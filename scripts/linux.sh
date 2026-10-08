@@ -6,13 +6,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Rust/Cargo is required to build NodeSend. Install it with:" >&2
+  echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+  echo "Then restart the shell or run: source \"\$HOME/.cargo/env\"" >&2
+  exit 127
+fi
+
 npm run build
 if [[ "${1:-}" == "debug" ]]; then
   cargo build --manifest-path src-tauri/Cargo.toml --bin nodesend-cli
-  cargo tauri build --bundles appimage --debug
+  npm exec -- tauri build --bundles appimage --debug
 else
   cargo build --manifest-path src-tauri/Cargo.toml --bin nodesend-cli --release
-  cargo tauri build --bundles appimage
+  npm exec -- tauri build --bundles appimage
 fi
 
 mkdir -p dist/linux
