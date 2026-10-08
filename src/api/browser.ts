@@ -1,0 +1,17 @@
+import { invoke } from './runtime';
+import type { BrowserConnection, BrowserConnectionInput, BrowserListing } from '../types/browser';
+export const listBrowserConnections = () => invoke<BrowserConnection[]>('list_browser_connections');
+export const connectBrowser = (input: BrowserConnectionInput) => invoke<BrowserConnection>('connect_browser', { input });
+export const closeBrowser = (id: string) => invoke<void>('close_browser', { id });
+export const reopenBrowser = (id: string, password?: string) => invoke<BrowserConnection>('reopen_browser', { id, password: password || null });
+export const testBrowserConnection = (input: BrowserConnectionInput) => invoke<void>('test_browser_connection', { input });
+export const updateBrowserConnection = (id: string, input: BrowserConnectionInput) => invoke<BrowserConnection>('update_browser_connection', { id, input });
+export const deleteBrowserConnection = (id: string) => invoke<void>('delete_browser_connection', { id });
+export const browseBrowser = (id: string, path: string) => invoke<BrowserListing>('browse_browser', { id, path });
+export const downloadBrowserFile = (id: string, path: string, destination: string) => invoke<void>('download_browser_file', { id, path, destination });
+export const uploadBrowserFile = (id: string, local: string, path: string) => invoke<void>('upload_browser_file', { id, local, path });
+export const createBrowserDirectory = (id: string, path: string) => invoke<void>('create_browser_directory', { id, path });
+export const deleteBrowserEntry = (id: string, path: string) => invoke<void>('delete_browser_entry', { id, path });
+export const renameBrowserEntry = (id: string, path: string, newName: string) => invoke<void>('rename_browser_entry', { id, path, newName });
+export const moveBrowserEntry = (id: string, path: string, target: string) => invoke<void>('move_browser_entry', { id, path, target });
+export const chooseBrowserDownloadPath = (name: string) => invoke<string | null>('choose_browser_download_path', { name });

@@ -1,0 +1,43 @@
+{
+  "name": "nodesend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "NodeSend - 跨平台去中心化 Node ↔ Node 文件传输与共享工具（初版）",
+  "scripts": {
+    "dev": "vite",
+    "dev:lan": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "test:ui": "playwright test",
+    "windows:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Check",
+    "windows:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Dev",
+    "windows:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Fast -Bundle nsis",
+    "windows:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1",
+    "windows:nsis": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Bundle nsis",
+    "windows:msi": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows.ps1 -Bundle msi",
+    "android:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Check",
+    "android:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1",
+    "android:debug": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Debug",
+    "android:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Fast"
+    ,"linux:build": "bash scripts/linux.sh"
+    ,"linux:debug": "bash scripts/linux.sh debug"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-clipboard-manager": "^2.4.1",
+    "@tauri-apps/plugin-deep-link": "^2.6.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

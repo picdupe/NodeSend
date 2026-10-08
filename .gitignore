@@ -1,0 +1,51 @@
+# Node.js / Vite
+node_modules
+dist
+
+# Rust / Tauri
+src-tauri/target
+src-tauri/icons/.build-fingerprint.json
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/build/
+src-tauri/gen/android/app/.cxx/
+.android/
+.nodesend-partials/
+*.nodesend-partials
+
+# NodeSend 本地运行数据（身份、数据库等，禁止提交）
+src-tauri/data
+*.db
+*.db-journal
+
+# 系统/编辑器
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.trace
+gnu_toolchain_verify/
+gnu-toolchain-test/
+*-build-check.log
+*-check.log
+*-build.log
+*-verified.png
+vite.config.ts.timestamp-*.mjs
+docs/benchmarks/*.jsonl
+
+# Browser QA
+playwright-report/
+test-results/
+
+# Local signing keys and credentials
+/signing/
+.idea/
+.vscode/
+*.code-workspace
+Thumbs.db
+Desktop.ini
+
+# 公开仓库只保留核心可编译代码和构建所需资源
+*.md
+docs/
+*.jsonl

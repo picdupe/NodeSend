@@ -1,0 +1,136 @@
+# =============================================================================
+# 文件功能：NodeSend Rust Service 的 Cargo 清单。
+# - 声明 Rust 后端全部依赖；不使用 Node.js 作为后端（基线 §1）；
+# - crate 划分：db / identity / share / access / httpapi / service / ipc；
+# - rusqlite 使用 bundled 特性（源码编译 SQLite，不依赖系统库）。
+# =============================================================================
+
+[package]
+name = "nodesend"
+version = "0.1.0"
+description = "NodeSend 跨平台文件传输与共享 Service"
+authors = ["NodeSend"]
+edition = "2021"
+rust-version = "1.95"
+
+[lib]
+# 业务逻辑放在 lib（lib.rs），供集成测试复用；main.rs 仅做启动入口（基线 §53）。
+name = "nodesend_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# 仅 Windows 测试用：为测试 exe 嵌入 Common-Controls v6 清单（替代 rustc 默认清单）。
+embed-resource = "3"
+
+[dependencies]
+# --- Tauri ---
+tauri = { version = "2", features = [] }
+
+# --- 异步运行时 / HTTP 服务（内嵌共享 HTTP，基线 §12）---
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["multipart"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# --- 本地 Node 发现与原生传输 ---
+mdns-sd = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+x509-parser = { version = "0.18", features = ["verify"] }
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.13"
+fs2 = "0.4"
+same-file = "1"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "multipart", "json"] }
+futures-util = "0.3"
+url = "2"
+urlencoding = "2"
+quick-xml = "0.42"
+uuid = { version = "1", features = ["v4"] }
+dav-server = { version = "0.11", default-features = false, features = ["localfs"] }
+smb-server = { path = "vendor/smb-server" }
+libunftp = { version = "0.23", default-features = false, features = ["ring"] }
+unftp-sbe-fs = { path = "vendor/unftp-sbe-fs" }
+unftp-core = "0.1"
+async-trait = "0.1"
+base64 = "0.22"
+
+# --- 序列化 / 时间 / 错误 ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+
+# --- 数据库：SQLite（基线 §18，Schema 只通过 Migration 修改）---
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- 身份与密码学：ECDSA P-256、X25519 预留、自签名证书（基线 §3）---
+p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+ecdsa = { version = "0.16", features = ["pem"] }
+sha2 = "0.10"
+rand = "0.8"
+rcgen = "0.13"
+
+# --- 日志 ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aes-gcm = "0.10"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri-plugin-deep-link = "2"
+tauri-plugin-clipboard-manager = "2"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_Shell"] }
+# rfd has native desktop backends but no Android backend. Android uses the
+# system picker bridge exposed by the mobile UI in a later iteration.
+rfd = "0.15"
+
+[dev-dependencies]
+smb2 = "0.27"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# sha2 0.10 uses runtime SHA-NI detection on x86 by default. Its ARM64
+# runtime SHA2 backend requires asm; unsupported CPUs retain software fallback.
+sha2 = { version = "0.10", features = ["asm"] }
+
+[profile.dev]
+# Fast local iteration and installable --debug packages share this cache.
+opt-level = 0
+debug = 0
+lto = false
+codegen-units = 256
+incremental = true
+
+# QUIC processes every UDP packet in Rust. Leaving this hot path at opt-level=0
+# makes installable debug builds CPU-bound even with chunk hashing disabled.
+# Optimize stable network dependencies once; keep NodeSend itself incremental
+# and unoptimized so UI/business-code iteration remains fast.
+[profile.dev.package.quinn]
+opt-level = 3
+[profile.dev.package.quinn-proto]
+opt-level = 3
+[profile.dev.package.quinn-udp]
+opt-level = 3
+[profile.dev.package.rustls]
+opt-level = 3
+[profile.dev.package.tokio]
+opt-level = 3
+[profile.dev.package.bytes]
+opt-level = 3
+# Hardware SHA instructions still need optimized surrounding code. Keep chunk
+# SHA-256 fast in debug builds without changing the wire format or verification.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+# Tauri 官方推荐的体积/性能优化配置。
+panic = "abort"
+codegen-units = 1
+lto = true
+incremental = false
+opt-level = "s"
+strip = true
