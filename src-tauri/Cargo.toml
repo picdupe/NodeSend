@@ -8,6 +8,7 @@
 [package]
 name = "nodesend"
 version = "0.1.0"
+default-run = "nodesend"
 description = "NodeSend 跨平台文件传输与共享 Service"
 authors = ["NodeSend"]
 edition = "2021"
