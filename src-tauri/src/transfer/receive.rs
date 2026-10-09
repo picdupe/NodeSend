@@ -1,6 +1,6 @@
 use super::{
     model::{incoming_id, ConflictPolicy, Manifest, TaskRecord},
-    paths, TransferService,
+    paths, relay, TransferService,
 };
 use crate::{
     error::{AppError, AppResult},
@@ -10,9 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
 };
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 impl TransferService {
     pub(crate) async fn offer(
         &self,
@@ -63,6 +61,8 @@ impl TransferService {
             updated_at: now.clone(),
             created_at: now,
             allow_public: false,
+            use_cache: false,
+            relayed: vec![],
         })?;
         let policy = self
             .app
@@ -99,15 +99,24 @@ impl TransferService {
         &self,
         id: &str,
         index: usize,
-        data: &[u8],
+        data: Vec<u8>,
         hash: Option<String>,
         transport: &str,
     ) -> AppResult<Response> {
         let gate = self.gate(id);
         let _lock = gate.lock().await;
-        let task = self.record(id)?;
+        let mut task = self.record(id)?;
         if !["accepted", "transferring"].contains(&task.status.as_str()) {
             return self.remote_state(id);
+        }
+        // 缓存盘中转：缓存盘写满时在此对接收背压（不报错、不丢数据）。
+        // 等待期间任务状态可能变化（暂停/取消），需重新读取后再继续。
+        if task.use_cache {
+            relay::await_cache_space(self, id).await?;
+            task = self.record(id)?;
+            if !["accepted", "transferring"].contains(&task.status.as_str()) {
+                return self.remote_state(id);
+            }
         }
         let chunk = task.manifest
             .chunk(index)
@@ -117,43 +126,85 @@ impl TransferService {
             return Err(AppError::BadRequest("Chunk 长度不匹配".into()));
         }
         if task.manifest.verify_hash
-            && hash.as_deref() != Some(format!("{:x}", Sha256::digest(data)).as_str())
+            && hash.as_deref() != Some(format!("{:x}", Sha256::digest(&data)).as_str())
         {
             return Err(AppError::Conflict("Chunk SHA-256 校验失败".into()));
         }
-        if task.completed.contains(&index) {
+        let key = (id.to_string(), index);
+        // 已完成，或已入队但尚未落盘：重复块直接确认，不重复入队。
+        if task.completed.contains(&index) || self.write_pending.lock().unwrap().contains(&key) {
             return Ok(Response::Ack);
         }
-        let stage = paths::stage(&task)?;
-        std::fs::create_dir_all(&stage)?;
-        paths::ensure_plain(&stage)?;
-        let part = stage.join(format!("{}.part", chunk.file));
-        paths::ensure_plain(&part)?;
-        let key = (id.to_string(), chunk.file);
-        let cached = { self.receive_files.lock().unwrap().get(&key).cloned() };
-        let file = if let Some(file) = cached {
-            file
-        } else {
-            let opened = tokio::fs::OpenOptions::new()
-                .create(true).truncate(false).read(true).write(true)
-                .open(&part).await?;
-            let file = Arc::new(tokio::sync::Mutex::new(opened));
-            self.receive_files.lock().unwrap().insert(key, file.clone());
-            file
-        };
-        let mut file = file.lock().await;
-        let expected_size = task.manifest.entries[chunk.file].size;
-        if file.metadata().await?.len() != expected_size { file.set_len(expected_size).await?; }
-        file.seek(std::io::SeekFrom::Start(chunk.offset)).await?;
-        file.write_all(data).await?;
-        file.sync_data().await?;
-        drop(file);
         self.edit(id, |t| {
-            t.completed.insert(index);
             t.status = "transferring".into();
             t.transport = Some(transport.into());
         })?;
+        self.write_pending.lock().unwrap().insert(key.clone());
+        // 入队即返回 Ack：磁盘延迟不再进入 ACK 往返路径。
+        // 完成状态由后台写入任务在 sync_data 成功后记录；队列有界，
+        // 满时在此背压等待（写入任务持续排空，不会死锁）。
+        let pending = super::write_queue::PendingChunk {
+            task_id: id.to_string(),
+            file: chunk.file,
+            index,
+            offset: chunk.offset,
+            data,
+        };
+        if self.write_tx.send(pending).await.is_err() {
+            self.write_pending.lock().unwrap().remove(&key);
+            return Err(AppError::Other("接收写入队列已关闭".into()));
+        }
         Ok(Response::Ack)
+    }
+    /// 等待本任务所有已入队块完成「写入 + sync_data + 记录完成」。
+    /// 超时说明写入任务异常或存在长期缺口，改由调用方报错，避免永久阻塞。
+    async fn await_writes(&self, id: &str) -> AppResult<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let busy = self
+                .write_pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(task, _)| task == id);
+            if !busy {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::Conflict("仍有未落盘的 Chunk，请稍后重试提交".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    /// 等待「缓存盘 → 目标盘」的转写任务把全部数据连续写完（缓存模式）。
+    /// 直写模式或未启用缓存时立即返回。
+    ///
+    /// 此时发送端已收齐全部回执（`await_writes` 已通过），转写所需数据都在缓存中，
+    /// 正常情况下只会慢、不会停，所以用「无进展超时」而非绝对超时：只要转写进度
+    /// 仍在推进就一直等（尾部可能很大，取决于缓存盘容量），停滞才报错。
+    async fn await_relay(&self, id: &str) -> AppResult<()> {
+        let mut last = 0u64;
+        let mut stalled_since = tokio::time::Instant::now();
+        loop {
+            let task = self.record(id)?;
+            if relay::relay_done(&task) {
+                return Ok(());
+            }
+            if let Some(err) = task.error.clone() {
+                return Err(AppError::Other(err));
+            }
+            if !["accepted", "transferring"].contains(&task.status.as_str()) {
+                return Err(AppError::Conflict("转写已停止，请稍后重试提交".into()));
+            }
+            let progress: u64 = task.relayed.iter().copied().sum();
+            if progress > last {
+                last = progress;
+                stalled_since = tokio::time::Instant::now();
+            } else if stalled_since.elapsed() >= std::time::Duration::from_secs(120) {
+                return Err(AppError::Conflict("转写长时间无进展，请稍后重试提交".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
     pub(crate) async fn commit(&self, id: &str) -> AppResult<Response> {
         let gate = self.gate(id);
@@ -165,6 +216,11 @@ impl TransferService {
         if !["accepted", "transferring"].contains(&task.status.as_str()) {
             return self.remote_state(id);
         }
+        // 先等队列排空并记录完成，再做完整性判断与提交。
+        self.await_writes(id).await?;
+        // 缓存中转模式：目标盘临时文件由转写任务连续写，需等转写完成后再 rename。
+        self.await_relay(id).await?;
+        let task = self.record(id)?;
         if task.completed.len() != task.manifest.chunks().len() {
             return Err(AppError::Conflict("仍有未提交 Chunk".into()));
         }
@@ -244,6 +300,8 @@ impl TransferService {
             t.error = None;
             t.event("所有文件已持久化并提交，发送完成回执");
         })?;
+        // 传输已结束：释放本任务登记的目标盘句柄，避免最终文件被长时间占用。
+        self.release_files(id);
         // Only generated staging files inside this task directory are cleaned.
         if paths::ensure_under(&root, &stage).is_ok() {
             let _ = std::fs::remove_dir_all(&stage);
@@ -273,11 +331,24 @@ impl TransferService {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
                     Err(e) => return Err(e.into()),
                 }
+                // 缓存中转模式：一并删除该文件的缓存分段，避免继续占用缓存盘。
+                if task.use_cache {
+                    if let Some(cache_root) = self.cache_root.as_ref() {
+                        for segment in 0..entry.size.div_ceil(relay::SEG_BYTES) {
+                            let _ = tokio::fs::remove_file(paths::cache_segment(
+                                cache_root, &id, file, segment,
+                            ))
+                            .await;
+                        }
+                    }
+                }
                 self.edit(&id, |t| {
                     t.targets[file] = None;
                     if t.skipped_files.insert(file) { t.event(format!("源文件已变化，跳过：{}", entry.path)); }
                     for (i, c) in t.manifest.chunks().iter().enumerate() { if c.file == file { t.completed.insert(i); } }
                 })?;
+                // 该文件已跳过：释放可能已打开的目标盘句柄（`.part` 已删除）。
+                self.receive_files.lock().unwrap().remove(&(id.clone(), file));
                 Ok(Response::Ack)
             },
             Request::Offer { id, manifest } => {

@@ -360,6 +360,8 @@ fn fail_task(service: &Arc<TransferService>, task_id: &str, err: &crate::error::
         .lock()
         .unwrap()
         .retain(|(task, _)| task != task_id);
+    // 写盘失败后不再继续复用句柄：释放目标盘句柄（调用方已移除文件缓冲）。
+    service.release_files(task_id);
     let _ = service.edit(task_id, |t| {
         t.error = Some(err.to_string());
         t.event(format!("写入失败：{err}"));
