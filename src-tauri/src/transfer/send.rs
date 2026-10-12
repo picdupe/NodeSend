@@ -128,6 +128,13 @@ impl TransferService {
             state.entries.extend(page.iter().cloned());
             state.db_buffer.extend(page.iter().cloned());
             first += page.len();
+            // Keep the sender UI responsive between durable 5000-entry batches.
+            // These counters are in-memory only; recovery still uses the durable cursor.
+            self.update_live_scan_progress(
+                &task.id,
+                first,
+                state.directories,
+            )?;
             // 扫满一个落库批次才写数据库：扫描/发送按 256 条小步推进，
             // 数据库按 5000 条摊销事务；两者互不阻塞。
             if state.db_buffer.len() >= MANIFEST_PAGE {

@@ -102,12 +102,39 @@ $internalVersion = "$($versionData.version)-build.$($versionData.build)"
 foreach ($artifact in $artifacts) {
     if ($artifact.Name.Contains($internalVersion)) {
         $newName = $artifact.Name.Replace($internalVersion, $publicVersion)
-        Rename-Item -LiteralPath $artifact.FullName -NewName $newName
+        $newPath = Join-Path $artifact.DirectoryName $newName
         $signature = "$($artifact.FullName).sig"
+
+        # Repeated builds may leave the same public-version filename behind.
+        # Remove the stale destination first; Rename-Item cannot overwrite it.
+        if (Test-Path -LiteralPath $newPath) {
+            Remove-Item -LiteralPath $newPath -Force
+        }
+        if (Test-Path -LiteralPath "$newPath.sig") {
+            Remove-Item -LiteralPath "$newPath.sig" -Force
+        }
+
+        Rename-Item -LiteralPath $artifact.FullName -NewName $newName
         if (Test-Path -LiteralPath $signature) {
             Rename-Item -LiteralPath $signature -NewName "$newName.sig"
         }
     }
+}
+# Keep only the artifacts for the version built in this run. Older public-version
+# filenames are not renamed above, so remove them and their signatures explicitly.
+foreach ($kind in $bundleKinds) {
+    $extension = if ($kind -eq 'nsis') { '*.exe' } else { '*.msi' }
+    $kindDirectory = Join-Path $bundleRoot $kind
+    Get-ChildItem -LiteralPath $kindDirectory -Filter $extension -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'NodeSend_*' -and $_.Name -notlike "*${publicVersion}*" } |
+        ForEach-Object {
+            $staleSignature = "$($_.FullName).sig"
+            Remove-Item -LiteralPath $_.FullName -Force
+            if (Test-Path -LiteralPath $staleSignature -PathType Leaf) {
+                Remove-Item -LiteralPath $staleSignature -Force
+            }
+            Write-Output "Removed stale bundle: $($_.Name)"
+        }
 }
 $artifacts = @(foreach ($kind in $bundleKinds) {
     $extension = if ($kind -eq 'nsis') { '*.exe' } else { '*.msi' }
@@ -132,7 +159,8 @@ $artifacts | Select-Object FullName, Length, LastWriteTime
 # Override the download host with -UpdateDownloadBaseUrl or
 # NODESEND_UPDATE_DOWNLOAD_BASE_URL for an intranet/CDN mirror.
 if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
-    $installer = @($artifacts | Where-Object { $_.Extension -eq '.exe' -and $_.Name -like 'NodeSend_*.exe' } | Select-Object -First 1)
+    $installerName = "NodeSend_$($publicVersion)_x64-setup.exe"
+    $installer = @($artifacts | Where-Object { $_.Extension -eq '.exe' -and $_.Name -eq $installerName })
     if ($installer.Count -gt 0) {
         $installer = $installer[0]
         $signaturePath = "$($installer.FullName).sig"

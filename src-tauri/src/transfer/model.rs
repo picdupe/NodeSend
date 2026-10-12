@@ -527,6 +527,13 @@ pub struct TaskRecord {
     pub scan_last_path: String,
     #[serde(default)]
     pub scan_complete: bool,
+    /// Sender scan counters for UI display. Persist these independently from
+    /// `file_count`: the latter is the durable manifest cursor and must never
+    /// advance beyond entries that have actually been saved to the database.
+    #[serde(default)]
+    pub scan_progress_count: usize,
+    #[serde(default)]
+    pub scan_progress_directories: usize,
     /// 运行期清单明细：启动时不加载，按需从 `task_entries` 载入（见 `TransferService`）。
     #[serde(skip)]
     pub manifest: Manifest,
@@ -587,6 +594,9 @@ impl TaskRecord {
     /// 任务快照（Stage 2 拆分）：只含计数、总量与进度，**不含清单明细**。
     /// 因此无需加载 bulk，也不会再把整份清单经 IPC 传到前端（明细走分页接口）。
     pub fn snapshot(&self) -> TaskSnapshot {
+        let show_scan_progress = self.direction == "send"
+            && !self.scan_complete
+            && (self.scan_progress_count > 0 || self.scan_last_seq == 0);
         TaskSnapshot {
             warnings: self
                 .skipped_paths
@@ -600,8 +610,8 @@ impl TaskRecord {
             status: self.status.clone(),
             scan_complete: self.scan_complete,
             top_level_count: self.top_level_count,
-            file_count: self.file_count,
-            directory_count: self.directory_count,
+            file_count: if show_scan_progress { self.scan_progress_count } else { self.file_count },
+            directory_count: if show_scan_progress { self.scan_progress_directories } else { self.directory_count },
             total_bytes: self.total_size.saturating_sub(self.skipped_bytes),
             completed_bytes: self.completed_bytes,
             transport: self.transport.clone(),

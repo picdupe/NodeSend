@@ -271,6 +271,22 @@ impl TransferService {
         self.persist(task)?;
         Ok(())
     }
+    /// Update sender-only live scan counters without advancing the durable
+    /// manifest cursor or rewriting the task record on every small batch.
+    pub(crate) fn update_live_scan_progress(
+        &self,
+        id: &str,
+        count: usize,
+        directories: usize,
+    ) -> AppResult<()> {
+        let mut map = locks::lock(&self.tasks);
+        let task = map
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound("传输任务不存在".into()))?;
+        task.scan_progress_count = count;
+        task.scan_progress_directories = directories;
+        Ok(())
+    }
     /// Append a sender-side batch to the durable table and live manifest without
     /// cloning all previously scanned entries.
     pub(crate) fn append_source_batch(
@@ -1016,6 +1032,8 @@ impl TransferService {
             scan_last_seq: 0,
             scan_last_path: String::new(),
             scan_complete: false,
+            scan_progress_count: 0,
+            scan_progress_directories: 0,
             manifest: Manifest::default(),
             completed: BTreeSet::new(),
             targets: vec![],

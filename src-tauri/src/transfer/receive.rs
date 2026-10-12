@@ -102,6 +102,8 @@ impl TransferService {
             scan_last_seq: 0,
             scan_last_path: String::new(),
             scan_complete: false,
+            scan_progress_count: 0,
+            scan_progress_directories: 0,
             manifest: Manifest::default(),
             completed: BTreeSet::new(),
             targets: vec![],
