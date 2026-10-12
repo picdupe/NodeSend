@@ -43,7 +43,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(response, Response::Ack));
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::join!(receive, send);
         })
         .await
@@ -65,7 +65,6 @@ use crate::{
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -84,14 +83,19 @@ pub struct Channel {
 impl Channel {
     pub async fn request(&mut self, r: &Request) -> AppResult<Response> {
         protocol::write_frame(&mut *self.writer, r).await?;
-        if matches!(r, Request::Commit { .. }) {
+        let timeout = match r {
             // SAF providers may copy a large staged file before acknowledging.
-            return match protocol::read_frame_with_timeout(&mut *self.reader, Duration::from_secs(1800)).await? {
-                Response::Error { message } => Err(AppError::Other(message)),
-                response => Ok(response),
-            };
+            Request::Commit { .. } => crate::tuning::COMMIT_ACK_TIMEOUT,
+            // 接收端按条处理清单，慢盘上可能远超默认 IO 超时。
+            Request::Offer { .. }
+            | Request::ManifestChunk { .. }
+            | Request::ManifestDone { .. } => protocol::MANIFEST_TIMEOUT,
+            _ => protocol::IO_TIMEOUT,
+        };
+        match protocol::read_frame_with_timeout(&mut *self.reader, timeout).await? {
+            Response::Error { message } => Err(AppError::Other(message)),
+            response => Ok(response),
         }
-        self.response().await
     }
     pub async fn response(&mut self) -> AppResult<Response> {
         match protocol::read_frame(&mut *self.reader).await? {
@@ -181,8 +185,8 @@ fn make_quic_endpoint(
 }
 fn quic_options() -> Arc<quinn::TransportConfig> {
     let mut config = quinn::TransportConfig::default();
-    config.keep_alive_interval(Some(Duration::from_secs(5)));
-    config.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    config.keep_alive_interval(Some(crate::tuning::QUIC_KEEPALIVE));
+    config.max_idle_timeout(Some(crate::tuning::QUIC_IDLE_TIMEOUT.try_into().unwrap()));
     config.max_concurrent_bidi_streams(8u32.into());
     config.max_concurrent_uni_streams(0u32.into());
     Arc::new(config)
@@ -199,49 +203,84 @@ pub async fn connect(
 ) -> AppResult<Channel> {
     let address = endpoint.socket(false)?;
     if !allow_public && !is_local(address.ip()) {
-        return Err(AppError::Forbidden(format!("公网路径需要显式允许：{}", endpoint.address)));
+        return Err(AppError::Forbidden(format!(
+            "公网路径需要显式允许：{}",
+            endpoint.address
+        )));
     }
     let mut quic_error = None;
     if !prefer_tcp && endpoint.quic_port != 0 {
         match tokio::time::timeout(
-            Duration::from_secs(2),
+            crate::tuning::QUIC_HANDSHAKE_TIMEOUT,
             connect_quic(app, endpoint, expected),
         )
         .await
         {
-            Ok(Ok(channel)) => return Ok(channel),
-            Ok(Err(err)) => quic_error = Some(err.to_string()),
-            Err(_) => quic_error = Some("QUIC 握手超时".into()),
+            Ok(Ok(channel)) => {
+                tracing::info!(remote = %endpoint.address, quic = endpoint.quic_port, peer_id = %channel.peer_id, "QUIC 原生连接已建立");
+                return Ok(channel);
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(remote = %endpoint.address, quic = endpoint.quic_port, %err, "QUIC 连接失败，回退 TCP");
+                quic_error = Some(err.to_string());
+            }
+            Err(_) => {
+                tracing::debug!(remote = %endpoint.address, quic = endpoint.quic_port, "QUIC 握手超时，回退 TCP");
+                quic_error = Some("QUIC 握手超时".into());
+            }
         }
     }
-    let stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(address))
-        .await
-        .map_err(|_| other("连接设备超时，请检查对方是否在线及网络是否可达"))?
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::ConnectionRefused => other(
-                "无法连接设备：对方可能离线、未启动 NodeSend，或此端口未开放。请确认对方状态后重试",
-            ),
-            _ => other(format!("网络连接失败：{err}")),
-        })?;
+    let stream = match tokio::time::timeout(
+        crate::tuning::TCP_CONNECT_TIMEOUT,
+        TcpStream::connect(address),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            let reason = match err.kind() {
+                std::io::ErrorKind::ConnectionRefused => {
+                    "无法连接设备：对方可能离线、未启动 NodeSend，或此端口未开放。请确认对方状态后重试".to_string()
+                }
+                _ => format!("网络连接失败：{err}"),
+            };
+            tracing::warn!(%address, error = %reason, "TCP 连接失败");
+            return Err(other(reason));
+        }
+        Err(_) => {
+            tracing::warn!(%address, "TCP 连接超时（对方在线但端口无响应）");
+            return Err(other("连接设备超时，请检查对方是否在线及网络是否可达"));
+        }
+    };
     stream.set_nodelay(true)?;
+    tracing::debug!(%address, "TCP 已连接，开始 TLS 握手");
     let connector =
         tokio_rustls::TlsConnector::from(Arc::new(tls::client(app, expected.map(str::to_owned))?));
-    let secured = tokio::time::timeout(
-        Duration::from_secs(4),
+    let secured = match tokio::time::timeout(
+        crate::tuning::TLS_HANDSHAKE_TIMEOUT,
         connector.connect(
             rustls::pki_types::ServerName::try_from("nodesend.local").unwrap(),
             stream,
         ),
     )
     .await
-    .map_err(|_| other("TCP TLS 握手超时"))?
-    .map_err(|e| {
-        other(format!(
-            "TCP TLS: {e}; QUIC: {}",
-            quic_error.unwrap_or_default()
-        ))
-    })?;
+    {
+        Ok(Ok(secured)) => secured,
+        Ok(Err(error)) => {
+            let quic = quic_error.unwrap_or_else(|| "未尝试".into());
+            tracing::warn!(%address, %error, quic = %quic, "TLS 握手失败");
+            return Err(other(format!("TCP TLS: {error}; QUIC: {quic}")));
+        }
+        Err(_) => {
+            let quic = quic_error.unwrap_or_else(|| "未尝试".into());
+            tracing::warn!(%address, quic = %quic, "TLS 握手超时：端口接受了连接但没有完成 NodeSend 握手");
+            return Err(other(format!(
+                "TCP TLS 握手超时：对方端口接受了连接，但没有完成 NodeSend 握手。常见原因：对方 NodeSend 未正常运行或进程卡住、端口被其他程序占用，或防火墙/安全软件只放行了握手、拦截了数据。QUIC: {quic}"
+            )));
+        }
+    };
     let peer_id = tls::remember(app, secured.get_ref().1.peer_certificates().unwrap_or(&[]))?;
+    tracing::info!(%address, peer_id = %peer_id, "TCP 原生连接已建立");
     let (reader, writer) = tokio::io::split(secured);
     Ok(Channel {
         reader: Box::new(reader),
@@ -381,45 +420,219 @@ pub async fn serve(listeners: Listeners, transfers: Arc<TransferService>, peers:
             return;
         }
     };
-    let slots = Arc::new(Semaphore::new(64));
+    let slots = Arc::new(Semaphore::new(crate::tuning::MAX_SESSIONS));
     let mut children = tokio::task::JoinSet::new();
-    let tcp_port = listeners.tcp_port;
-    let quic_port = listeners.quic_port;
+    let ports = (listeners.tcp_port, listeners.quic_port);
     loop {
         tokio::select! {
-            _=transfers.shutdown.cancelled()=>break,
-            Some(_)=children.join_next(),if !children.is_empty()=>{},
-            result=listeners.tcp.accept()=>{
-                let Ok((stream,remote))=result else{break;};let Ok(permit)=slots.clone().try_acquire_owned() else{continue;};
-                let tls=acceptor.clone();let transfers=transfers.clone();let peers=peers.clone();
-                children.spawn(async move {let _permit=permit;
-                    if let Ok(Ok(stream))=tokio::time::timeout(Duration::from_secs(5),tls.accept(stream)).await {
-                        if let Ok(peer_id)=tls::remember(&transfers.app,stream.get_ref().1.peer_certificates().unwrap_or(&[])) {
-                            let (reader,writer)=tokio::io::split(stream);let mut channel=Channel{reader:Box::new(reader),writer:Box::new(writer),peer_id,kind:"tcp",_endpoint:None,_connection:None};
-                            finish_session(&mut channel,&transfers,&peers,remote,tcp_port,quic_port).await;
-                        }
+            _ = transfers.shutdown.cancelled() => break,
+            Some(_) = children.join_next(), if !children.is_empty() => {}
+            result = listeners.tcp.accept() => {
+                let Ok((stream, remote)) = result else { break };
+                match acquire_slot(&slots, SessionKind::Tcp, remote) {
+                    Some(permit) => {
+                        let state = SessionState {
+                            acceptor: acceptor.clone(),
+                            transfers: transfers.clone(),
+                            peers: peers.clone(),
+                            ports,
+                        };
+                        children.spawn(async move {
+                            let _permit = permit;
+                            serve_tcp_session(state, stream, remote).await;
+                        });
                     }
-                });
-            },
-            Some(incoming)=listeners.quic.accept()=>{
-                let Ok(permit)=slots.clone().try_acquire_owned() else{incoming.refuse();continue;};let transfers=transfers.clone();let peers=peers.clone();
-                children.spawn(async move {let _permit=permit;
-                    if let Ok(Ok(connection))=tokio::time::timeout(Duration::from_secs(5),incoming).await {
-                        let identity=connection.peer_identity().and_then(|v|v.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok());
-                        if let Some(identity)=identity {if let Ok(peer_id)=tls::remember(&transfers.app,&identity) {
-                            if let Ok(Ok((writer,reader)))=tokio::time::timeout(Duration::from_secs(5),connection.accept_bi()).await {
-                                let remote=connection.remote_address();let mut channel=Channel{reader:Box::new(reader),writer:Box::new(writer),peer_id,kind:"quic",_endpoint:None,_connection:Some(connection)};
-                                finish_session(&mut channel,&transfers,&peers,remote,tcp_port,quic_port).await;
-                            }
-                        }}
+                    None => drop(stream),
+                }
+            }
+            Some(incoming) = listeners.quic.accept() => {
+                let remote = incoming.remote_address();
+                match acquire_slot(&slots, SessionKind::Quic, remote) {
+                    Some(permit) => {
+                        let state = SessionState {
+                            acceptor: acceptor.clone(),
+                            transfers: transfers.clone(),
+                            peers: peers.clone(),
+                            ports,
+                        };
+                        children.spawn(async move {
+                            let _permit = permit;
+                            serve_quic_session(state, incoming, remote).await;
+                        });
                     }
-                });
+                    None => incoming.refuse(),
+                }
             }
         }
     }
     children.abort_all();
     while children.join_next().await.is_some() {}
     listeners.quic.close(0u32.into(), b"shutdown");
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    Tcp,
+    Quic,
+}
+
+impl SessionKind {
+    fn label(self) -> &'static str {
+        match self {
+            SessionKind::Tcp => "TCP",
+            SessionKind::Quic => "QUIC",
+        }
+    }
+}
+
+/// 每个新会话所需的共享句柄。避免在 `select!` 分支里逐个 `clone()` 造成噪声。
+struct SessionState {
+    acceptor: tokio_rustls::TlsAcceptor,
+    transfers: Arc<TransferService>,
+    peers: Arc<PeerStore>,
+    ports: (u16, u16),
+}
+
+/// 取一个会话许可。达到上限时记录日志并拒绝（静默丢弃会让对端只看到
+/// "连不上、需要重启本机"，必须留下可诊断的日志）。
+fn acquire_slot(
+    slots: &Arc<Semaphore>,
+    kind: SessionKind,
+    remote: SocketAddr,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match slots.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            tracing::warn!(
+                %remote,
+                permits = slots.available_permits(),
+                "连接数已达上限，拒绝新的{}会话",
+                kind.label()
+            );
+            None
+        }
+    }
+}
+
+/// 完成对端证书登记（写库）并给出对端 Node ID。
+///
+/// 身份登记是同步数据库写入：任何长期占用数据库锁的线程都会让这里无限等待，
+/// 进而让对端卡在"连接检测"、并且一直占着一个连接许可。因此放到阻塞线程池
+/// 并加超时——宁可放弃这次会话，也不把自身拖死。
+async fn register_identity(
+    transfers: &Arc<TransferService>,
+    certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+    remote: SocketAddr,
+    kind: SessionKind,
+) -> Option<String> {
+    let app = transfers.app.clone();
+    let remembered = tokio::time::timeout(
+        crate::tuning::IDENTITY_RECORD_TIMEOUT,
+        tokio::task::spawn_blocking(move || tls::remember(&app, &certificates)),
+    )
+    .await;
+    match remembered {
+        Ok(Ok(Ok(peer_id))) => Some(peer_id),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%remote, %error, "{} 会话身份登记失败", kind.label());
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%remote, %error, "{} 会话身份登记任务异常", kind.label());
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                %remote,
+                "{} 会话身份登记超时（数据库锁可能被长期占用），已放弃本次会话",
+                kind.label()
+            );
+            None
+        }
+    }
+}
+
+async fn serve_tcp_session(state: SessionState, stream: TcpStream, remote: SocketAddr) {
+    let Ok(Ok(stream)) = tokio::time::timeout(
+        crate::tuning::ACCEPT_TIMEOUT,
+        state.acceptor.accept(stream),
+    )
+    .await
+    else {
+        return;
+    };
+    let certificates = stream.get_ref().1.peer_certificates().unwrap_or(&[]).to_vec();
+    let Some(peer_id) = register_identity(
+        &state.transfers,
+        certificates,
+        remote,
+        SessionKind::Tcp,
+    )
+    .await
+    else {
+        return;
+    };
+    let (reader, writer) = tokio::io::split(stream);
+    let mut channel = Channel {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        peer_id,
+        kind: "tcp",
+        _endpoint: None,
+        _connection: None,
+    };
+    finish_session(
+        &mut channel,
+        &state.transfers,
+        &state.peers,
+        remote,
+        state.ports.0,
+        state.ports.1,
+    )
+    .await;
+}
+
+async fn serve_quic_session(state: SessionState, incoming: quinn::Incoming, remote: SocketAddr) {
+    let Ok(Ok(connection)) = tokio::time::timeout(crate::tuning::ACCEPT_TIMEOUT, incoming).await
+    else {
+        return;
+    };
+    let Some(identity) = connection
+        .peer_identity()
+        .and_then(|value| {
+            value
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+    else {
+        return;
+    };
+    let Some(peer_id) = register_identity(&state.transfers, *identity, remote, SessionKind::Quic).await
+    else {
+        return;
+    };
+    let Ok(Ok((writer, reader))) =
+        tokio::time::timeout(crate::tuning::ACCEPT_TIMEOUT, connection.accept_bi()).await
+    else {
+        return;
+    };
+    let mut channel = Channel {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        peer_id,
+        kind: "quic",
+        _endpoint: None,
+        _connection: Some(connection),
+    };
+    finish_session(
+        &mut channel,
+        &state.transfers,
+        &state.peers,
+        remote,
+        state.ports.0,
+        state.ports.1,
+    )
+    .await;
 }
 async fn finish_session(
     channel: &mut Channel,
@@ -434,7 +647,7 @@ async fn finish_session(
     }
     // Send TLS close_notify (or finish the QUIC stream) on our own exit.
     // A closed stream still does not substitute for a durable commit ACK.
-    let _ = tokio::time::timeout(Duration::from_secs(2), channel.writer.shutdown()).await;
+    let _ = tokio::time::timeout(crate::tuning::SHUTDOWN_FLUSH_TIMEOUT, channel.writer.shutdown()).await;
 }
 
 async fn session(
@@ -472,15 +685,53 @@ async fn session(
     .await?;
     loop {
         let request: Request = protocol::read_frame(&mut *channel.reader).await?;
+        // 清单/提交阶段的帧必须留痕：发送端说"已发出"而接收端毫无记录时，
+        // 这是唯一能区分"帧没到"和"处理失败"的证据。
+        match &request {
+            Request::ManifestChunk { first, entries, .. } => {
+                tracing::info!(
+                    peer = %channel.peer_id,
+                    transport = channel.kind,
+                    first,
+                    entries = entries.len(),
+                    "收到清单分片"
+                );
+            }
+            Request::ManifestDone { file_count, total_size, .. } => {
+                tracing::info!(
+                    peer = %channel.peer_id,
+                    transport = channel.kind,
+                    file_count,
+                    total_size,
+                    "收到清单结束帧"
+                );
+            }
+            Request::Offer { .. } => {
+                tracing::info!(peer = %channel.peer_id, transport = channel.kind, "收到清单摘要（Offer）");
+            }
+            Request::Commit { .. } => {
+                tracing::info!(peer = %channel.peer_id, transport = channel.kind, "收到提交请求");
+            }
+            _ => {}
+        }
         match &request {
             Request::Addresses => {
-                let addresses = if_addrs::get_if_addrs()?.into_iter()
+                let addresses = if_addrs::get_if_addrs()?
+                    .into_iter()
                     .filter(|i| !i.is_loopback() && !i.ip().is_unspecified())
                     .map(|i| i.ip().to_string())
-                    .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-                protocol::write_frame(&mut *channel.writer, &Response::Addresses {
-                    addresses, tcp_port, quic_port,
-                }).await?;
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                protocol::write_frame(
+                    &mut *channel.writer,
+                    &Response::Addresses {
+                        addresses,
+                        tcp_port,
+                        quic_port,
+                    },
+                )
+                .await?;
                 continue;
             }
             Request::Browse {
@@ -582,6 +833,7 @@ async fn session(
             }
             _ => {}
         }
+        let request_label = request_label(&request);
         let result = match request {
             Request::Chunk {
                 id,
@@ -589,7 +841,7 @@ async fn session(
                 length,
                 sha256,
             } => {
-                if length > 4194304 {
+                if length as u64 > crate::transfer::CHUNK_SIZE {
                     return Err(AppError::BadRequest("Chunk 过大".into()));
                 }
                 let mut data = vec![0; length];
@@ -600,7 +852,7 @@ async fn session(
                     .receive_chunk(
                         &crate::transfer::model::incoming_id(&channel.peer_id, &id),
                         index,
-                        &data,
+                        data,
                         sha256,
                         channel.kind,
                     )
@@ -614,10 +866,40 @@ async fn session(
         };
         let response = match result {
             Ok(r) => r,
-            Err(e) => Response::Error {
-                message: e.to_string(),
-            },
+            Err(e) => {
+                // 接收端必须记录"收到了什么请求、为什么失败"：否则对端只看到
+                // 静默等待（清单分片不回执），无法区分"没收到"和"处理失败"。
+                tracing::warn!(
+                    peer = %channel.peer_id,
+                    transport = channel.kind,
+                    request = request_label,
+                    %e,
+                    "会话请求处理失败，已返回错误帧"
+                );
+                Response::Error {
+                    message: e.to_string(),
+                }
+            }
         };
         protocol::write_frame(&mut *channel.writer, &response).await?;
+    }
+}
+
+/// 请求类型简称：用于日志（`Request` 的 Debug 对清单分片会打印上千条条目）。
+fn request_label(request: &Request) -> &'static str {
+    match request {
+        Request::SkipFile { .. } => "SkipFile",
+        Request::Addresses => "Addresses",
+        Request::Hello { .. } => "Hello",
+        Request::Offer { .. } => "Offer",
+        Request::ManifestChunk { .. } => "ManifestChunk",
+        Request::ManifestDone { .. } => "ManifestDone",
+        Request::Poll { .. } => "Poll",
+        Request::Chunk { .. } => "Chunk",
+        Request::Commit { .. } => "Commit",
+        Request::Cancel { .. } => "Cancel",
+        Request::Browse { .. } => "Browse",
+        Request::Fetch { .. } => "Fetch",
+        Request::Put { .. } => "Put",
     }
 }

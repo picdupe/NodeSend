@@ -1,24 +1,113 @@
 //! Versioned, length-bounded NodeSend native protocol; no HTTP dependency.
 use crate::error::{AppError, AppResult};
-use crate::transfer::model::Manifest;
+use crate::transfer::model::{FileEntry, OfferSummary};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-pub const VERSION: u16 = 1;
-pub const MAX_FRAME: usize = 8 * 1024 * 1024;
-pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// v3 adds incremental scan summaries and partial-manifest resume offsets.
+pub const VERSION: u16 = crate::tuning::PROTOCOL_VERSION;
+pub const MAX_FRAME: usize = crate::tuning::MAX_FRAME;
+pub const IO_TIMEOUT: std::time::Duration = crate::tuning::FRAME_IO_TIMEOUT;
+/// 清单帧（Offer / ManifestChunk / ManifestDone）的应答超时。
+/// 接收端要逐条落库并规划目标路径，几万条清单在 NAS、HDD 或网络盘上
+/// 可能远超普通请求的 20 秒；用普通超时会把"扫描慢"误报成"网络读取超时"。
+pub const MANIFEST_TIMEOUT: std::time::Duration = crate::tuning::MANIFEST_ACK_TIMEOUT;
+
+/// 已完成块集合的紧凑编码：按升序、互不重叠的闭区间 `[start, end]`。
+///
+/// 原先是 `Vec<usize>`，每次 `Poll` 都要回传整份块号列表：1 TB / 4 MiB 分块
+/// 等于 26 万个块，JSON 约 2 MB，且每 750ms 一次。顺序传输下块号是连续的，
+/// 用区间表示通常只剩几个元素；缺口多时最坏退化为"每块一个区间"，
+/// 也比逐个数字小得多（每个区间 2 个 32 位整数）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedRanges {
+    #[serde(default)]
+    ranges: Vec<[u32; 2]>,
+}
+
+impl CompletedRanges {
+    /// 由**升序**块号构造（`BTreeSet` 迭代天然升序）。乱序输入只会多出区间，不会出错。
+    pub fn from_sorted(iter: impl IntoIterator<Item = usize>) -> Self {
+        let mut ranges: Vec<[u32; 2]> = Vec::new();
+        for index in iter {
+            let value = index.min(u32::MAX as usize) as u32;
+            match ranges.last_mut() {
+                Some(last) if value == last[1].saturating_add(1) => last[1] = value,
+                Some(last) if value <= last[1] => {}
+                _ => ranges.push([value, value]),
+            }
+        }
+        Self { ranges }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// 已完成块的精确数量（区间长度之和）。
+    pub fn len(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|range| (range[1] - range[0]) as usize + 1)
+            .sum()
+    }
+
+    /// 是否包含某块（区间有序且互不重叠，二分查找）。
+    pub fn contains(&self, index: usize) -> bool {
+        let value = index.min(u32::MAX as usize) as u32;
+        self.ranges
+            .binary_search_by(|range| {
+                if range[1] < value {
+                    std::cmp::Ordering::Less
+                } else if range[0] > value {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// 最大块号（用于校验对端是否返回了超出清单的块）。
+    pub fn max(&self) -> Option<usize> {
+        self.ranges.last().map(|range| range[1] as usize)
+    }
+
+    /// 展开为逐块迭代器（顺序即升序）。
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ranges
+            .iter()
+            .flat_map(|range| (range[0]..=range[1]).map(|value| value as usize))
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Request {
-    SkipFile { id: String, file: usize },
+pub enum Request {    SkipFile {
+        id: String,
+        file: usize,
+    },
     Addresses,
     Hello {
         version: u16,
         node_id: String,
         display_name: String,
     },
+    /// 建立/复用接收任务：只带清单摘要与指纹，返 `Ready` 表示需继续接收分片清单。
     Offer {
         id: String,
-        manifest: Manifest,
+        summary: OfferSummary,
+    },
+    /// 清单分片：`first` 为本片首条在整份清单中的下标（0 起，按序递增）。
+    ManifestChunk {
+        id: String,
+        first: usize,
+        entries: Vec<FileEntry>,
+    },
+    /// 清单发送完毕：最终计数和摘要只在扫描结束后确定，接收端据此校验清单。
+    ManifestDone {
+        id: String,
+        file_count: usize,
+        total_size: u64,
+        digest: String,
     },
     Poll {
         id: String,
@@ -63,7 +152,11 @@ pub struct NativeEntry {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Addresses { addresses: Vec<String>, tcp_port: u16, quic_port: u16 },
+    Addresses {
+        addresses: Vec<String>,
+        tcp_port: u16,
+        quic_port: u16,
+    },
     Hello {
         version: u16,
         node_id: String,
@@ -73,9 +166,11 @@ pub enum Response {
     },
     State {
         status: String,
-        completed: Vec<usize>,
+        completed: CompletedRanges,
     },
     Ack,
+    /// 清单分片已写入（逐片确认，形成背压，避免接收端无界缓冲）。
+    ManifestAck,
     Listing {
         entries: Vec<NativeEntry>,
     },
@@ -83,6 +178,7 @@ pub enum Response {
         length: u64,
     },
     Ready,
+    ManifestResume { next_index: usize },
     Error {
         message: String,
     },
@@ -110,7 +206,8 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
     read_frame_with_timeout(r, IO_TIMEOUT).await
 }
 pub async fn read_frame_with_timeout<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
-    r: &mut R, timeout: std::time::Duration,
+    r: &mut R,
+    timeout: std::time::Duration,
 ) -> AppResult<T> {
     tokio::time::timeout(timeout, async {
         let length = r.read_u32().await? as usize;

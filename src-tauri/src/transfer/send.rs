@@ -1,4 +1,7 @@
-use super::{model::TaskRecord, source, TransferService};
+use super::{
+    model::{Manifest, ManifestDigest, TaskRecord},
+    source, TransferService, MANIFEST_BATCH, MANIFEST_PAGE,
+};
 use crate::{
     error::{AppError, AppResult},
     network::{
@@ -9,17 +12,175 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
-    time::Duration,
 };
 use tokio::sync::Mutex;
+/// 流式扫描的共享状态。
+///
+/// 两条入口——"全新发送"与"接收端已有该任务时补齐剩余扫描"——此前各写了一份
+/// 结构相同、细节略有差异的循环（改一处漏一处是隐患）。现在统一走
+/// [`TransferService::stream_scan`]，差异只用下面的开关表达。
+struct ScanStream {
+    /// 已交付接收端的清单前缀长度；小于它的分片不再重发（续传）。
+    resume_manifest_at: usize,
+    /// 扫描过程中是否顺带发送已就绪文件的数据（补齐扫描时为 false：数据早前已发）。
+    send_data: bool,
+    entries: Vec<super::model::FileEntry>,
+    pending_files: VecDeque<(usize, usize)>,
+    sent_chunks: BTreeSet<usize>,
+    chunk_count: usize,
+    total_size: u64,
+    directories: usize,
+    digest: ManifestDigest,
+    /// 已扫描但尚未落库的条目：累计到 [`MANIFEST_PAGE`] 再一次性写库，
+    /// 这样每帧仍按 [`MANIFEST_BATCH`] 小批量发送（先发先算），
+    /// 但数据库事务按 5000 条摊销。
+    db_buffer: Vec<super::model::FileEntry>,
+    /// `db_buffer` 首条在清单中的下标。
+    db_buffer_start: usize,
+}
 impl TransferService {
+    /// 从 `scanner`（已定位到 `first` 之前）继续逐批扫描并增量交付清单，
+    /// 直到扫完；返回扫描结束时的条目游标。
+    ///
+    /// 每批都：发清单分片（必要时跳过已交付前缀）→ 累加摘要/计数 →
+    /// 累计到落库批次后写库并推进游标 →（可选）发送已就绪文件的数据。
+    /// 任何一步发现任务被停止都会立即返回。
+    async fn stream_scan(
+        &self,
+        control: &mut Channel,
+        task: &TaskRecord,
+        state: &mut ScanStream,
+        mut scanner: source::SourceScanner,
+        mut first: usize,
+    ) -> AppResult<usize> {
+        loop {
+            if self.stopped(&task.id)? {
+                return Ok(first);
+            }
+            let batch = tokio::task::spawn_blocking(move || {
+                let batch = scanner.next_batch(MANIFEST_BATCH)?;
+                Ok::<_, AppError>((scanner, batch))
+            })
+            .await
+            .map_err(|e| AppError::Other(e.to_string()))??;
+            scanner = batch.0;
+            let page = batch.1;
+            if page.is_empty() {
+                break;
+            }
+            let send_offset = state.resume_manifest_at.saturating_sub(first).min(page.len());
+            if send_offset < page.len() {
+                let requested = std::time::Instant::now();
+                let response = control
+                    .request(&Request::ManifestChunk {
+                        id: task.wire_id.clone(),
+                        first: first + send_offset,
+                        entries: page[send_offset..].to_vec(),
+                    })
+                    .await?;
+                let elapsed = requested.elapsed();
+                if elapsed >= crate::tuning::SLOW_REQUEST_WARN {
+                    tracing::warn!(
+                        task = %task.wire_id,
+                        first = first + send_offset,
+                        entries = page.len() - send_offset,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "接收端处理清单分片较慢"
+                    );
+                } else {
+                    tracing::info!(
+                        task = %task.wire_id,
+                        first = first + send_offset,
+                        entries = page.len() - send_offset,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "清单分片已确认"
+                    );
+                }
+                match response {
+                    Response::ManifestAck => {}
+                    Response::State { status, .. }
+                        if ["cancelled", "rejected"].contains(&status.as_str()) =>
+                    {
+                        self.edit(&task.id, |t| t.status = status)?;
+                        return Ok(first);
+                    }
+                    _ => return Err(AppError::Other("接收方未确认清单分片".into())),
+                }
+            }
+            for (page_offset, entry) in page.iter().enumerate() {
+                state.digest.update(entry);
+                state.total_size = state.total_size.saturating_add(entry.size);
+                state.directories += usize::from(entry.directory);
+                if !entry.directory && entry.size > 0 {
+                    if state.send_data {
+                        state
+                            .pending_files
+                            .push_back((first + page_offset, state.chunk_count));
+                    }
+                    state.chunk_count += entry.size.div_ceil(task.chunk_size) as usize;
+                }
+            }
+            state.entries.extend(page.iter().cloned());
+            state.db_buffer.extend(page.iter().cloned());
+            first += page.len();
+            // 扫满一个落库批次才写数据库：扫描/发送按 256 条小步推进，
+            // 数据库按 5000 条摊销事务；两者互不阻塞。
+            if state.db_buffer.len() >= MANIFEST_PAGE {
+                let start = state.db_buffer_start;
+                let buffered = std::mem::take(&mut state.db_buffer);
+                state.db_buffer_start = first;
+                self.append_source_batch(
+                    &task.id,
+                    start,
+                    &buffered,
+                    state.directories,
+                    state.total_size,
+                    state.chunk_count,
+                )?;
+                // 每 4 个落库批次（约 2 万条）写一条任务事件：界面能直接看出清单在推进。
+                if (first / MANIFEST_PAGE).is_multiple_of(4) || first <= MANIFEST_PAGE {
+                    self.edit(&task.id, |t| {
+                        t.event(format!("正在分段发送清单：已扫描 {first} 条"))
+                    })?;
+                }
+            }
+            if self.stopped(&task.id)? {
+                return Ok(first);
+            }
+            if state.send_data {
+                self.send_streaming_ready_files(
+                    control,
+                    task,
+                    &state.entries,
+                    &mut state.pending_files,
+                    &mut state.sent_chunks,
+                )
+                .await?;
+            }
+        }
+        // 收尾：把不足一个落库批次的剩余条目写库，游标推进到扫描终点。
+        if !state.db_buffer.is_empty() {
+            let start = state.db_buffer_start;
+            let buffered = std::mem::take(&mut state.db_buffer);
+            state.db_buffer_start = first;
+            self.append_source_batch(
+                &task.id,
+                start,
+                &buffered,
+                state.directories,
+                state.total_size,
+                state.chunk_count,
+            )?;
+        }
+        Ok(first)
+    }
     pub fn start_task(self: &Arc<Self>, peers: Arc<PeerStore>, id: String) {
-        if !self.active.lock().unwrap().insert(id.clone()) {
+        if self.runtime(&id).active.swap(true, Ordering::SeqCst) {
             return;
         }
         let service = self.clone();
@@ -49,13 +210,13 @@ impl TransferService {
                             if !retry || attempt == 2 {
                                 return Err(err);
                             }
-                            cooldown.store(chrono::Utc::now().timestamp() + 30, Ordering::Relaxed);
+                            cooldown.store(chrono::Utc::now().timestamp() + crate::tuning::SEND_RETRY_COOLDOWN_SECS, Ordering::Relaxed);
                             service.edit(&id, |t| {
                                 t.status = "paused".into();
                                 t.error = Some(err.to_string());
                                 t.event("连接中断，已暂停；点击继续后重新检查所有地址");
                             })?;
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            tokio::time::sleep(crate::tuning::SEND_RETRY_DELAY).await;
                         }
                     }
                 }
@@ -71,12 +232,25 @@ impl TransferService {
                     }
                 });
             }
-            service.active.lock().unwrap().remove(&id);
+            // 任务结束（含暂停/取消/完成）：释放发送端读句柄，避免常驻占用。
+            service.release_send_files(&id);
+            // 终态（完成/取消/被拒）时整体释放运行期资源；暂停保留，续传时复用。
+            let terminal = service
+                .status_of(&id)
+                .map(|status| ["completed", "cancelled", "rejected"].contains(&status.as_str()))
+                .unwrap_or(false);
+            if terminal {
+                service.release_runtime(&id);
+            } else {
+                service.runtime(&id).active.store(false, Ordering::SeqCst);
+            }
         });
     }
     fn stopped(&self, id: &str) -> AppResult<bool> {
-        Ok(["paused", "cancelled", "rejected", "completed"]
-            .contains(&self.record(id)?.status.as_str()))
+        Ok(
+            ["paused", "cancelled", "rejected", "completed"]
+                .contains(&self.status_of(id)?.as_str()),
+        )
     }
     async fn channel(
         &self,
@@ -101,7 +275,9 @@ impl TransferService {
                     peers.seen(&task.peer_id, endpoint);
                     // TCP is a fallback for this connection only. Do not keep
                     // a cooldown: the next reconnect must probe QUIC again.
-                    if channel.kind == "tcp" { cooldown.store(0, Ordering::Relaxed); }
+                    if channel.kind == "tcp" {
+                        cooldown.store(0, Ordering::Relaxed);
+                    }
                     self.edit(&task.id, |t| {
                         if t.transport.as_deref() != Some(channel.kind) {
                             t.event(format!(
@@ -122,23 +298,414 @@ impl TransferService {
         }
         Err(AppError::Other(last))
     }
+    /// 补齐未完成的清单扫描（恢复/重试路径）。
+    ///
+    /// Offer 返回 `Ready` 才会走上面的流式扫描；接收端已经存在同名任务时返回
+    /// 的是状态帧，扫描阶段被跳过，`scan_complete` 会一直是 false：小任务表现为
+    /// "数据都传完了还显示正在扫描"，大目录则永远发不完剩余清单。这里按持久化
+    /// 游标继续扫描、补发分片，最后发 `ManifestDone` 并落 `scan_complete`。
+    async fn complete_source_scan(&self, control: &mut Channel, id: &str) -> AppResult<()> {
+        let task = self.record(id)?;
+        if task.manifest.entries.is_empty() && task.sources.is_empty() {
+            return Ok(());
+        }
+        let wire_id = task.wire_id.clone();
+        let selected = task
+            .sources
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        let cursor = task.file_count;
+        let last_path = task.scan_last_path.clone();
+        let directories = task.directory_count;
+        let total_size = task.total_size;
+        let chunk_count = task.chunk_count;
+        tracing::info!(task = %id, cursor, "清单扫描未完成，继续扫描剩余条目");
+        self.edit(id, |t| {
+            t.event(format!("接收方已有该任务：从第 {cursor} 条继续扫描剩余清单"))
+        })?;
+        let scanner = tokio::task::spawn_blocking(move || {
+            let mut scanner = source::SourceScanner::new(selected)?;
+            scanner.resume_after(cursor, &last_path)?;
+            Ok::<_, AppError>(scanner)
+        })
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))??;
+        // 与全新发送共用同一段扫描循环（send_data=false：数据早已发出）。
+        let mut stream = ScanStream {
+            resume_manifest_at: cursor,
+            send_data: false,
+            entries: Vec::new(),
+            pending_files: VecDeque::new(),
+            sent_chunks: BTreeSet::new(),
+            chunk_count,
+            total_size,
+            directories,
+            digest: ManifestDigest::new(),
+            db_buffer: Vec::new(),
+            db_buffer_start: cursor,
+        };
+        let _ = self
+            .stream_scan(control, &task, &mut stream, scanner, cursor)
+            .await?;
+        let digest = self.record(id)?.manifest.digest();
+        self.finish_source_scan(id, digest)?;
+        let complete = self.record(id)?;
+        tracing::info!(
+            task = %id,
+            files = complete.file_count,
+            total = complete.total_size,
+            "清单扫描已补齐"
+        );
+        self.edit(id, |t| {
+            t.event(format!(
+                "清单扫描已补齐：{} 个文件 · {} 个目录",
+                t.file_count, t.directory_count
+            ))
+        })?;
+        // 结束帧的响应由调用方的 Poll 统一处理；这里只把错误向上抛。
+        let _ = control
+            .request(&Request::ManifestDone {
+                id: wire_id,
+                file_count: complete.file_count,
+                total_size: complete.total_size,
+                digest: complete.digest.clone(),
+            })
+            .await?;
+        Ok(())
+    }
+    async fn send_streaming_ready_files(
+        &self,
+        control: &mut Channel,
+        task: &TaskRecord,
+        entries: &[super::model::FileEntry],
+        pending: &mut VecDeque<(usize, usize)>,
+        sent: &mut BTreeSet<usize>,
+    ) -> AppResult<()> {
+        let state = control.request(&Request::Poll { id: task.wire_id.clone() }).await?;
+        let (status, completed) = match state {
+            Response::State { status, completed } => (status, completed),
+            _ => return Err(AppError::Other("接收方未返回清单扫描状态".into())),
+        };
+        if !["accepted", "transferring"].contains(&status.as_str()) {
+            if ["cancelled", "rejected"].contains(&status.as_str()) {
+                self.edit(&task.id, |record| record.status = status)?;
+            }
+            return Ok(());
+        }
+        let remote_completed = completed.iter().collect::<BTreeSet<_>>();
+        // 每轮只占用有限的几秒发送"已扫描到"的文件数据：清单扫描优先推进，
+        // 其余数据交给扫描结束后的工作线程并发发送。否则大目录里扫描会被
+        // 数据发送饿死（几万文件时表现为永远停在"正在扫描"）。
+        // 边扫边传是刻意设计：数据发送不向扫描让路（真实场景是 1TB/20 万文件，
+        // 扫描本来就要十几分钟）。这里只限制"单个文件独占时间片"，避免一个
+        // 大文件把清单扫描一直堵到它传完。
+        let deadline = std::time::Instant::now() + crate::tuning::SEND_DATA_SLICE;
+        let mut handled = 0usize;
+        let mut sent_chunks_now = 0usize;
+        while let Some((file_index, first_chunk)) = pending.pop_front() {
+            if handled > 0 && std::time::Instant::now() >= deadline {
+                pending.push_front((file_index, first_chunk));
+                break;
+            }
+            if self.stopped(&task.id)? {
+                pending.push_front((file_index, first_chunk));
+                return Ok(());
+            }
+            let Some(entry) = entries.get(file_index) else {
+                return Err(AppError::Conflict("扫描中的文件索引不连续".into()));
+            };
+            if entry.directory || entry.size == 0 { continue; }
+            handled += 1;
+            let chunk_count = entry.size.div_ceil(task.chunk_size) as usize;
+            let mut truncated = false;
+            for local_index in 0..chunk_count {
+                // 单个大文件不能在时间片里独占：到点把该文件退回队首，
+                // 已发送的块在下一轮会被 sent 去重跳过。否则一个 10 GB 文件
+                // 会把清单扫描一直堵到它传完。
+                if sent_chunks_now > 0 && std::time::Instant::now() >= deadline {
+                    pending.push_front((file_index, first_chunk));
+                    truncated = true;
+                    break;
+                }
+                if self.stopped(&task.id)? {
+                    pending.push_front((file_index, first_chunk));
+                    return Ok(());
+                }
+                let index = first_chunk + local_index;
+                if sent.contains(&index) || remote_completed.contains(&index) { continue; }
+                let offset = local_index as u64 * task.chunk_size;
+                let length = task.chunk_size.min(entry.size - offset) as usize;
+                let bytes = match self
+                    .read_chunk_entry(&task, file_index, entry, offset, length)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(AppError::Conflict(_)) => {
+                        match control.request(&Request::SkipFile { id: task.wire_id.clone(), file: file_index }).await? {
+                            Response::Ack => {},
+                            _ => return Err(AppError::Other("接收方未确认跳过变化文件".into())),
+                        }
+                        self.mark_skipped(&task.id, file_index)?;
+                        for skipped in first_chunk..first_chunk + chunk_count { sent.insert(skipped); }
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let sha256 = task.verify_hash.then(|| format!("{:x}", Sha256::digest(&bytes)));
+                match control.chunk(&Request::Chunk { id: task.wire_id.clone(), index, length: bytes.len(), sha256 }, &bytes).await? {
+                    Response::Ack => {
+                        self.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
+                        sent.insert(index);
+                        sent_chunks_now += 1;
+                        // 数据一开始流动就把状态从"正在连接"切到"传输中"，
+                        // 否则界面会在整个清单/数据阶段一直显示正在连接。
+                        if sent_chunks_now == 1 {
+                            self.edit(&task.id, |record| {
+                                if ["queued", "connecting", "waiting"].contains(&record.status.as_str()) {
+                                    record.status = "transferring".into();
+                                    record.event("已开始发送文件数据");
+                                }
+                            })?;
+                        }
+                    }
+                    Response::State { status, .. } if status == "paused" => { pending.push_front((file_index, first_chunk)); return Ok(()); }
+                    Response::State { status, .. } if ["cancelled", "rejected"].contains(&status.as_str()) => { self.edit(&task.id, |record| record.status = status)?; return Ok(()); }
+                    _ => return Err(AppError::Other("接收方未确认流式数据块".into())),
+                }
+            }
+            if truncated {
+                break;
+            }
+        }
+        Ok(())
+    }
     async fn send_once(
         self: &Arc<Self>,
         peers: Arc<PeerStore>,
         id: &str,
         cooldown: Arc<AtomicI64>,
     ) -> AppResult<()> {
-        let task = self.edit(id, |t| {
+        let mut task = self.edit(id, |t| {
             t.status = "connecting".into();
             t.error = None;
         })?;
+        // Resume guard: if a selected top-level item changed, discard this task's
+        // old manifest/chunk state and begin a fresh scan under a new wire ID.
+        let mut stale_wire = None;
+        if let Err(error) = source::verify_top_level_fingerprint(&task) {
+            if !matches!(&error, AppError::Conflict(_)) {
+                return Err(error);
+            }
+            let old_wire = task.wire_id.clone();
+            let selected = task.sources.iter().map(|root| root.path.clone()).collect();
+            let verify_hash = task.verify_hash;
+            let (sources, roots) = tokio::task::spawn_blocking(move || {
+                let mut scanner = source::SourceScanner::new(selected)?;
+                let sources = scanner.roots().to_vec();
+                let roots = scanner.next_batch(sources.len().max(1))?;
+                Ok::<_, AppError>((sources, roots))
+            })
+            .await
+            .map_err(|e| AppError::Other(e.to_string()))??;
+            let top_level_count = sources.len();
+            let fingerprint = source::top_level_fingerprint(&sources);
+            self.clear_entries(id)?;
+            self.app.db.with_conn(|conn| {
+                for table in ["task_chunks", "task_targets", "task_skipped", "task_relay"] {
+                    conn.execute(&format!("DELETE FROM {table} WHERE task_id=?1"), [id])?;
+                }
+                Ok(())
+            })?;
+            task = self.edit(id, |record| {
+                record.wire_id = super::model::random_id();
+                record.sources = sources;
+                record.top_level_count = top_level_count;
+                record.top_level_fingerprint = fingerprint;
+                record.attach_manifest(Manifest::new(roots, super::CHUNK_SIZE, verify_hash));
+                record.digest.clear();
+                record.scan_last_seq = record.file_count;
+                record.scan_last_path = record.manifest.entries.last().map(|entry| entry.path.clone()).unwrap_or_default();
+                record.scan_complete = false;
+                record.completed.clear();
+                record.completed_count = 0;
+                record.completed_bytes = 0;
+                record.targets.clear();
+                record.relayed.clear();
+                record.skipped_files.clear();
+                record.skipped_bytes = 0;
+                record.skipped_paths.clear();
+                record.relayed_total = 0;
+                record.relay_target_bytes = 0;
+                record.status = "connecting".into();
+                record.error = None;
+                record.event("顶层项目元数据变化，已清除旧恢复状态并重新扫描");
+            })?;
+            self.save_entries(&task)?;
+            stale_wire = Some(old_wire);
+        }
         let mut control = self.channel(&peers, &task, &cooldown).await?;
+        if let Some(old_wire) = stale_wire {
+            let _ = control.request(&Request::Cancel { id: old_wire }).await;
+        }
+        // 先用摘要 + 指纹建立接收任务：重复 Offer 返回当前状态，`Ready` 表示需继续发分片清单。
+        let mut offer_summary = task.manifest.offer_summary();
+        offer_summary.streaming = true;
+        offer_summary.file_count = 0;
+        offer_summary.directory_count = 0;
+        offer_summary.total_size = 0;
+        offer_summary.chunk_count = 0;
+        offer_summary.digest.clear();
+        offer_summary.top_level_fingerprint = task.top_level_fingerprint.clone();
         let mut state = control
             .request(&Request::Offer {
                 id: task.wire_id.clone(),
-                manifest: task.manifest.clone(),
+                summary: offer_summary,
             })
             .await?;
+        let mut resume_manifest_at = 0usize;
+        state = match state {
+            Response::ManifestResume { next_index } => {
+                resume_manifest_at = next_index;
+                Response::Ready
+            }
+            other => other,
+        };
+        // 任务事件直接显示在任务详情里：不翻日志也能看出停在哪一步。
+        self.edit(id, |t| {
+            t.event(match &state {
+                Response::Ready => "接收方已就绪：开始扫描并把清单分段发给对方",
+                _ => "接收方已有该任务：先同步状态，再补齐剩余清单",
+            })
+        })?;
+        if matches!(state, Response::Ready) {
+            // The Offer is sent before recursive traversal. Send selected roots
+            // first, then walk and acknowledge bounded manifest batches as they
+            // are discovered instead of building the full tree up front.
+            let mut entries = task.manifest.entries.clone();
+            let mut digest = ManifestDigest::new();
+            let mut total_size = 0u64;
+            let mut directories = 0usize;
+            let mut chunk_count = 0usize;
+            let mut pending_files = VecDeque::new();
+            let mut sent_chunks = BTreeSet::new();
+            for (file_index, entry) in entries.iter().enumerate() {
+                digest.update(entry);
+                total_size = total_size.saturating_add(entry.size);
+                directories += usize::from(entry.directory);
+                if !entry.directory && entry.size > 0 {
+                    pending_files.push_back((file_index, chunk_count));
+                    chunk_count += entry.size.div_ceil(task.chunk_size) as usize;
+                }
+            }
+            for (page_index, page) in entries
+                .get(resume_manifest_at.min(entries.len())..)
+                .unwrap_or_default()
+                .chunks(MANIFEST_PAGE)
+                .enumerate()
+            {
+                let first = resume_manifest_at + page_index * MANIFEST_PAGE;
+                let requested = std::time::Instant::now();
+                let response = control
+                    .request(&Request::ManifestChunk {
+                        id: task.wire_id.clone(),
+                        first,
+                        entries: page.to_vec(),
+                    })
+                    .await?;
+                let elapsed = requested.elapsed();
+                if elapsed >= crate::tuning::SLOW_REQUEST_WARN {
+                    tracing::warn!(
+                        task = %task.wire_id,
+                        first,
+                        entries = page.len(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "接收端处理清单分片较慢"
+                    );
+                } else {
+                    tracing::info!(
+                        task = %task.wire_id,
+                        first,
+                        entries = page.len(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "清单分片已确认"
+                    );
+                }
+                match response {
+                    Response::ManifestAck => {}
+                    Response::State { status, .. }
+                        if ["cancelled", "rejected"].contains(&status.as_str()) =>
+                    {
+                        self.edit(id, |t| t.status = status)?;
+                        return Ok(());
+                    }
+                    _ => return Err(AppError::Other("接收方未确认顶层清单".into())),
+                }
+            }
+
+            self.send_streaming_ready_files(
+                &mut control,
+                &task,
+                &entries,
+                &mut pending_files,
+                &mut sent_chunks,
+            )
+            .await?;
+            if self.stopped(id)? {
+                return Ok(());
+            }
+            let selected = task.sources.iter().map(|root| root.path.clone()).collect();
+            let roots_count = entries.len();
+            let last_root = entries.last().map(|entry| entry.path.clone()).unwrap_or_default();
+            tracing::info!(task = %task.wire_id, roots = roots_count, "清单阶段：顶层已发送，准备继续扫描目录");
+            let scanner = tokio::task::spawn_blocking(move || {
+                let mut scanner = source::SourceScanner::new(selected)?;
+                scanner.resume_after(roots_count, &last_root)?;
+                Ok::<_, AppError>(scanner)
+            })
+            .await
+            .map_err(|e| AppError::Other(e.to_string()))??;
+            tracing::info!(task = %task.wire_id, "清单阶段：扫描器已就绪，开始逐批扫描");
+            // 与"补齐剩余扫描"共用同一段循环：这里 send_data=true（边扫边传）。
+            let mut stream = ScanStream {
+                resume_manifest_at,
+                send_data: true,
+                entries: std::mem::take(&mut entries),
+                pending_files: std::mem::take(&mut pending_files),
+                sent_chunks: std::mem::take(&mut sent_chunks),
+                chunk_count,
+                total_size,
+                directories,
+                digest,
+                db_buffer: Vec::new(),
+                db_buffer_start: roots_count,
+            };
+            let first = self
+                .stream_scan(&mut control, &task, &mut stream, scanner, roots_count)
+                .await?;
+            let ScanStream { entries, digest, .. } = stream;
+            let final_digest = digest.finish();
+            let manifest = Manifest::new(entries, task.chunk_size, task.verify_hash);
+            manifest.validate()?;
+            drop(manifest);
+            tracing::info!(task = %task.wire_id, entries = first, "清单阶段：扫描结束，发送清单结束帧");
+            self.finish_source_scan(id, final_digest)?;
+            self.edit(id, |t| {
+                t.event(format!(
+                    "清单扫描完成：{} 个文件 · {} 个目录",
+                    t.file_count, t.directory_count
+                ))
+            })?;
+            task = self.record(id)?;
+            state = control
+                .request(&Request::ManifestDone {
+                    id: task.wire_id.clone(),
+                    file_count: task.file_count,
+                    total_size: task.total_size,
+                    digest: task.digest.clone(),
+                })
+                .await?;
+        }
         loop {
             if self.stopped(id)? {
                 if self.record(id)?.status == "cancelled" {
@@ -154,12 +721,26 @@ impl TransferService {
                 Response::State { status, completed }
                     if ["accepted", "transferring", "completed"].contains(&status.as_str()) =>
                 {
-                    let count = task.manifest.chunks().len();
-                    if completed.iter().any(|i| *i >= count) {
+                    let count = task.chunk_count;
+                    if completed.max().is_some_and(|last| last >= count) {
                         return Err(AppError::BadRequest("对端返回非法分块状态".into()));
                     }
                     self.edit(id, |t| {
-                        t.completed = completed.into_iter().collect();
+                        // 只累加"本次新增"的块：原先每次都遍历全部已完成块重算
+                        // 总量，几十万块时是 O(n) 重复劳动，会拖慢状态刷新。
+                        let mut added = 0u64;
+                        for index in completed.iter() {
+                            if t.completed.insert(index)
+                                && t.manifest
+                                    .chunk(index)
+                                    .is_some_and(|c| !t.skipped_files.contains(&c.file))
+                            {
+                                added = added
+                                    .saturating_add(t.manifest.chunk(index).map(|c| c.length as u64).unwrap_or(0));
+                            }
+                        }
+                        t.completed_count = t.completed.len();
+                        t.completed_bytes = t.completed_bytes.saturating_add(added);
                         t.status = if status == "completed" {
                             "completed"
                         } else {
@@ -185,7 +766,7 @@ impl TransferService {
                     if ["waiting", "paused", "interrupted"].contains(&status.as_str()) =>
                 {
                     self.edit(id, |t| t.status = "waiting".into())?;
-                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    tokio::time::sleep(crate::tuning::SEND_POLL_INTERVAL).await;
                     state = control
                         .request(&Request::Poll {
                             id: task.wire_id.clone(),
@@ -195,12 +776,38 @@ impl TransferService {
                 _ => return Err(AppError::Other("接收方未返回有效接收状态".into())),
             }
         }
+        // Offer 返回的不是 Ready 时（恢复/重试的任务，接收端已有该任务）上面的
+        // 扫描阶段会被整体跳过，scan_complete 会永远是 false —— 表现就是"文件都
+        // 传完了还显示正在扫描"，大目录则永远发不完清单。这里补齐剩余扫描。
+        if !self.record(id)?.scan_complete {
+            match self.complete_source_scan(&mut control, id).await {
+                Ok(()) => {
+                    // 扫描状态与计数已变化：重新读取任务后再进入数据阶段。
+                    task = self.record(id)?;
+                    // 补齐清单期间接收方可能取消或拒绝：按状态收尾。
+                    if let Response::State { status, .. } = control
+                        .request(&Request::Poll {
+                            id: task.wire_id.clone(),
+                        })
+                        .await?
+                    {
+                        if ["cancelled", "rejected"].contains(&status.as_str()) {
+                            self.edit(id, |t| t.status = status)?;
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(task = %id, %error, "补齐清单扫描失败");
+                    return Err(error);
+                }
+            }
+        }
         let chunks = task.manifest.chunks();
-        let current = self.record(id)?;
         let pending = chunks
             .iter()
             .enumerate()
-            .filter(|(i, _)| !current.completed.contains(i))
+            .filter(|(i, _)| !self.is_completed(id, *i))
             .map(|(i, c)| (i, *c))
             .collect::<VecDeque<_>>();
         let concurrency = pending.len().clamp(1, 4);
@@ -223,20 +830,29 @@ impl TransferService {
                     let Some((index, chunk)) = queue.lock().await.pop_front() else {
                         break;
                     };
-                    if service.record(&task.id)?.skipped_files.contains(&chunk.file) { continue; }
-                    let bytes = match source::read_chunk(&task, chunk).await {
+                    if service.is_skipped(&task.id, chunk.file) {
+                        continue;
+                    }
+                    let bytes = match service.read_chunk_cached(&task, chunk).await {
                         Ok(bytes) => bytes,
                         Err(AppError::Conflict(_)) => {
-                            match channel.request(&Request::SkipFile { id: task.wire_id.clone(), file: chunk.file }).await? {
-                                Response::Ack => {},
-                                _ => return Err(AppError::Other("接收方未确认跳过变化文件，请更新两端软件后重试".into())),
+                            match channel
+                                .request(&Request::SkipFile {
+                                    id: task.wire_id.clone(),
+                                    file: chunk.file,
+                                })
+                                .await?
+                            {
+                                Response::Ack => {}
+                                _ => {
+                                    return Err(AppError::Other(
+                                        "接收方未确认跳过变化文件，请更新两端软件后重试".into(),
+                                    ))
+                                }
                             }
-                            service.edit(&task.id, |t| {
-                                if t.skipped_files.insert(chunk.file) { t.event(format!("源文件已变化，跳过：{}", task.manifest.entries[chunk.file].path)); }
-                                for (i, c) in t.manifest.chunks().iter().enumerate() { if c.file == chunk.file { t.completed.insert(i); } }
-                            })?;
+                            service.mark_skipped(&task.id, chunk.file)?;
                             continue;
-                        },
+                        }
                         Err(e) => return Err(e),
                     };
                     let sha256 = task
@@ -260,9 +876,7 @@ impl TransferService {
                             .await?
                         {
                             Response::Ack => {
-                                service.edit(&task.id, |t| {
-                                    t.completed.insert(index);
-                                })?;
+                                service.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
                                 break;
                             }
                             Response::State { status, .. } if status == "paused" => {
@@ -276,7 +890,7 @@ impl TransferService {
                                     if service.stopped(&task.id)? {
                                         return Ok(());
                                     }
-                                    tokio::time::sleep(Duration::from_millis(750)).await;
+                                    tokio::time::sleep(crate::tuning::SEND_POLL_INTERVAL).await;
                                     match channel
                                         .request(&Request::Poll {
                                             id: task.wire_id.clone(),
@@ -350,13 +964,17 @@ impl TransferService {
                     })?;
                     return Ok(());
                 }
-                Response::State { status, .. } if status == "paused" => {
+                Response::State { status, .. }
+                    if ["paused", "accepted", "transferring"].contains(&status.as_str()) =>
+                {
+                    // 提交可能要对几十万文件做 rename，接收端会持续报告 transferring；
+                    // 这里必须继续等待回执，不能当成错误结束。
                     self.edit(id, |t| {
-                        if t.status == "transferring" {
-                            t.status = "waiting".into();
+                        if t.status == "waiting" {
+                            t.status = "transferring".into();
                         }
                     })?;
-                    tokio::time::sleep(Duration::from_millis(750)).await;
+                    tokio::time::sleep(crate::tuning::SEND_POLL_INTERVAL).await;
                 }
                 Response::State { status, .. }
                     if ["cancelled", "rejected"].contains(&status.as_str()) =>

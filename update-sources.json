@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "config_version": 1,
+  "channels": {
+    "stable": {
+      "sources": [
+        {
+          "id": "github-raw-stable",
+          "manifest_url": "https://raw.githubusercontent.com/picdupe/NodeSend/main/updates/stable/latest.json"
+        }
+      ]
+    },
+    "test": {
+      "sources": [
+        {
+          "id": "github-raw-test",
+          "manifest_url": "https://raw.githubusercontent.com/picdupe/NodeSend/main/updates/test/latest.json"
+        }
+      ]
+    }
+  }
+}

@@ -10,6 +10,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $fastBuild = $Fast -or $Debug
 $projectRoot = Split-Path $PSScriptRoot -Parent
+$versionScript = Join-Path $PSScriptRoot 'version.py'
+$python = Get-Command python -ErrorAction SilentlyContinue
+if (-not $python) { throw 'Python 3 is required to synchronize the release version. Install Python and ensure python.exe is on PATH.' }
+$versionAction = & $python.Source $versionScript sync
+if ($LASTEXITCODE -ne 0) { throw 'Could not synchronize NodeSend version metadata.' }
+Write-Output $versionAction
 $properties = Join-Path $projectRoot 'src-tauri/gen/android/local.properties'
 if (Test-Path -LiteralPath $properties) {
     $sdkLine = Get-Content -LiteralPath $properties | Where-Object { $_ -match '^sdk\.dir=' } | Select-Object -First 1

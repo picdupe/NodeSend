@@ -3,18 +3,42 @@ use crate::{
     error::AppResult,
     network::{peers::Peer, NetworkManager, NetworkStatus},
     transfer::{
-        model::{ConflictPolicy, Manifest},
-        TransferService,
+        model::{ConflictPolicy, FileEntry},
+        PreviewStatus, TransferService,
     },
 };
+use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
+/// 分页清单响应：`entries` 为本页明细，`total` 为该任务清单总条目数。
+#[derive(Serialize)]
+pub struct TaskEntriesPage {
+    pub entries: Vec<FileEntry>,
+    pub total: usize,
+}
+#[tauri::command]
+pub async fn list_task_entries(
+    network: State<'_, Arc<NetworkManager>>,
+    id: String,
+    offset: usize,
+    limit: usize,
+) -> AppResult<TaskEntriesPage> {
+    let (entries, total) = network.transfers.entries_page(&id, offset, limit)?;
+    Ok(TaskEntriesPage { entries, total })
+}
 #[tauri::command]
 pub async fn describe_receive_directory(app: tauri::AppHandle, root: String) -> AppResult<String> {
     #[cfg(target_os = "android")]
-    { crate::android_import::directory_label(app, root).await.map_err(crate::error::AppError::Other) }
+    {
+        crate::android_import::directory_label(app, root)
+            .await
+            .map_err(crate::error::AppError::Other)
+    }
     #[cfg(not(target_os = "android"))]
-    { let _ = app; Ok(root) }
+    {
+        let _ = app;
+        Ok(root)
+    }
 }
 #[tauri::command]
 pub async fn get_network_status(
@@ -82,9 +106,22 @@ pub async fn transfer_action(
 ) -> AppResult<()> {
     network.action(id, action).await
 }
+/// 发送前预览：立即返回当前快照并在后台继续扫描（不阻塞"发送"）。
 #[tauri::command]
-pub async fn preview_transfer(paths: Vec<String>) -> AppResult<Manifest> {
-    TransferService::manifest_preview(paths).await
+pub async fn preview_transfer(paths: Vec<String>) -> AppResult<PreviewStatus> {
+    TransferService::preview_start(paths)
+}
+
+/// 预览扫描进度（界面轮询；扫描结束后仍可读到最终计数）。
+#[tauri::command]
+pub async fn preview_status() -> Option<PreviewStatus> {
+    TransferService::preview_status()
+}
+
+/// 结束预览扫描（选择清空时调用）。
+#[tauri::command]
+pub async fn preview_cancel() -> () {
+    TransferService::preview_cancel();
 }
 #[tauri::command]
 pub async fn stage_text_payload(text: String) -> AppResult<String> {
@@ -181,7 +218,11 @@ pub async fn choose_send_files(directory: bool) -> AppResult<Vec<String>> {
 }
 #[tauri::command]
 #[cfg(target_os = "android")]
-pub async fn choose_send_files(app: tauri::AppHandle, directory: bool, kind: Option<String>) -> AppResult<Vec<String>> {
+pub async fn choose_send_files(
+    app: tauri::AppHandle,
+    directory: bool,
+    kind: Option<String>,
+) -> AppResult<Vec<String>> {
     crate::android_import::pick(app, directory, kind.unwrap_or_else(|| "files".into()))
         .await
         .map_err(crate::error::AppError::Other)

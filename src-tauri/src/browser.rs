@@ -1,7 +1,11 @@
 //! Unified file browser adapters for local shares, native NodeSend, WebDAV, SMB and FTP.
-use chrono::Utc;
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use crate::locks::MutexExt;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use chrono::Utc;
 use futures_util::TryStreamExt;
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -88,13 +92,12 @@ pub struct BrowserManager {
 
 impl BrowserManager {
     pub fn new(app: Arc<AppService>) -> AppResult<Self> {
-        let records = {
-            let conn = app.db.conn();
+        let records: Vec<String> = app.db.with_conn(|conn| {
             let mut stmt =
                 conn.prepare("SELECT record FROM external_connections ORDER BY updated_at DESC")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })?;
         let mut sessions = HashMap::new();
         for record in records {
             let value: serde_json::Value = serde_json::from_str(&record)?;
@@ -147,17 +150,20 @@ impl BrowserManager {
             password: input.password.clone(),
         };
         self.check_connection(&session).await?;
-        public.saved_credential = input.password.as_deref().map(|value| self.encrypt_credential(value)).transpose()?;
+        public.saved_credential = input
+            .password
+            .as_deref()
+            .map(|value| self.encrypt_credential(value))
+            .transpose()?;
         self.persist(&public)?;
-        self.sessions.lock().unwrap().insert(id, session);
+        crate::locks::lock(&self.sessions).insert(id, session);
         Ok(public)
     }
 
     pub fn list(&self) -> Vec<BrowserConnection> {
         let mut values = self
             .sessions
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .values()
             .map(|v| v.public.clone())
             .collect::<Vec<_>>();
@@ -166,7 +172,7 @@ impl BrowserManager {
     }
 
     pub fn close(&self, id: &str) -> AppResult<()> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = crate::locks::lock(&self.sessions);
         let session = sessions
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound("连接标签不存在".into()))?;
@@ -179,8 +185,7 @@ impl BrowserManager {
     pub async fn reopen(&self, id: &str, password: Option<String>) -> AppResult<BrowserConnection> {
         let mut session = self
             .sessions
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get(id)
             .cloned()
             .ok_or_else(|| AppError::NotFound("连接配置不存在".into()))?;
@@ -196,8 +201,7 @@ impl BrowserManager {
         }
         self.persist(&session.public)?;
         self.sessions
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .insert(id.to_string(), session.clone());
         Ok(session.public)
     }
@@ -230,7 +234,7 @@ impl BrowserManager {
             return Err(AppError::BadRequest("连接名称和地址不能为空".into()));
         }
         validate_address(input.protocol, &address)?;
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = crate::locks::lock(&self.sessions);
         let session = sessions
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound("连接配置不存在".into()))?;
@@ -241,22 +245,28 @@ impl BrowserManager {
         if input.password.is_some() {
             session.password = input.password.clone();
         }
-        session.public.saved_credential = session.password.as_deref().map(|value| self.encrypt_credential(value)).transpose()?;
+        session.public.saved_credential = session
+            .password
+            .as_deref()
+            .map(|value| self.encrypt_credential(value))
+            .transpose()?;
         session.public.connected = false;
         self.persist(&session.public)?;
         Ok(session.public.clone())
     }
 
     pub fn remove_connection(&self, id: &str) -> AppResult<()> {
-        let removed = self.sessions.lock().unwrap().remove(id);
+        let removed = crate::locks::lock(&self.sessions).remove(id);
         if removed.is_none() {
             return Err(AppError::NotFound("连接配置不存在".into()));
         }
-        self.app.db.conn().execute(
-            "DELETE FROM external_connections WHERE id=?1",
-            rusqlite::params![id],
-        )?;
-        Ok(())
+        self.app.db.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM external_connections WHERE id=?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
     }
 
     pub async fn browse(&self, id: &str, path: String) -> AppResult<BrowserListing> {
@@ -477,8 +487,7 @@ impl BrowserManager {
     fn session(&self, id: &str) -> AppResult<Session> {
         let session = self
             .sessions
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .get(id)
             .cloned()
             .ok_or_else(|| AppError::NotFound("连接标签不存在".into()))?;
@@ -489,28 +498,50 @@ impl BrowserManager {
     }
     fn persist(&self, public: &BrowserConnection) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        self.app.db.conn().execute("INSERT INTO external_connections(id,record,created_at,updated_at) VALUES(?1,?2,?3,?3) ON CONFLICT(id) DO UPDATE SET record=excluded.record,updated_at=excluded.updated_at",rusqlite::params![public.id,serde_json::to_string(public)?,now])?;
-        Ok(())
+        let json = serde_json::to_string(public)?;
+        self.app.db.with_conn(|conn| {
+            conn.execute("INSERT INTO external_connections(id,record,created_at,updated_at) VALUES(?1,?2,?3,?3) ON CONFLICT(id) DO UPDATE SET record=excluded.record,updated_at=excluded.updated_at",rusqlite::params![public.id, json, now])?;
+            Ok(())
+        })
     }
     fn credential_key(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        Sha256::digest(format!("NodeSend connection credential:{}", self.app.identity.node_id).as_bytes()).into()
+        Sha256::digest(
+            format!(
+                "NodeSend connection credential:{}",
+                self.app.identity.node_id
+            )
+            .as_bytes(),
+        )
+        .into()
     }
     #[allow(deprecated)]
     fn encrypt_credential(&self, value: &str) -> AppResult<String> {
-        let cipher = Aes256Gcm::new_from_slice(&self.credential_key()).map_err(|e| AppError::Crypto(e.to_string()))?;
+        let cipher = Aes256Gcm::new_from_slice(&self.credential_key())
+            .map_err(|e| AppError::Crypto(e.to_string()))?;
         let nonce_bytes: [u8; 12] = rand::random();
-        let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes()).map_err(|_| AppError::Crypto("连接密码加密失败".into()))?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes())
+            .map_err(|_| AppError::Crypto("连接密码加密失败".into()))?;
         Ok(B64.encode([nonce_bytes.as_slice(), ciphertext.as_slice()].concat()))
     }
     #[allow(deprecated)]
     fn decrypt_credential(&self, value: Option<&str>) -> AppResult<Option<String>> {
         let Some(value) = value else { return Ok(None) };
-        let raw = B64.decode(value).map_err(|_| AppError::Crypto("连接密码格式无效".into()))?;
-        if raw.len() < 12 { return Err(AppError::Crypto("连接密码格式无效".into())); }
-        let cipher = Aes256Gcm::new_from_slice(&self.credential_key()).map_err(|e| AppError::Crypto(e.to_string()))?;
-        let plaintext = cipher.decrypt(Nonce::from_slice(&raw[..12]), &raw[12..]).map_err(|_| AppError::Crypto("连接密码无法在此设备解密".into()))?;
-        Ok(Some(String::from_utf8(plaintext).map_err(|_| AppError::Crypto("连接密码格式无效".into()))?))
+        let raw = B64
+            .decode(value)
+            .map_err(|_| AppError::Crypto("连接密码格式无效".into()))?;
+        if raw.len() < 12 {
+            return Err(AppError::Crypto("连接密码格式无效".into()));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&self.credential_key())
+            .map_err(|e| AppError::Crypto(e.to_string()))?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&raw[..12]), &raw[12..])
+            .map_err(|_| AppError::Crypto("连接密码无法在此设备解密".into()))?;
+        Ok(Some(String::from_utf8(plaintext).map_err(|_| {
+            AppError::Crypto("连接密码格式无效".into())
+        })?))
     }
     async fn check_connection(&self, s: &Session) -> AppResult<()> {
         match s.public.protocol {

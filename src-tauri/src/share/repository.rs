@@ -21,37 +21,43 @@ pub fn set_protocol(
     protocol: super::ShareProtocol,
     port: u16,
 ) -> AppResult<ShareConfig> {
-    db.conn().execute(
-        "UPDATE shares SET protocol=?2, port=?3 WHERE id=?1",
-        params![id, protocol.as_str(), port],
-    )?;
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE shares SET protocol=?2, port=?3 WHERE id=?1",
+            params![id, protocol.as_str(), port],
+        )?;
+        Ok(())
+    })?;
     get_by_id(db, id)
 }
 
 pub fn list_all(db: &Db) -> AppResult<Vec<ShareConfig>> {
-    let conn = db.conn();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM shares ORDER BY created_at DESC"
-    ))?;
-    let rows = stmt.query_map([], row_to_config)?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM shares ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([], row_to_config)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
 }
 
 pub fn get_by_id(db: &Db, id: &str) -> AppResult<ShareConfig> {
-    let conn = db.conn();
-    conn.query_row(
-        &format!("SELECT {COLUMNS} FROM shares WHERE id = ?1"),
-        params![id],
-        row_to_config,
-    )
-    .map_err(|_| AppError::NotFound(format!("共享 {id} 不存在")))
+    db.with_conn(|conn| {
+        conn.query_row(
+            &format!("SELECT {COLUMNS} FROM shares WHERE id = ?1"),
+            params![id],
+            row_to_config,
+        )
+        .map_err(|_| AppError::NotFound(format!("共享 {id} 不存在")))
+    })
 }
 
 pub fn get_by_name(db: &Db, name: &str) -> AppResult<Option<ShareConfig>> {
-    let conn = db.conn();
-    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM shares WHERE name = ?1"))?;
-    let mut rows = stmt.query_map(params![name], row_to_config)?;
-    Ok(rows.next().transpose()?)
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM shares WHERE name = ?1"))?;
+        let mut rows = stmt.query_map(params![name], row_to_config)?;
+        Ok(rows.next().transpose()?)
+    })
 }
 
 /// 创建共享。`id` 由调用方（IPC 命令）生成；token 自动生成。
@@ -80,15 +86,15 @@ pub fn create(
         None
     };
     let now = Utc::now().to_rfc3339();
-    {
-        let conn = db.conn();
+    db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO shares
                 (id, name, path, enabled, access_mode, access_token, created_at, updated_at)
              VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?6)",
             params![id, name, path, access_mode.as_str(), token, now],
         )?;
-    }
+        Ok(())
+    })?;
     get_by_id(db, id)
 }
 
@@ -129,32 +135,34 @@ pub fn update(
     }
     current.updated_at = Utc::now().to_rfc3339();
 
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE shares SET name=?2, path=?3, access_mode=?4,
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE shares SET name=?2, path=?3, access_mode=?4,
              access_token=?5, updated_at=?6 WHERE id=?1",
-        params![
-            current.id,
-            current.name,
-            current.path,
-            current.access_mode.as_str(),
-            current.access_token,
-            current.updated_at
-        ],
-    )?;
-    drop(conn);
+            params![
+                current.id,
+                current.name,
+                current.path,
+                current.access_mode.as_str(),
+                current.access_token,
+                current.updated_at
+            ],
+        )?;
+        Ok(())
+    })?;
     get_by_id(db, id)
 }
 
 pub fn set_enabled(db: &Db, id: &str, enabled: bool) -> AppResult<ShareConfig> {
     get_by_id(db, id)?;
     let now = Utc::now().to_rfc3339();
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE shares SET enabled=?2, updated_at=?3 WHERE id=?1",
-        params![id, enabled as i64, now],
-    )?;
-    drop(conn);
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE shares SET enabled=?2, updated_at=?3 WHERE id=?1",
+            params![id, enabled as i64, now],
+        )?;
+        Ok(())
+    })?;
     get_by_id(db, id)
 }
 
@@ -163,20 +171,22 @@ pub fn rotate_token(db: &Db, id: &str) -> AppResult<ShareConfig> {
     let mut current = get_by_id(db, id)?;
     current.access_token = Some(generate_token());
     current.updated_at = Utc::now().to_rfc3339();
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE shares SET access_token=?2, updated_at=?3 WHERE id=?1",
-        params![current.id, current.access_token, current.updated_at],
-    )?;
-    drop(conn);
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE shares SET access_token=?2, updated_at=?3 WHERE id=?1",
+            params![current.id, current.access_token, current.updated_at],
+        )?;
+        Ok(())
+    })?;
     get_by_id(db, id)
 }
 
 pub fn delete(db: &Db, id: &str) -> AppResult<()> {
     get_by_id(db, id)?;
-    let conn = db.conn();
-    conn.execute("DELETE FROM shares WHERE id=?1", params![id])?;
-    Ok(())
+    db.with_conn(|conn| {
+        conn.execute("DELETE FROM shares WHERE id=?1", params![id])?;
+        Ok(())
+    })
 }
 
 fn row_to_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareConfig> {

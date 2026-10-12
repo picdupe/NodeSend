@@ -1,3 +1,4 @@
+use crate::locks::MutexExt;
 use crate::{
     error::{AppError, AppResult},
     service::AppService,
@@ -44,12 +45,11 @@ pub struct PeerStore {
 }
 impl PeerStore {
     pub fn new(app: Arc<AppService>) -> AppResult<Arc<Self>> {
-        let values = {
-            let conn = app.db.conn();
+        let values: Vec<String> = app.db.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT record FROM nodes")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })?;
         let mut peers = HashMap::new();
         for value in values {
             let mut peer: Peer = serde_json::from_str(&value)?;
@@ -77,7 +77,7 @@ impl PeerStore {
         if !valid_id(&node_id) || name.len() > 128 {
             return Err(AppError::BadRequest("Node 发现报文非法".into()));
         }
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = crate::locks::lock(&self.peers);
         if peers.len() >= 2048 && !peers.contains_key(&node_id) {
             return Err(AppError::Forbidden("发现设备数量超出限制".into()));
         }
@@ -94,7 +94,10 @@ impl PeerStore {
         }
         peer.verified |= verified;
         let now = chrono::Utc::now().timestamp();
-        peer.endpoints.retain(|e| !e.socket(false).is_ok_and(|a| a.ip().is_ipv4()) || now.saturating_sub(e.last_seen) < 86400);
+        peer.endpoints.retain(|e| {
+            !e.socket(false).is_ok_and(|a| a.ip().is_ipv4())
+                || now.saturating_sub(e.last_seen) < 86400
+        });
         for ep in endpoints {
             if ep.socket(false).is_err() || ep.tcp_port == 0 {
                 continue;
@@ -109,21 +112,27 @@ impl PeerStore {
                 peer.endpoints.push(ep);
             }
         }
-        self.app.db.conn().execute("INSERT INTO nodes(node_id,record) VALUES(?1,?2) ON CONFLICT(node_id) DO UPDATE SET record=excluded.record",rusqlite::params![peer.node_id,serde_json::to_string(peer)?])?;
+        let json = serde_json::to_string(peer)?;
+        self.app.db.with_conn(|conn| {
+            conn.execute("INSERT INTO nodes(node_id,record) VALUES(?1,?2) ON CONFLICT(node_id) DO UPDATE SET record=excluded.record",rusqlite::params![peer.node_id, json])?;
+            Ok(())
+        })?;
         Ok(())
     }
     pub fn list(&self) -> Vec<Peer> {
         let trusted = crate::registry::list(&self.app.db).unwrap_or_default();
         let mut peers = self
             .peers
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .values()
             .cloned()
             .collect::<Vec<_>>();
         let now = chrono::Utc::now().timestamp();
         for p in &mut peers {
-            p.endpoints.retain(|e| !e.socket(false).is_ok_and(|a| a.ip().is_ipv4()) || now.saturating_sub(e.last_seen) < 86400);
+            p.endpoints.retain(|e| {
+                !e.socket(false).is_ok_and(|a| a.ip().is_ipv4())
+                    || now.saturating_sub(e.last_seen) < 86400
+            });
             // Discovery announcements are periodic, but mDNS may only emit a
             // resolved event once and mobile multicast delivery can be
             // delayed while the app is resumed. mDNS registration remains a
@@ -146,22 +155,35 @@ impl PeerStore {
             .ok_or_else(|| AppError::NotFound("目标 Node 尚未发现，请手动添加地址".into()))
     }
     pub fn refresh_addresses(&self, id: &str, endpoints: Vec<Endpoint>) -> AppResult<()> {
-        let mut peers = self.peers.lock().unwrap();
-        let Some(peer) = peers.get_mut(id) else { return Ok(()); };
+        let mut peers = crate::locks::lock(&self.peers);
+        let Some(peer) = peers.get_mut(id) else {
+            return Ok(());
+        };
         let now = chrono::Utc::now().timestamp();
         peer.endpoints.retain(|e| retain_previous_address(e, now));
         for endpoint in endpoints {
-            if let Some(old) = peer.endpoints.iter_mut().find(|e| e.address == endpoint.address && e.tcp_port == endpoint.tcp_port) {
+            if let Some(old) = peer
+                .endpoints
+                .iter_mut()
+                .find(|e| e.address == endpoint.address && e.tcp_port == endpoint.tcp_port)
+            {
                 *old = endpoint;
             } else {
                 peer.endpoints.push(endpoint);
             }
         }
-        self.app.db.conn().execute("UPDATE nodes SET record=?1 WHERE node_id=?2", rusqlite::params![serde_json::to_string(peer)?, id])?;
+        let json = serde_json::to_string(peer)?;
+        self.app.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE nodes SET record=?1 WHERE node_id=?2",
+                rusqlite::params![json, id],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
     pub fn failure(&self, id: &str, ep: &Endpoint, error: String) {
-        if let Some(p) = self.peers.lock().unwrap().get_mut(id) {
+        if let Some(p) = crate::locks::lock(&self.peers).get_mut(id) {
             if let Some(e) = p
                 .endpoints
                 .iter_mut()
@@ -172,7 +194,7 @@ impl PeerStore {
         }
     }
     pub fn seen(&self, id: &str, ep: &Endpoint) {
-        if let Some(peer) = self.peers.lock().unwrap().get_mut(id) {
+        if let Some(peer) = crate::locks::lock(&self.peers).get_mut(id) {
             if let Some(current) = peer
                 .endpoints
                 .iter_mut()
@@ -184,12 +206,13 @@ impl PeerStore {
         }
     }
     pub fn remove(&self, id: &str) -> AppResult<()> {
-        self.peers.lock().unwrap().remove(id);
-        let conn = self.app.db.conn();
-        conn.execute("DELETE FROM nodes WHERE node_id=?1", [id])?;
-        conn.execute("DELETE FROM trusted_nodes WHERE node_id=?1", [id])?;
-        conn.execute("DELETE FROM node_certificates WHERE node_id=?1", [id])?;
-        Ok(())
+        crate::locks::lock(&self.peers).remove(id);
+        self.app.db.with_conn(|conn| {
+            conn.execute("DELETE FROM nodes WHERE node_id=?1", [id])?;
+            conn.execute("DELETE FROM trusted_nodes WHERE node_id=?1", [id])?;
+            conn.execute("DELETE FROM node_certificates WHERE node_id=?1", [id])?;
+            Ok(())
+        })
     }
 }
 pub fn valid_id(id: &str) -> bool {
@@ -209,13 +232,26 @@ mod tests {
     fn snapshot_expires_ipv4_after_24_hours_and_replaces_ipv6() {
         let now = 200000;
         for (address, age, keep) in [
-            ("10.1.1.3", 86399, true), ("10.1.1.3", 86400, false),
-            ("10.1.1.3", 86401, false), ("::ffff:10.1.1.3", 1, true),
-            ("2408:846a:7310:3bed::6d", 1, false), ("fe80::1%3", 1, false),
+            ("10.1.1.3", 86399, true),
+            ("10.1.1.3", 86400, false),
+            ("10.1.1.3", 86401, false),
+            ("::ffff:10.1.1.3", 1, true),
+            ("2408:846a:7310:3bed::6d", 1, false),
+            ("fe80::1%3", 1, false),
         ] {
-            let endpoint = Endpoint { address: address.into(), tcp_port: 58082, quic_port: 0,
-                source: "manual".into(), last_seen: now - age, error: None };
-            assert_eq!(retain_previous_address(&endpoint, now), keep, "{address}, age {age}");
+            let endpoint = Endpoint {
+                address: address.into(),
+                tcp_port: 58082,
+                quic_port: 0,
+                source: "manual".into(),
+                last_seen: now - age,
+                error: None,
+            };
+            assert_eq!(
+                retain_previous_address(&endpoint, now),
+                keep,
+                "{address}, age {age}"
+            );
         }
     }
 }

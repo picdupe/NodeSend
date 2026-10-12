@@ -3,7 +3,7 @@ import type { BrowserConnection, BrowserListing } from '../types/browser';
 
 const remote = 'b'.repeat(64);
 const entries = [{ path: '设计稿.pdf', size: 2400000, modified_ms: 0, directory: false }, { path: '封面.png', size: 850000, modified_ms: 0, directory: false }];
-const task: TransferTask = { id: 'preview-incoming', peer_id: remote, peer_name: '示例笔记本', direction: 'receive', status: 'waiting', entries, total_bytes: 3250000, completed_bytes: 0, transport: 'quic', error: null, destination: null, events: ['示例接收请求'], created_at: new Date().toISOString(), verify_hash: false };
+const task: TransferTask = { id: 'preview-incoming', peer_id: remote, peer_name: '示例笔记本', direction: 'receive', status: 'waiting', scan_complete: true, top_level_count: entries.length, file_count: entries.length, directory_count: 0, total_bytes: 3250000, completed_bytes: 0, transport: 'quic', error: null, destination: null, events: ['示例接收请求'], created_at: new Date().toISOString(), verify_hash: false };
 const state: NetworkStatus = {
   node_id: 'a'.repeat(64), display_name: '界面预览', tcp_port: 58082, quic_port: 58082,
   addresses: ['192.0.2.1'], receive_directory: 'Downloads/NodeSend', receive_policy: 'ask',
@@ -22,7 +22,8 @@ export async function previewInvoke(command: string, args: Record<string, unknow
     case 'share_protocol_status': return [];
     case 'list_trusted_nodes': return state.peers.filter(p => p.trusted).map(p => ({ node_id: p.node_id, display_name: p.display_name, created_at: task.created_at }));
     case 'choose_send_files': return entries.map(e => e.path);
-    case 'preview_transfer': return { entries, chunk_size: 262144, verify_hash: false };
+    case 'preview_transfer': return { scan_complete: false, top_level_count: entries.length, file_count: 0, directory_count: 0, total_size: 0, chunk_count: 0, chunk_size: 262144, verify_hash: false };
+    case 'list_task_entries': { const page = entries.slice(Number(args.offset) || 0, (Number(args.offset) || 0) + (Number(args.limit) || 200)); return { entries: page, total: entries.length }; }
     case 'choose_receive_directory': return 'Downloads/NodeSend';
     case 'set_network_settings':
       state.display_name = String(args.name); state.receive_directory = String(args.directory); state.receive_policy = args.policy as NetworkStatus['receive_policy']; return;

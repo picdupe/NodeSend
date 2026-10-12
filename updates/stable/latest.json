@@ -1,0 +1,10 @@
+﻿{
+    "version":  "0.1.1-build.82",
+    "notes":  "优化机械盘传输及大文件夹传输",
+    "platforms":  {
+                      "windows-x86_64":  {
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0R3TzNycThUcWVUUzhac1ZnTjZyVXdweFVDWE9BOVZWbnIwQW1YMDZtNVdtanB3VEVYU0UwOUx5UE5Rdm52V201RmtsY3l2MitpSmdRZFRDZzY2TWdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNzg1MzU4CWZpbGU6Tm9kZVNlbmRfMC4xLjEtYnVpbGQuODJfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4xLWJ1aWxkLjgyCjZuWEp5ZUlyZ21BV2E3bjZjWUdDR29kbzc3MEZNSEZtKzNUcXdzU1lNdW1ocE1WMmpKYXNFZ3J6cTBkbEUwcnpDbFB4L3p2REpLUmZwTXdmTDhTckFBPT0K",
+                                             "url":  "https://github.com/picdupe/NodeSend/releases/download/v0.1.1/NodeSend_v0.1.1.82_x64-setup.exe"
+                                         }
+                  }
+}

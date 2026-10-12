@@ -19,19 +19,20 @@ pub struct TrustedNode {
 }
 
 pub fn list(db: &Db) -> AppResult<Vec<TrustedNode>> {
-    let conn = db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT node_id, display_name, created_at
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT node_id, display_name, created_at
          FROM trusted_nodes ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(TrustedNode {
-            node_id: row.get(0)?,
-            display_name: row.get(1)?,
-            created_at: row.get(2)?,
-        })
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TrustedNode {
+                node_id: row.get(0)?,
+                display_name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
 }
 
 /// 添加 Trust（已存在则更新显示名称）。
@@ -40,29 +41,31 @@ pub fn add(db: &Db, node_id: &str, display_name: Option<String>) -> AppResult<()
         return Err(AppError::BadRequest("node_id 不能为空".into()));
     }
     let now = Utc::now().to_rfc3339();
-    let conn = db.conn();
-    conn.execute(
-        "INSERT INTO trusted_nodes (node_id, display_name, created_at)
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO trusted_nodes (node_id, display_name, created_at)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(node_id) DO UPDATE SET display_name=excluded.display_name",
-        params![node_id, display_name, now],
-    )?;
-    Ok(())
+            params![node_id, display_name, now],
+        )?;
+        Ok(())
+    })
 }
 
 /// 移除 Trust。
 pub fn remove(db: &Db, node_id: &str) -> AppResult<()> {
-    let conn = db.conn();
-    let affected = conn.execute(
-        "DELETE FROM trusted_nodes WHERE node_id=?1",
-        params![node_id],
-    )?;
-    if affected == 0 {
-        return Err(AppError::NotFound(format!("未信任的 Node: {node_id}")));
-    }
-    conn.execute(
-        "DELETE FROM settings WHERE key=?1",
-        params![format!("auto_receive_{node_id}")],
-    )?;
-    Ok(())
+    db.with_conn(|conn| {
+        let affected = conn.execute(
+            "DELETE FROM trusted_nodes WHERE node_id=?1",
+            params![node_id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(format!("未信任的 Node: {node_id}")));
+        }
+        conn.execute(
+            "DELETE FROM settings WHERE key=?1",
+            params![format!("auto_receive_{node_id}")],
+        )?;
+        Ok(())
+    })
 }

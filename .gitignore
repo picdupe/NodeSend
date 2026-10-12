@@ -4,6 +4,7 @@ dist
 
 # Rust / Tauri
 src-tauri/target
+**/target/
 src-tauri/icons/.build-fingerprint.json
 src-tauri/gen/android/.gradle/
 src-tauri/gen/android/app/build/
@@ -17,6 +18,21 @@ src-tauri/gen/android/app/.cxx/
 src-tauri/data
 *.db
 *.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+tmp/
+
+# 本地环境变量、签名材料和身份凭据（禁止提交）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
 
 # 系统/编辑器
 .DS_Store
@@ -45,7 +61,20 @@ test-results/
 Thumbs.db
 Desktop.ini
 
-# 公开仓库只保留核心可编译代码和构建所需资源
-*.md
-docs/
+# 开发文档与公开文档分开管理
+# Develop_docs/ 为开发文档目录；根目录 Develop_*.md 为开发用文档。
+# 未匹配这些规则的 README.md 等公开说明文档可正常纳入版本控制。
+Develop_docs/
+Develop_*.md
 *.jsonl
+
+# 诊断构建产物
+target-diag/
+
+# 本地测试（未跟踪；如需提交请显式 git add -f）
+/tests/
+src-tauri/tests/
+playwright.config.ts
+
+# 脚本误产生的目录（npm 变量未展开的产物）
+${APPDATA}/

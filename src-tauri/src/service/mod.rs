@@ -74,26 +74,28 @@ impl AppService {
     }
 
     pub fn get_setting(&self, key: &str) -> AppResult<Option<String>> {
-        let conn = self.db.conn();
-        let value = conn.query_row(
-            "SELECT value FROM settings WHERE key=?1",
-            params![key],
-            |row| row.get(0),
-        );
-        match value {
-            Ok(value) => Ok(Some(value)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+        self.db.with_conn(|conn| {
+            let value = conn.query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![key],
+                |row| row.get(0),
+            );
+            match value {
+                Ok(value) => Ok(Some(value)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        })
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> AppResult<()> {
-        let conn = self.db.conn();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+                params![key, value],
+            )?;
+            Ok(())
+        })
     }
 }

@@ -5,6 +5,7 @@ pub mod peers;
 pub mod protocol;
 pub mod tls;
 pub mod transport;
+use crate::locks::MutexExt;
 use crate::{
     error::{AppError, AppResult},
     service::AppService,
@@ -129,7 +130,7 @@ impl NetworkManager {
             discovery: self
                 .discovery
                 .as_ref()
-                .map(|d| d.status.lock().unwrap().clone())
+                .map(|d| crate::locks::lock(&d.status).clone())
                 .unwrap_or_default(),
             peers: self.peers.list(),
             tasks: self.transfers.snapshots(),
@@ -153,8 +154,10 @@ impl NetworkManager {
             return Err(AppError::BadRequest("请输入对方 IP 或主机名".into()));
         }
         let endpoints = resolve_manual_endpoints(&self.app.identity.node_id, input).await?;
+        tracing::info!(address = %input, candidates = endpoints.len(), "手动连接：开始尝试候选地址");
         let mut failure = "Endpoint 无可用地址".to_string();
         for endpoint in endpoints {
+            tracing::info!(address = %endpoint.address, tcp = endpoint.tcp_port, quic = endpoint.quic_port, source = %endpoint.source, "尝试连接候选地址");
             match transport::connect(
                 &self.app,
                 &endpoint,
@@ -181,11 +184,16 @@ impl NetworkManager {
                         }],
                         true,
                     )?;
+                    tracing::info!(peer_id = %node_id, "已添加设备");
                     return self.peers.get(&node_id);
                 }
-                Err(err) => failure = err.to_string(),
+                Err(err) => {
+                    tracing::warn!(address = %endpoint.address, tcp = endpoint.tcp_port, error = %err, "候选地址连接失败");
+                    failure = err.to_string();
+                }
             }
         }
+        tracing::warn!(address = %input, error = %failure, "手动连接失败：所有候选地址均不可用");
         Err(AppError::Other(failure))
     }
     pub async fn send(
@@ -197,8 +205,7 @@ impl NetworkManager {
     ) -> AppResult<String> {
         let cancellation = CancellationToken::new();
         self.preflights
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .insert(peer_id.clone(), cancellation.clone());
         let result = self
             .send_with_preflight(
@@ -209,12 +216,12 @@ impl NetworkManager {
                 cancellation,
             )
             .await;
-        self.preflights.lock().unwrap().remove(&peer_id);
+        crate::locks::lock(&self.preflights).remove(&peer_id);
         result
     }
 
     pub fn cancel_preflight(&self, peer_id: &str) {
-        if let Some(cancellation) = self.preflights.lock().unwrap().get(peer_id) {
+        if let Some(cancellation) = crate::locks::lock(&self.preflights).get(peer_id) {
             cancellation.cancel();
         }
     }
@@ -254,6 +261,14 @@ impl NetworkManager {
             };
             match result {
                 Ok(((name, tcp_port, quic_port), channel)) => {
+                    // 对方证书里的 Node ID 与本机相同：两台设备共用了一份身份
+                    // （复制过 %APPDATA%\NodeSend 或指向同一应用数据目录）。
+                    // 这种情况必须立刻报错，否则界面会一直停在"连接检测"。
+                    if channel.peer_id == self.app.identity.node_id {
+                        return Err(AppError::BadRequest(
+                            "对方使用的 Node ID 与本机完全相同：同一身份不能在两台设备上同时使用，请在对方设备上删除/重建应用数据目录（%APPDATA%\\NodeSend）后重试。".into(),
+                        ));
+                    }
                     self.peers.upsert(
                         peer_id.clone(),
                         name,
@@ -270,9 +285,22 @@ impl NetworkManager {
                     let app = self.app.clone();
                     let peers = self.peers.clone();
                     let peer_id = peer_id.clone();
-                    let connected = Endpoint { tcp_port, quic_port, ..endpoint.clone() };
+                    let connected = Endpoint {
+                        tcp_port,
+                        quic_port,
+                        ..endpoint.clone()
+                    };
                     tokio::spawn(async move {
-                        if let Err(error) = refresh_send_addresses(app, peers, peer_id, connected, channel, allow_public).await {
+                        if let Err(error) = refresh_send_addresses(
+                            app,
+                            peers,
+                            peer_id,
+                            connected,
+                            channel,
+                            allow_public,
+                        )
+                        .await
+                        {
                             tracing::debug!(%error, "后台地址更新未完成，保留已有地址");
                         }
                     });
@@ -288,7 +316,8 @@ impl NetworkManager {
             if !allow_public {
                 if let Some(endpoint) = public_endpoint {
                     return Err(AppError::Forbidden(format!(
-                        "公网路径需要显式允许：{}", endpoint.address
+                        "公网路径需要显式允许：{}",
+                        endpoint.address
                     )));
                 }
             }
@@ -347,11 +376,13 @@ impl NetworkManager {
         #[cfg(target_os = "android")]
         if action == "save" {
             let task = self.transfers.record(&id)?;
-            if task.direction != "receive" || task.completed.len() != task.manifest.chunks().len() {
+            if task.direction != "receive" || task.completed_count != task.chunk_count {
                 return Err(AppError::BadRequest("文件尚未接收完整".into()));
             }
             if task.status == "completed" {
-                return crate::android_import::export_received(task).await.map_err(AppError::Other);
+                return crate::android_import::export_received(task)
+                    .await
+                    .map_err(AppError::Other);
             }
             self.transfers.commit(&id).await?;
             return Ok(());
@@ -415,7 +446,7 @@ impl NetworkManager {
             d.stop();
         }
         self.transfers.shutdown.cancel();
-        let handle = self.server.lock().unwrap().take();
+        let handle = crate::locks::lock(&self.server).take();
         if let Some(h) = handle {
             let _ = h.await;
         }
@@ -423,32 +454,60 @@ impl NetworkManager {
 }
 
 async fn refresh_send_addresses(
-    app: Arc<AppService>, peers: Arc<PeerStore>, peer_id: String,
-    mut connected: Endpoint, mut channel: transport::Channel, allow_public: bool,
+    app: Arc<AppService>,
+    peers: Arc<PeerStore>,
+    peer_id: String,
+    mut connected: Endpoint,
+    mut channel: transport::Channel,
+    allow_public: bool,
 ) -> AppResult<()> {
-    let protocol::Response::Addresses { addresses, tcp_port, quic_port } = channel.request(&protocol::Request::Addresses).await? else {
+    let protocol::Response::Addresses {
+        addresses,
+        tcp_port,
+        quic_port,
+    } = channel.request(&protocol::Request::Addresses).await?
+    else {
         return Ok(());
     };
-    if addresses.len() > 128 || tcp_port == 0 { return Err(AppError::BadRequest("地址列表非法".into())); }
+    if addresses.len() > 128 || tcp_port == 0 {
+        return Err(AppError::BadRequest("地址列表非法".into()));
+    }
     drop(channel);
     connected.last_seen = chrono::Utc::now().timestamp();
     connected.error = None;
     let mut verified = vec![connected.clone()];
     let mut probes = tokio::task::JoinSet::new();
-    let slots = Arc::new(tokio::sync::Semaphore::new(4));
-    let addresses = addresses.into_iter().collect::<std::collections::BTreeSet<_>>();
+    let slots = Arc::new(tokio::sync::Semaphore::new(crate::tuning::MAX_ACTIVE_SENDS));
+    let addresses = addresses
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
     for address in addresses {
-        let Ok(ip) = address.parse::<std::net::IpAddr>() else { continue; };
-        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() { continue; }
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
         let address = match ip {
             std::net::IpAddr::V6(v) if (v.segments()[0] & 0xffc0) == 0xfe80 => {
-                let Some((_, scope)) = connected.address.split_once('%') else { continue; };
+                let Some((_, scope)) = connected.address.split_once('%') else {
+                    continue;
+                };
                 format!("{v}%{scope}")
             }
             _ => peers::address(ip),
         };
-        if address == connected.address && tcp_port == connected.tcp_port { continue; }
-        let mut endpoint = Endpoint { address, tcp_port, quic_port, source: "send-refresh".into(), last_seen: chrono::Utc::now().timestamp(), error: None };
+        if address == connected.address && tcp_port == connected.tcp_port {
+            continue;
+        }
+        let mut endpoint = Endpoint {
+            address,
+            tcp_port,
+            quic_port,
+            source: "send-refresh".into(),
+            last_seen: chrono::Utc::now().timestamp(),
+            error: None,
+        };
         if !allow_public && !transport::is_local(ip) {
             // Retain the peer's current IPv6 candidates without silently granting
             // permission to probe public networks during a private transfer.
@@ -462,19 +521,28 @@ async fn refresh_send_addresses(
         probes.spawn(async move {
             let _permit = slots.acquire_owned().await.ok()?;
             tokio::time::timeout(std::time::Duration::from_secs(6), async {
-                let mut channel = transport::connect(&app, &endpoint, Some(&peer_id), true, allow_public).await.ok()?;
+                let mut channel =
+                    transport::connect(&app, &endpoint, Some(&peer_id), true, allow_public)
+                        .await
+                        .ok()?;
                 transport::hello(&mut channel, &app).await.ok()?;
                 Some(endpoint)
-            }).await.ok().flatten()
+            })
+            .await
+            .ok()
+            .flatten()
         });
     }
     while let Some(result) = probes.join_next().await {
-        if let Ok(Some(endpoint)) = result { verified.push(endpoint); }
+        if let Ok(Some(endpoint)) = result {
+            verified.push(endpoint);
+        }
     }
     peers.refresh_addresses(&peer_id, verified)
 }
 
 async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<Endpoint>> {
+    tracing::debug!(input, "解析手动输入的设备地址");
     let addresses = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::net::lookup_host(input),
@@ -482,7 +550,7 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
     .await
     .map_err(|_| AppError::Other("地址解析超时".into()))?;
     if let Ok(addresses) = addresses {
-        return Ok(addresses
+        let endpoints: Vec<Endpoint> = addresses
             .map(|addr| Endpoint {
                 address: endpoint_address(addr),
                 tcp_port: addr.port(),
@@ -491,7 +559,9 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
                 last_seen: chrono::Utc::now().timestamp(),
                 error: None,
             })
-            .collect());
+            .collect();
+        tracing::info!(input, candidates = endpoints.len(), "使用显式端口");
+        return Ok(endpoints);
     }
 
     // No explicit port: ask the remote NodeSend discovery listener for its
@@ -510,6 +580,7 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
     let mut endpoints = Vec::new();
     for target in targets {
         if let Ok(found) = discovery::probe(target, node_id).await {
+            tracing::debug!(%target, answered = found.len(), "UDP 发现探测结果");
             for (announcement, source) in found {
                 endpoints.push(Endpoint {
                     address: endpoint_address(source),
@@ -548,6 +619,7 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
     )
     .await
     .map_err(|_| AppError::Other("地址解析超时".into()))??;
+    tracing::info!(input, port = default_tcp, "UDP 发现无应答，回退默认 TCP 端口");
     let fallback = fallback_addresses
         .map(|addr| Endpoint {
             address: endpoint_address(addr),
@@ -559,6 +631,7 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
         })
         .collect::<Vec<_>>();
     if fallback.is_empty() {
+        tracing::warn!(input, "未发现 NodeSend 服务");
         return Err(AppError::Other(
             "未发现 NodeSend 服务。请确认对方已启动并连接同一网络".into(),
         ));

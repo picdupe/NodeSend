@@ -51,7 +51,9 @@ pub async fn hello(State(state): State<HttpState>) -> Json<HelloResponse> {
 pub async fn list_shares(State(state): State<HttpState>) -> AppResult<Json<Vec<SharePublic>>> {
     let shares = share_repo::list_all(&state.db)?
         .into_iter()
-        .filter(|share| share.is_enabled() && share.protocol == crate::share::ShareProtocol::Nodesend)
+        .filter(|share| {
+            share.is_enabled() && share.protocol == crate::share::ShareProtocol::Nodesend
+        })
         .map(|share| share.to_public())
         .collect();
     Ok(Json(shares))

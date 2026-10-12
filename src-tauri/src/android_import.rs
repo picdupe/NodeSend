@@ -20,13 +20,17 @@ const PLUGIN_IDENTIFIER: &str = "com.picdupe.nodesend";
 pub struct AndroidImport<R: Runtime>(PluginHandle<R>);
 
 #[cfg(target_os = "android")]
-static RECEIVE_EXPORT: std::sync::OnceLock<Box<dyn Fn(crate::transfer::model::TaskRecord) -> Result<(), String> + Send + Sync>> = std::sync::OnceLock::new();
+static RECEIVE_EXPORT: std::sync::OnceLock<
+    Box<dyn Fn(crate::transfer::model::TaskRecord) -> Result<(), String> + Send + Sync>,
+> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
 pub async fn export_received(task: crate::transfer::model::TaskRecord) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         RECEIVE_EXPORT.get().ok_or("Android 目录服务尚未就绪")?(task)
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(target_os = "android")]
@@ -103,7 +107,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 }
 
 #[cfg(target_os = "android")]
-pub async fn pick<R: Runtime>(app: AppHandle<R>, directory: bool, kind: String) -> Result<Vec<String>, String> {
+pub async fn pick<R: Runtime>(
+    app: AppHandle<R>,
+    directory: bool,
+    kind: String,
+) -> Result<Vec<String>, String> {
     app.state::<AndroidImport<R>>()
         .0
         .run_mobile_plugin_async::<SharedFiles>("pick", PickArgs { directory, kind })
@@ -123,12 +131,23 @@ pub async fn clipboard<R: Runtime>(app: AppHandle<R>) -> Result<Vec<String>, Str
 }
 
 #[cfg(target_os = "android")]
-pub async fn directory_label<R: Runtime>(app: AppHandle<R>, root: String) -> Result<String, String> {
+pub async fn directory_label<R: Runtime>(
+    app: AppHandle<R>,
+    root: String,
+) -> Result<String, String> {
     #[derive(Deserialize)]
-    struct Label { label: String }
-    app.state::<AndroidImport<R>>().0.run_mobile_plugin_async::<Label>(
-        "describeReceiveDirectory", serde_json::json!({"root": root})
-    ).await.map(|v| v.label).map_err(|e| e.to_string())
+    struct Label {
+        label: String,
+    }
+    app.state::<AndroidImport<R>>()
+        .0
+        .run_mobile_plugin_async::<Label>(
+            "describeReceiveDirectory",
+            serde_json::json!({"root": root}),
+        )
+        .await
+        .map(|v| v.label)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "android")]

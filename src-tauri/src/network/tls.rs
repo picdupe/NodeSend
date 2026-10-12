@@ -184,7 +184,10 @@ pub fn remember(s: &AppService, certificates: &[CertificateDer<'_>]) -> AppResul
         .first()
         .ok_or_else(|| AppError::Certificate("对端未提供身份".into()))?;
     let id = certificate_node_id(cert.as_ref()).map_err(tls_error)?;
-    s.db.conn().execute("INSERT INTO node_certificates(node_id,certificate,updated_at) VALUES (?1,?2,?3) ON CONFLICT(node_id) DO UPDATE SET certificate=excluded.certificate,updated_at=excluded.updated_at", rusqlite::params![id,cert.as_ref(),chrono::Utc::now().to_rfc3339()])?;
+    s.db.with_conn(|conn| {
+        conn.execute("INSERT INTO node_certificates(node_id,certificate,updated_at) VALUES (?1,?2,?3) ON CONFLICT(node_id) DO UPDATE SET certificate=excluded.certificate,updated_at=excluded.updated_at", rusqlite::params![id,cert.as_ref(),chrono::Utc::now().to_rfc3339()])?;
+        Ok(())
+    })?;
     Ok(id)
 }
 fn tls_error(e: impl std::fmt::Display) -> AppError {

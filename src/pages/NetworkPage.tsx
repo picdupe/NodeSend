@@ -10,10 +10,11 @@ import { addEndpoint, errorText } from '../api/network';
 import { useRef, useState, type FormEvent } from 'react';
 import { useDialogEnter } from '../components/useDialogEnter';
 import { useDeviceFavorites } from '../hooks/useDeviceFavorites';
+import type { SendSelectionState } from '../hooks/useSendSelection';
 
 export type TransferPage = 'send' | 'receive' | 'transfers';
 const copy: Record<TransferPage, [string, string]> = { send: ['传递，就在身边', '把文件送到另一台设备，简单、直接。'], receive: ['接收，尽在掌握', '每一次传递，都由你确认。'], transfers: ['每一次传递', '查看进度、继续任务，或回顾已经送达的文件。'] };
-export function NetworkPage({ mode, status, error, refresh, onNavigate }: { mode: TransferPage; status: NetworkStatus | null; error: string; refresh: () => Promise<void>; onNavigate: (page: TransferPage) => void }) {
+export function NetworkPage({ mode, status, error, refresh, onNavigate, selection }: { mode: TransferPage; status: NetworkStatus | null; error: string; refresh: () => Promise<void>; onNavigate: (page: TransferPage) => void; selection: SendSelectionState }) {
   const [manualOpen, setManualOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [favoritesOpen, setFavoritesOpen] = useState(false);
@@ -33,7 +34,7 @@ export function NetworkPage({ mode, status, error, refresh, onNavigate }: { mode
     {error && <div className="notice error" role="alert">{status ? error : '尚未连接到 NodeSend 本机服务。请通过桌面应用打开。'}<details><summary>查看原因</summary>{error}</details></div>}
     {status?.discovery.warnings.map(warning => <div className="notice" key={warning}>{warning}；可尝试手动连接设备。</div>)}
     {!status && !error && <div className="surface empty-state generous">正在连接本机服务…</div>}
-    {status && <>{mode === 'send' && <div className="send-shell"><SendPanel status={status} favoritesOpen={favoritesOpen} onCloseFavorites={() => setFavoritesOpen(false)} onRemoveFavorite={removeFavorite} favorites={favorites} favoriteError={favoriteError} onToggleFavorite={toggleFavorite} refresh={refresh} onSent={() => onNavigate('transfers')} /></div>}{mode === 'receive' && <ReceivePanel status={status} refresh={refresh} />}{mode === 'transfers' && <TaskList tasks={status.tasks} refresh={refresh} />}</>}
+    {status && <>{mode === 'send' && <div className="send-shell"><SendPanel status={status} selection={selection} favoritesOpen={favoritesOpen} onCloseFavorites={() => setFavoritesOpen(false)} onRemoveFavorite={removeFavorite} favorites={favorites} favoriteError={favoriteError} onToggleFavorite={toggleFavorite} refresh={refresh} onSent={() => onNavigate('transfers')} /></div>}{mode === 'receive' && <ReceivePanel status={status} refresh={refresh} />}{mode === 'transfers' && <TaskList tasks={status.tasks} refresh={refresh} />}</>}
     {manualOpen && <ManualDiscoveryDialog onClose={() => setManualOpen(false)} onAdded={async () => { setManualOpen(false); await refresh(); }} />}
     {infoOpen && status && <DeviceInfoDialog status={status} onClose={() => setInfoOpen(false)} />}
 

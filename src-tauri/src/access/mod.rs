@@ -51,13 +51,16 @@ pub fn authorize(share: &ShareConfig, caller: &Caller, db: &Db) -> AppResult<()>
 }
 
 fn is_trusted(db: &Db, node_id: &str) -> bool {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT 1 FROM trusted_nodes WHERE node_id=?1",
-        rusqlite::params![node_id],
-        |_| Ok(()),
-    )
-    .is_ok()
+    db.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM trusted_nodes WHERE node_id=?1",
+                rusqlite::params![node_id],
+                |_| Ok(()),
+            )
+            .is_ok())
+    })
+    .unwrap_or(false)
 }
 
 /// 定长比较，避免令牌比较的计时侧信道（不等长时仍很快返回，仅初版防护）。

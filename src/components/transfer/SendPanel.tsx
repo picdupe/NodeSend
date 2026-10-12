@@ -3,24 +3,22 @@ import { addressPriority } from '../../utils/address';
 import { useEffect, useState } from 'react';
 import { readImage, readText } from '@tauri-apps/plugin-clipboard-manager';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { addEndpoint, cancelSendPreflight, chooseSendFiles, previewTransfer, removePeer, sendFiles, errorText, stageTextPayload, stageBinaryPayload, readClipboardFiles } from '../../api/network';
-import type { Manifest, NetworkStatus, Peer } from '../../types/network';
+import { addEndpoint, cancelSendPreflight, chooseSendFiles, removePeer, sendFiles, errorText, stageTextPayload, stageBinaryPayload, readClipboardFiles } from '../../api/network';
+import type { NetworkStatus, Peer } from '../../types/network';
 import type { FavoriteDevice } from '../../hooks/useDeviceFavorites';
+import type { SendSelectionState } from '../../hooks/useSendSelection';
 import { Icon } from '../Icon';
 import { PublicPathPrompt, publicPathRejected, publicPathAddress } from '../PublicPathPrompt';
 import { formatBytes } from './format';
 
-export function SendPanel({ status, refresh, onSent, favorites, favoriteError, onToggleFavorite, favoritesOpen, onCloseFavorites, onRemoveFavorite }: { status: NetworkStatus; refresh: () => Promise<void>; onSent: () => void; favorites: FavoriteDevice[]; favoriteError: string; onToggleFavorite: (peer: Peer) => void; favoritesOpen: boolean; onCloseFavorites: () => void; onRemoveFavorite: (nodeId: string) => void }) {
-  const [paths, setPaths] = useState<string[]>([]);
-  const [manifest, setManifest] = useState<Manifest | null>(null);
-  const [peerId, setPeerId] = useState('');
+export function SendPanel({ status, refresh, onSent, favorites, favoriteError, onToggleFavorite, favoritesOpen, onCloseFavorites, onRemoveFavorite, selection }: { status: NetworkStatus; refresh: () => Promise<void>; onSent: () => void; favorites: FavoriteDevice[]; favoriteError: string; onToggleFavorite: (peer: Peer) => void; favoritesOpen: boolean; onCloseFavorites: () => void; onRemoveFavorite: (nodeId: string) => void; selection: SendSelectionState }) {
+  const { paths, setPaths, manifest, scanError, peerId, setPeerId, verifyHash, setVerifyHash } = selection;
   const [busy, setBusy] = useState(false);
   const [preflighting, setPreflighting] = useState(false);
   const [preflightPeerId, setPreflightPeerId] = useState<string | null>(null);
   const [cancellingPreflight, setCancellingPreflight] = useState(false);
   const [error, setError] = useState('');
   const [dragging, setDragging] = useState(false);
-  const [verifyHash, setVerifyHash] = useState(false);
   const [publicPrompt, setPublicPrompt] = useState(false);
   const [search, setSearch] = useState('');
   const [contextPeer, setContextPeer] = useState<string | null>(null);
@@ -34,21 +32,6 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
     query.addEventListener?.('change', update);
     return () => query.removeEventListener?.('change', update);
   }, []);
-  useEffect(() => {
-    const onSharedFiles = (event: Event) => {
-      const files = (event as CustomEvent<string[]>).detail;
-      if (Array.isArray(files) && files.length) setPaths(old => [...new Set([...old, ...files])]);
-    };
-    window.addEventListener('nodesend-shared-files', onSharedFiles);
-    return () => window.removeEventListener('nodesend-shared-files', onSharedFiles);
-  }, []);
-  useEffect(() => {
-    let alive = true;
-    if (!paths.length) { setManifest(null); return; }
-    setManifest(null); setError('');
-    previewTransfer(paths).then(m => { if (alive) setManifest(m); }).catch(e => { if (alive) setError(errorText(e)); });
-    return () => { alive = false; };
-  }, [paths]);
   useEffect(() => {
     let disposed = false; let cleanup: (() => void) | undefined;
     try { getCurrentWebview().onDragDropEvent(event => {
@@ -116,7 +99,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
   }
   const [publicAddress, setPublicAddress] = useState('');
   async function send(allowPublic = false) {
-    if (busy || preflighting || !peerId || !manifest) return;
+    if (busy || preflighting || !peerId || !paths.length) return;
     const selectedPeer = status.peers.find(peer => peer.node_id === peerId);
     if (!selectedPeer) { setError('未找到接收设备，请刷新设备列表后重试。'); return; }
     setPreflighting(true); setPreflightPeerId(peerId); setError('');
@@ -140,8 +123,8 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
     .filter(p => (p.display_name + p.node_id + p.endpoints.map(e => e.address)).toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => Number(b.online) - Number(a.online)
       || Number(favoriteIds.has(b.node_id)) - Number(favoriteIds.has(a.node_id)));
-  const count = manifest?.entries.filter(e => !e.directory).length ?? 0;
-  const total = manifest?.entries.reduce((n, e) => n + e.size, 0) ?? 0;
+  const count = manifest?.file_count ?? 0;
+  const total = manifest?.total_size ?? 0;
   const uniqueEndpoints = (peer: typeof status.peers[number]) => {
     const seen = new Set<string>();
     return peer.endpoints.filter(endpoint => {
@@ -155,6 +138,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
   return <div className="send-panel">
     <div className="send-scroll">
       {error && <div className="notice error" role="alert">{error}</div>}
+      {scanError && <div className="notice error" role="alert">扫描状态读取失败：{scanError}</div>}
       <div className="send-grid">
       <section className="surface payload-panel">
         <div className="section-title"><span className="step">1</span><h2>选择要发送的内容</h2></div>
@@ -165,8 +149,8 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
         <div className={'button-row send-type-buttons ' + (isMobile ? 'mobile-send-types' : 'desktop-send-types')}><button onClick={() => choose(false)}><Icon name="file" size={22} /> <span>文件</span></button><button onClick={() => choose(true)}><Icon name="folder" size={22} /> <span>文件夹</span></button>{isMobile && <><button onClick={() => choose(false, 'media')}><Icon name="image" size={22} /> <span>媒体</span></button><button onClick={() => choose(false, 'apps')}><Icon name="app" size={22} /> <span>应用</span></button></>}<button onClick={() => void addText(false)}><Icon name="text" size={22} /> <span>文本</span></button><button onClick={() => void addText(true)}><Icon name="clipboard" size={22} /> <span>剪切板</span></button></div>
         </div>
         {!!paths.length && <div className="selection-list">
-          <div className="selection-heading"><strong>{manifest ? count + ' 个文件 · ' + formatBytes(total) : '正在读取文件清单…'}</strong><button className="text-button" onClick={() => setPaths([])}>清空</button></div>
-          {paths.map(path => <div className="selection-row" key={path}><Icon name="file" /><span title={path}>{path.split(/[\\/]/).pop()}</span><button className="icon-button" title="移除" aria-label={'移除 ' + path} onClick={() => setPaths(old => old.filter(p => p !== path))}><Icon name="close" size={16} /></button></div>)}
+          <div className="selection-heading"><strong>{!manifest ? '正在读取所选项目…' : manifest.scanning ? (manifest.exceeded ? '文件数量过多 · 发送时逐步扫描' : '正在扫描…') : count + ' 个文件 · ' + formatBytes(total)}</strong><button className="text-button" onClick={() => setPaths([])}>清空</button></div>
+          {paths.map(path => <div className="selection-row" key={path}><Icon name="file" /><span>{path.split(/[\\/]/).pop()}</span><button className="icon-button" title="移除" aria-label={'移除 ' + path} onClick={() => setPaths(old => old.filter(p => p !== path))}><Icon name="close" size={16} /></button></div>)}
         </div>}
         <label className="check-label"><input type="checkbox" checked={verifyHash} onChange={e => setVerifyHash(e.target.checked)} /><span className="check-mark" aria-hidden="true"><Icon name="check" size={14} /></span><span>额外校验每个分块的 SHA-256</span></label>
         <p className="caption">传输始终加密。额外哈希校验适合重要资料。</p>
@@ -187,7 +171,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
       </section>
       </div>
     </div>
-    {favoritesOpen && !contextPeer && <FavoritesDialog favorites={favorites} peers={status.peers} error={favoriteError} selectedId={peerId} canSend={!busy && !preflighting && !!manifest} onSelect={setPeerId} onDetails={setContextPeer} onSend={() => { onCloseFavorites(); void send(); }} onRemove={onRemoveFavorite} onClose={onCloseFavorites} />}
+    {favoritesOpen && !contextPeer && <FavoritesDialog favorites={favorites} peers={status.peers} error={favoriteError} selectedId={peerId} canSend={!busy && !preflighting && !!paths.length} onSelect={setPeerId} onDetails={setContextPeer} onSend={() => { onCloseFavorites(); void send(); }} onRemove={onRemoveFavorite} onClose={onCloseFavorites} />}
     {contextPeer && (() => {
       const saved = favorites.find(item => item.node_id === contextPeer);
       const livePeer = status.peers.find(item => item.node_id === contextPeer);
@@ -206,7 +190,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
       </section></div>;
     })()}
     {textDialog === 'text' && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setTextDialog(null); }}><section className="modal surface" role="dialog" aria-modal="true" aria-labelledby="text-dialog-title"><div className="modal-heading"><div><span className="eyebrow">SEND TEXT</span><h2 id="text-dialog-title">输入要发送的文本</h2></div><button type="button" className="icon-button" aria-label="关闭" onClick={() => setTextDialog(null)}><Icon name="close" /></button></div><textarea className="text-entry" autoFocus value={textDraft} onChange={event => setTextDraft(event.target.value)} placeholder="输入文本内容" rows={6} /><div className="modal-actions"><button type="button" onClick={() => setTextDialog(null)}>取消</button><button type="button" className="primary" disabled={!textDraft.trim()} onClick={() => void confirmText()}>添加到发送列表</button></div></section></div>}
-    <div className="send-footer"><div><strong>{peerId ? '接收方：' + (status.peers.find(p => p.node_id === peerId)?.display_name ?? '') : '选择内容和接收方后即可发送'}</strong><span>接收方确认后才开始传输 · 无需账号</span></div>{preflighting ? <button className="primary send-button" disabled={cancellingPreflight} onClick={() => void cancelPreflight()}>取消</button> : <button className="primary send-button" disabled={busy || !manifest || !peerId} onClick={() => void send()}>发送{count ? ' ' + count + ' 个文件' : ''}</button>}</div>
+    <div className="send-footer"><div><strong>{peerId ? '接收方：' + (status.peers.find(p => p.node_id === peerId)?.display_name ?? '') : '选择内容和接收方后即可发送'}</strong><span>接收方确认后才开始传输 · 无需账号</span></div>{preflighting ? <button className="primary send-button" disabled={cancellingPreflight} onClick={() => void cancelPreflight()}>取消</button> : <button className="primary send-button" disabled={busy || !paths.length || !peerId} onClick={() => void send()}>发送{manifest && !manifest.scanning && count ? ' ' + count + ' 个文件' : ''}</button>}</div>
     {publicPrompt && <PublicPathPrompt address={publicAddress} busy={busy} error="" onCancel={() => setPublicPrompt(false)} onConfirm={() => void send(true)} />}
   </div>;
 }

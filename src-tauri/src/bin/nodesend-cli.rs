@@ -4,16 +4,26 @@
 //!   nodesend-cli receive <directory>
 //!   nodesend-cli send <peer-address> <path> [--no-hash]
 //!
+//! 该二进制由 `cli` feature 单独构建，不进入 GUI 安装包：
+//!   cargo build --release --features cli --bin nodesend-cli
+//!
 //! The CLI uses the same profile and native transport as the desktop app. Set
-//! NODESEND_DATA_DIR when it must share an existing GUI profile.
+//! NODESEND_DATA_DIR when it must share an existing GUI profile. 因为共用同一
+//! 监听端口，CLI 与 GUI 不能同时运行：桌面应用已启动时需要先退出它。
 
+use nodesend_lib::{
+    config::AppPaths, network::NetworkManager, service::AppService, transfer::model::ConflictPolicy,
+};
 use std::{env, path::PathBuf, sync::Arc};
-use nodesend_lib::{config::AppPaths, network::NetworkManager, service::AppService, transfer::model::ConflictPolicy};
 
 fn data_dir() -> PathBuf {
-    env::var_os("NODESEND_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| {
-        dirs::data_dir().unwrap_or_else(|| PathBuf::from("." )).join("NodeSend")
-    })
+    env::var_os("NODESEND_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("NodeSend")
+        })
 }
 
 #[tokio::main]
@@ -21,7 +31,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
     let app = AppService::init(AppPaths::new(data_dir()))?;
-    let network = NetworkManager::start(Arc::clone(&app)).await?;
+    let network = match NetworkManager::start(Arc::clone(&app)).await {
+        Ok(network) => network,
+        Err(error) => {
+            eprintln!("无法启动 NodeSend 网络服务：{error}");
+            eprintln!(
+                "如果桌面应用已经在运行，请先退出它：CLI 与 GUI 共用应用数据目录和监听端口。"
+            );
+            std::process::exit(1);
+        }
+    };
     match command.as_str() {
         "daemon" => {
             println!("NodeSend CLI 在线");
@@ -34,8 +53,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::create_dir_all(&directory)?;
             println!("NodeSend CLI 接收中: {}", directory);
             loop {
-                for task in network.transfers.snapshots().into_iter().filter(|t| t.direction == "receive" && t.status == "waiting") {
-                    network.decide_and_trust(task.id, true, Some(directory.clone()), ConflictPolicy::Rename, None, false).await?;
+                for task in network
+                    .transfers
+                    .snapshots()
+                    .into_iter()
+                    .filter(|t| t.direction == "receive" && t.status == "waiting")
+                {
+                    network
+                        .decide_and_trust(
+                            task.id,
+                            true,
+                            Some(directory.clone()),
+                            ConflictPolicy::Rename,
+                            None,
+                            false,
+                        )
+                        .await?;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -45,14 +78,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = args.next().ok_or("缺少文件路径")?;
             let verify_hash = !args.any(|arg| arg == "--no-hash");
             let peer = network.add_endpoint(address, None, false).await?;
-            let id = network.send(peer.node_id.clone(), vec![path], verify_hash, false).await?;
+            let id = network
+                .send(peer.node_id.clone(), vec![path], verify_hash, false)
+                .await?;
             println!("任务已创建: {id}");
             loop {
-                let task = network.transfers.snapshots().into_iter().find(|t| t.id == id);
+                let task = network
+                    .transfers
+                    .snapshots()
+                    .into_iter()
+                    .find(|t| t.id == id);
                 match task {
                     Some(t) => {
-                        println!("{}: {}/{} bytes ({})", t.status, t.completed_bytes, t.total_bytes, t.transport.unwrap_or_default());
-                        if ["completed", "cancelled", "rejected"].contains(&t.status.as_str()) { break; }
+                        println!(
+                            "{}: {}/{} bytes ({})",
+                            t.status,
+                            t.completed_bytes,
+                            t.total_bytes,
+                            t.transport.unwrap_or_default()
+                        );
+                        if ["completed", "cancelled", "rejected"].contains(&t.status.as_str()) {
+                            break;
+                        }
                     }
                     None => break,
                 }

@@ -11,41 +11,87 @@ pub fn validate_relative(raw: &str) -> AppResult<()> {
         return Err(invalid());
     }
     for part in raw.split('/') {
-        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
-        let device = ["CON", "PRN", "AUX", "NUL", "CLOCK$"].contains(&stem.as_str())
-            || (stem.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && stem.as_bytes()[3].is_ascii_digit());
-        if part.is_empty()
-            || part == "."
-            || part == ".."
-            || part.len() > 240
-            || part.ends_with(['.', ' '])
-            || part
-                .chars()
-                .any(|c| c.is_control() || r#"<>:"|?*"#.contains(c))
-            || device
-            || part.to_lowercase().starts_with(".nodesend-")
-        {
-            return Err(invalid());
-        }
+        validate_component(part)?;
+    }
+    Ok(())
+}
+
+/// 校验单个文件名组件，避免遍历目录时对每个条目反复扫描整个相对路径。
+pub fn validate_component(part: &str) -> AppResult<()> {
+    let stem = part.split('.').next().unwrap_or("");
+    let reserved = ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name));
+    let device_prefix = stem.get(..3);
+    let device_number = stem.len() == 4
+        && device_prefix.is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+        })
+        && stem.as_bytes()[3].is_ascii_digit();
+    let nodesend_reserved = part
+        .get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".nodesend-"));
+    if part.is_empty()
+        || part == "."
+        || part == ".."
+        || part.len() > 240
+        || part.ends_with(['.', ' '])
+        || part
+            .chars()
+            .any(|c| c.is_control() || r#"<>:"|?*"#.contains(c))
+        || reserved
+        || device_number
+        || nodesend_reserved
+    {
+        return Err(invalid());
     }
     Ok(())
 }
 fn invalid() -> AppError {
     AppError::BadRequest("文件路径包含越界、保留名称或非法字符".into())
 }
+/// 判定一份**未跟随符号链接**的元数据是否为普通项：拒绝符号链接与 Windows 重解析点。
+///
+/// 与 [`ensure_plain`] 的检查完全一致，区别是复用调用方已经取得的 `symlink_metadata`，
+/// 从而避免对同一路径重复发起一次 stat（遍历路径上每条目省一次文件系统调用）。
+pub fn ensure_plain_meta(meta: &std::fs::Metadata) -> AppResult<()> {
+    if meta.file_type().is_symlink() {
+        return Err(AppError::Forbidden("不允许符号链接".into()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err(AppError::Forbidden("不允许重解析点".into()));
+        }
+    }
+    Ok(())
+}
 pub fn ensure_plain(path: &Path) -> AppResult<()> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(AppError::Forbidden("不允许符号链接".into()));
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if meta.file_attributes() & 0x400 != 0 {
-                return Err(AppError::Forbidden("不允许重解析点".into()));
-            }
+        ensure_plain_meta(&meta)?;
+    }
+    Ok(())
+}
+/// 词法路径安全检查：只做字符串判断，不访问文件系统。
+///
+/// 清单分片一次可达数千条，逐条 `ensure_under` 会在每个路径段上做
+/// symlink_metadata/exists/canonicalize（十几条系统调用），在 NAS、HDD 或
+/// 网络盘上会把一帧拖到几十秒，进而让发送端误报"网络读取超时"。
+/// 因此清单阶段用词法检查；真正的符号链接/重解析点校验仍在
+/// [`ensure_under`]，由"确认接收"规划目标路径与"提交落盘"时执行。
+pub fn ensure_relative_safe(path: &str) -> AppResult<()> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains(':')
+        || path.contains('\0')
+    {
+        return Err(invalid());
+    }
+    for part in path.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains('\\') {
+            return Err(invalid());
         }
     }
     Ok(())
@@ -156,6 +202,59 @@ pub fn cleanup_stage(task: &TaskRecord) -> AppResult<()> {
         std::fs::remove_dir_all(stage)?;
     }
     Ok(())
+}
+
+/// 缓存目录/文件名安全化：任务 ID 来自网络（`in-<peer>-<wire>`），
+/// 只保留字母数字与 `-`/`_`，杜绝路径分隔符或 `..` 逃逸缓存根目录。
+pub fn safe_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 某任务在缓存盘上的根目录（`<cache_root>/<safe task id>`）。
+pub fn cache_task(cache_root: &Path, task_id: &str) -> PathBuf {
+    cache_root.join(safe_component(task_id))
+}
+
+/// 缓存分段文件：`<cache_root>/<task>/<file>.<segment>.seg`。
+/// 分段是为了在 Windows 上能「从头部」回收已转写的数据（Windows 无法截断文件头部）。
+pub fn cache_segment(cache_root: &Path, task_id: &str, file: usize, segment: u64) -> PathBuf {
+    cache_task(cache_root, task_id).join(format!("{file}.{segment}.seg"))
+}
+
+/// 两个路径是否位于同一卷（同卷说明缓存与目标共用一块盘，中转只会加倍 I/O，
+/// 调用方据此回退为直写）。
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        fn prefix(path: &Path) -> Option<String> {
+            let real = path.canonicalize().ok()?;
+            match real.components().next()? {
+                std::path::Component::Prefix(prefix) => {
+                    Some(prefix.as_os_str().to_string_lossy().to_uppercase())
+                }
+                _ => None,
+            }
+        }
+        matches!((prefix(a), prefix(b)), (Some(x), Some(y)) if x == y)
+    }
+    #[cfg(not(windows))]
+    {
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => {
+                use std::os::unix::fs::MetadataExt;
+                x.dev() == y.dev()
+            }
+            _ => false,
+        }
+    }
 }
 
 fn numbered_name(name: &str, directory: bool, number: usize) -> String {

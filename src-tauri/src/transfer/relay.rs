@@ -18,7 +18,7 @@
 //! - 转写启动后**持续运行**，与接收并行；目标盘写入严格按偏移顺序。
 //! - 缓存分段文件是必需的：Windows 无法截断文件头部，只有分段才能回收已转写数据。
 
-use super::{model::TaskRecord, paths, write_queue::writable, TransferService};
+use super::{paths, write_queue::writable, RelayPlan, RelayState, TransferService};
 use crate::error::{AppError, AppResult};
 use crate::service::AppService;
 use std::{
@@ -31,23 +31,22 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// 启动转写的触发线：缓存中已 sync 的字节达到该值即启动转写任务。
 /// **这是触发线，不是上限**；小文件全部收齐时也立即触发。
-pub(crate) const START_RELAY_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const START_RELAY_BYTES: u64 = crate::tuning::RELAY_START_BYTES;
 
-/// 缓存分段大小。必须为块大小的整数倍（256 KiB / 1 MiB / 4 MiB 均整除 64 MiB），
-/// 这样每个块都完整落在某一段内，转写按段推进即可严格顺序。
-pub(crate) const SEG_BYTES: u64 = 64 * 1024 * 1024;
+/// 缓存分段大小。见 [`crate::tuning::RELAY_SEGMENT_BYTES`]。
+pub(crate) const SEG_BYTES: u64 = crate::tuning::RELAY_SEGMENT_BYTES;
 
 /// 缓存盘可用空间低于该值时阻塞接收，等待转写释放空间；绝不报错、绝不丢数据。
-pub(crate) const CACHE_FREE_FLOOR: u64 = 256 * 1024 * 1024;
+pub(crate) const CACHE_FREE_FLOOR: u64 = crate::tuning::CACHE_FREE_FLOOR;
 
 /// 巡检间隔（触发转写任务、等待缺口）。
-const TICK: Duration = Duration::from_millis(200);
+const TICK: Duration = crate::tuning::WRITE_TICK;
 
 /// 转写进度（已 sync 到目标盘）保存失败时的兜底设置键前缀提示，见 `pending_cleanup`。
 const PENDING_CLEANUP_KEY: &str = "pending_cleanup";
 
 /// 解析缓存盘中转目录：
-/// 用户设置 `cache_directory` → `<软件安装目录>\Cache`（默认）→ `<数据目录>\Cache`（回退）。
+/// 用户设置 `cache_directory` → `D:\ProgramData\NodeSend\Cache` → `C:\ProgramData\NodeSend\Cache`。
 /// 返回第一个「可创建」的目录；全部不可用时返回 `None`（此时所有任务自动直写）。
 pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
     let mut candidates = Vec::new();
@@ -56,10 +55,16 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
             candidates.push(PathBuf::from(dir));
         }
     }
-    if let Some(install) = crate::config::install_dir() {
-        candidates.push(install.join("Cache"));
+    #[cfg(windows)]
+    {
+        candidates.push(PathBuf::from(r"D:\ProgramData\NodeSend\Cache"));
+        candidates.push(PathBuf::from(r"C:\ProgramData\NodeSend\Cache"));
     }
-    candidates.push(app.paths.data_dir.join("Cache"));
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 平台没有 D:/C: ProgramData 约定，保留平台数据目录。
+        candidates.push(app.paths.data_dir.join("Cache"));
+    }
     for candidate in candidates {
         match std::fs::create_dir_all(&candidate) {
             Ok(()) => return Some(candidate),
@@ -71,15 +76,12 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
 
 /// 缓存盘可用空间不足时阻塞，等待转写任务腾出空间。
 /// 用于接收路径：把「缓存盘写满」转化为对接收的**背压**，而不是错误。
-pub(crate) async fn await_cache_space(
-    service: &TransferService,
-    task_id: &str,
-) -> AppResult<()> {
+pub(crate) async fn await_cache_space(service: &TransferService, task_id: &str) -> AppResult<()> {
     let Some(cache_root) = service.cache_root.as_ref() else {
         return Ok(());
     };
     loop {
-        if !writable(&service.record(task_id)?.status) {
+        if !writable(&service.status_of(task_id)?) {
             return Ok(());
         }
         if fs2::available_space(cache_root).unwrap_or(u64::MAX) >= CACHE_FREE_FLOOR {
@@ -98,14 +100,17 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
                 _ = service.shutdown.cancelled() => break,
                 _ = tokio::time::sleep(TICK) => {
                     for id in service.receive_ids() {
-                        let Ok(task) = service.record(&id) else { continue };
-                        if !candidate(&task) {
+                        let Ok(state) = service.relay_state(&id) else { continue };
+                        if !candidate(&state) {
                             continue;
                         }
-                        if service.relay_active.lock().unwrap().contains(&id) {
+                        let runtime = service.runtime(&id);
+                        if runtime.relay_active.load(std::sync::atomic::Ordering::SeqCst) {
                             continue;
                         }
-                        service.relay_active.lock().unwrap().insert(id.clone());
+                        runtime
+                            .relay_active
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         let worker = Arc::clone(&service);
                         let task_id = id.clone();
                         tokio::spawn(async move {
@@ -113,7 +118,11 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
                                 tracing::error!(task = %task_id, "缓冲中转写失败：{err}");
                                 fail_relay(&worker, &task_id, &err);
                             }
-                            worker.relay_active.lock().unwrap().remove(&task_id);
+                            if let Some(runtime) = worker.runtime_if_exists(&task_id) {
+                                runtime
+                                    .relay_active
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
                         });
                     }
                 }
@@ -122,86 +131,74 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
     });
 }
 
-/// 是否应启动/继续转写该任务。
-fn candidate(task: &TaskRecord) -> bool {
-    task.direction == "receive"
-        && task.use_cache
-        && task.error.is_none()
-        && writable(&task.status)
-        && trigger(task)
-        && !relay_done(task)
+/// 是否应启动/继续转写该任务（只用标量状态，O(1)）。
+fn candidate(state: &RelayState) -> bool {
+    state.use_cache
+        && state.error.is_none()
+        && writable(&state.status)
+        && trigger(state)
+        && !relay_done(state)
 }
 
 /// 转写触发条件：缓存中已 sync 的字节 ≥ [`START_RELAY_BYTES`]，或全部块已收齐/跳过。
-fn trigger(task: &TaskRecord) -> bool {
-    let chunks = task.manifest.chunks();
-    if task.completed.len() >= chunks.len() {
-        return true;
-    }
-    let received: u64 = task
-        .completed
-        .iter()
-        .filter_map(|i| chunks.get(*i))
-        .filter(|c| !task.skipped_files.contains(&c.file))
-        .map(|c| c.length as u64)
-        .sum();
-    received >= START_RELAY_BYTES
+fn trigger(state: &RelayState) -> bool {
+    state.completed_count >= state.chunk_count || state.completed_bytes >= START_RELAY_BYTES
 }
 
 /// 转写是否已全部完成（直写模式或未选中的文件视为已完成）。
 /// 完成后目标盘临时文件长度即等于清单大小，`commit` 才能 rename。
-pub(crate) fn relay_done(task: &TaskRecord) -> bool {
-    if !task.use_cache {
-        return true;
-    }
-    task.manifest.entries.iter().enumerate().all(|(i, entry)| {
-        entry.directory
-            || task.targets.get(i).and_then(Option::as_ref).is_none()
-            || entry.size == 0
-            || task.relayed.get(i).copied().unwrap_or(0) >= entry.size
-    })
+pub(crate) fn relay_done(state: &RelayState) -> bool {
+    !state.use_cache || state.relayed_total >= state.relay_target_bytes
 }
 
 /// 单个任务的转写循环：按文件、按偏移顺序把缓存数据搬到目标盘。
+///
+/// 明细只在启动时取一次（`RelayPlan`）；进度用 `relayed_at` 按文件读取，
+/// 状态用 `status_of` 读取，因此每轮巡检都不再克隆整份清单（百万级清单仍 O(1)）。
 async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
     let Some(cache_root) = service.cache_root.clone() else {
         return Ok(());
     };
+    let plan = service.relay_plan(id)?;
+    if !plan.use_cache {
+        return Ok(());
+    }
     loop {
-        let task = service.record(id)?;
-        if !writable(&task.status) || !task.use_cache {
+        let state = service.relay_state(id)?;
+        if !writable(&state.status) || !state.use_cache {
             return Ok(());
         }
-        if relay_done(&task) {
+        if relay_done(&state) {
             return Ok(());
         }
-        let bases = file_bases(&task);
         let mut progressed = false;
         // 一个文件尽量连续写完再换下一个，避免在机械盘上多文件交错写入造成寻道。
         // 只有该文件所需块尚未到达缓存（阻塞）时才换到下一个文件。
-        for (file, entry) in task.manifest.entries.iter().enumerate() {
-            if entry.directory || task.targets.get(file).and_then(Option::as_ref).is_none() {
+        for (file, entry) in plan.entries.iter().enumerate() {
+            if entry.directory || plan.targets.get(file).and_then(Option::as_ref).is_none() {
                 continue;
             }
+            let mut done = service.relayed_at(id, file);
             loop {
-                let current = service.record(id)?;
-                if !writable(&current.status) {
+                if !writable(&service.status_of(id)?) {
                     return Ok(());
                 }
-                let done = current.relayed.get(file).copied().unwrap_or(0);
                 if done >= entry.size {
                     break;
                 }
-                if !relay_file_step(service, &current, &cache_root, &bases, file, entry.size, done)
+                match relay_file_step(service, &plan, &cache_root, id, file, entry.size, done)
                     .await?
                 {
-                    break; // 所需块未到，先处理下一个文件，下一轮再回来
+                    Some(next) => {
+                        done = next;
+                        progressed = true;
+                    }
+                    None => break, // 所需块未到，先处理下一个文件，下一轮再回来
                 }
-                progressed = true;
             }
         }
-        let latest = service.record(id)?;
-        if relay_done(&latest) || !writable(&latest.status) {
+        let state = service.relay_state(id)?;
+        if relay_done(&state) || !writable(&state.status) {
             return Ok(());
         }
         if !progressed {
@@ -210,38 +207,26 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
     }
 }
 
-/// 每个「文件条目」在 `manifest.chunks()` 中的起始全局块号。
-fn file_bases(task: &TaskRecord) -> Vec<usize> {
-    let mut bases = Vec::with_capacity(task.manifest.entries.len());
-    let mut acc = 0usize;
-    for entry in &task.manifest.entries {
-        bases.push(acc);
-        if !entry.directory {
-            acc += entry.size.div_ceil(task.manifest.chunk_size) as usize;
-        }
-    }
-    bases
-}
-
 /// 转写一个文件的一个分段：读缓存 → 顺序追加目标盘临时文件 → sync → 记录进度 → 删缓存。
-/// 返回是否取得进展（`false` 表示所需块尚未在缓存中，等下一轮）。
+/// 返回 `Some(新偏移)` 表示取得进展；`None` 表示所需块尚未在缓存中，等下一轮。
 async fn relay_file_step(
     service: &Arc<TransferService>,
-    task: &TaskRecord,
+    plan: &RelayPlan,
     cache_root: &Path,
-    bases: &[usize],
+    id: &str,
     file: usize,
     size: u64,
     done: u64,
-) -> AppResult<bool> {
+) -> AppResult<Option<u64>> {
     let seg_end = ((done / SEG_BYTES + 1) * SEG_BYTES).min(size);
-    let chunk_size = task.manifest.chunk_size;
+    let chunk_size = plan.chunk_size;
+    let base = plan.bases[file];
     // 先确认本段的第一个块已在缓存中，避免无谓地打开/截断目标文件。
-    let first = bases[file] + (done / chunk_size) as usize;
-    if !task.completed.contains(&first) {
-        return Ok(false);
+    let first = base + (done / chunk_size) as usize;
+    if !service.is_completed(id, first) {
+        return Ok(None);
     }
-    let part = paths::stage(task)?.join(format!("{file}.part"));
+    let part = service.stage_dir(id)?.join(format!("{file}.part"));
     paths::ensure_plain(&part)?;
     if let Some(parent) = part.parent() {
         std::fs::create_dir_all(parent)?;
@@ -260,12 +245,12 @@ async fn relay_file_step(
     }
     let mut offset = done;
     while offset < seg_end {
-        let index = bases[file] + (offset / chunk_size) as usize;
-        if !task.completed.contains(&index) {
-            return Ok(false);
+        let index = base + (offset / chunk_size) as usize;
+        if !service.is_completed(id, index) {
+            return Ok(None);
         }
         let len = chunk_size.min(size - offset) as usize;
-        let seg_path = paths::cache_segment(cache_root, &task.id, file, offset / SEG_BYTES);
+        let seg_path = paths::cache_segment(cache_root, id, file, offset / SEG_BYTES);
         let data = read_segment(&seg_path, offset % SEG_BYTES, len).await?;
         handle.seek(std::io::SeekFrom::Start(offset)).await?;
         handle.write_all(&data).await?;
@@ -273,18 +258,13 @@ async fn relay_file_step(
     }
     handle.sync_data().await?;
     drop(handle);
-    // sync 成功后记录转写进度：这是崩溃后唯一可信的回退点。
-    service.edit(&task.id, |t| {
-        if t.relayed.len() < t.manifest.entries.len() {
-            t.relayed.resize(t.manifest.entries.len(), 0);
-        }
-        t.relayed[file] = offset;
-    })?;
+    // sync 成功后记录转写进度：这是崩溃后唯一可信的回退点（增量写 `task_relay`）。
+    service.set_relayed(id, file, offset)?;
     // 释放已转写的缓存分段（Windows 上靠分段才能回收已写过的前缀）。
     for segment in fully_consumed(done, size)..fully_consumed(offset, size) {
-        let _ = std::fs::remove_file(paths::cache_segment(cache_root, &task.id, file, segment));
+        let _ = std::fs::remove_file(paths::cache_segment(cache_root, id, file, segment));
     }
-    Ok(true)
+    Ok(Some(offset))
 }
 
 /// 已完全转写（可删除）的缓存分段数量。
@@ -327,8 +307,10 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
         .into_iter()
         .filter(|id| {
             service
-                .record(id)
-                .map(|t| ["waiting", "accepted", "transferring", "paused"].contains(&t.status.as_str()))
+                .status_of(id)
+                .map(|status| {
+                    ["waiting", "accepted", "transferring", "paused"].contains(&status.as_str())
+                })
                 .unwrap_or(false)
         })
         .map(|id| paths::safe_component(&id))
@@ -338,7 +320,11 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         if !path.is_dir() || protected.contains(&name) {

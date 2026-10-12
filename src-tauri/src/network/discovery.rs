@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tokio::net::UdpSocket;
 pub const SERVICE_TYPE: &str = "_nodesend._tcp.local.";
@@ -69,7 +68,7 @@ pub async fn probe(
     socket.send_to(&packet, target).await?;
     let mut buf = [0; 4096];
     let mut found = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + crate::tuning::DISCOVERY_PROBE_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -106,7 +105,7 @@ impl Discovery {
         let (h, p, s, c) = (hello.clone(), peers.clone(), status.clone(), stop.clone());
         tokio::spawn(async move {
             if let Err(e) = mdns(h, p, s.clone(), c).await {
-                let mut status = s.lock().unwrap();
+                let mut status = crate::locks::lock(&s);
                 status.mdns = false;
                 status.warnings.push(format!("mDNS: {e}"));
             }
@@ -114,7 +113,7 @@ impl Discovery {
         let (s, c) = (status.clone(), stop.clone());
         tokio::spawn(async move {
             if let Err(e) = udp(hello, peers, s.clone(), c).await {
-                let mut status = s.lock().unwrap();
+                let mut status = crate::locks::lock(&s);
                 status.udp = false;
                 status.warnings.push(format!("UDP: {e}"));
             }
@@ -157,7 +156,7 @@ async fn mdns(
     let fullname = info.get_fullname().to_string();
     daemon.register(info).map_err(other)?;
     let receiver = daemon.browse(SERVICE_TYPE).map_err(other)?;
-    status.lock().unwrap().mdns = true;
+    crate::locks::lock(&status).mdns = true;
     loop {
         tokio::select! {
             _=stop.cancelled()=>break,
@@ -177,7 +176,7 @@ async fn mdns(
     }
     let _ = daemon.unregister(&fullname);
     let _ = daemon.shutdown();
-    status.lock().unwrap().mdns = false;
+    crate::locks::lock(&status).mdns = false;
     Ok(())
 }
 fn scoped_addresses(ip: IpAddr) -> Vec<String> {
@@ -220,10 +219,10 @@ async fn udp(
     let group = Ipv4Addr::new(239, 255, 58, 81);
     let _ = socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED);
     socket.set_multicast_ttl_v4(1)?;
-    status.lock().unwrap().udp = true;
+    crate::locks::lock(&status).udp = true;
     let data = serde_json::to_vec(&hello)?;
     let mut buf = [0; 4096];
-    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    let mut tick = tokio::time::interval(crate::tuning::DISCOVERY_TICK);
     loop {
         tokio::select! {
             _=stop.cancelled()=>break,
@@ -260,7 +259,7 @@ async fn udp(
             }
         }
     }
-    status.lock().unwrap().udp = false;
+    crate::locks::lock(&status).udp = false;
     Ok(())
 }
 fn other(e: impl std::fmt::Display) -> AppError {

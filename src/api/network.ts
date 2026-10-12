@@ -1,5 +1,5 @@
 import { invoke } from './runtime';
-import type { ConflictPolicy, Manifest, NetworkStatus, Peer } from '../types/network';
+import type { ConflictPolicy, NetworkStatus, Peer, PreviewStatus, TaskEntriesPage } from '../types/network';
 export const getNetworkStatus = () => invoke<NetworkStatus>('get_network_status');
 export const chooseSendFiles = (directory = false, kind: 'files' | 'media' | 'apps' = 'files') => invoke<string[]>('choose_send_files', { directory, kind });
 export const takeSharedFiles = () => invoke<string[]>('take_shared_files');
@@ -7,7 +7,10 @@ export const stageTextPayload = (text: string) => invoke<string>('stage_text_pay
 export const stageBinaryPayload = (bytes: number[], extension: string) => invoke<string>('stage_binary_payload', { bytes, extension });
 export const readClipboardFiles = () => invoke<string[]>('read_clipboard_files');
 export const chooseReceiveDirectory = () => invoke<string | null>('choose_receive_directory');
-export const previewTransfer = (paths: string[]) => invoke<Manifest>('preview_transfer', { paths });
+export const previewTransfer = (paths: string[]) => invoke<PreviewStatus>('preview_transfer', { paths });
+export const previewStatus = () => invoke<PreviewStatus | null>('preview_status');
+export const previewCancel = () => invoke<void>('preview_cancel');
+export const listTaskEntries = (id: string, offset: number, limit: number) => invoke<TaskEntriesPage>('list_task_entries', { id, offset, limit });
 export const sendFiles = (peerId: string, paths: string[], verifyHash: boolean, allowPublic: boolean) => invoke<string>('send_files', { peerId, paths, verifyHash, allowPublic });
 export const cancelSendPreflight = (peerId: string) => invoke<void>('cancel_send_preflight', { peerId });
 export const addEndpoint = (address: string, expectedNodeId: string | null, allowPublic: boolean) => invoke<Peer>('add_endpoint', { address, expectedNodeId, allowPublic });

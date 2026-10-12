@@ -9,11 +9,13 @@ import { ShareCenterPage } from './pages/ShareCenterPage';
 import { TrustedPage } from './pages/TrustedPage';
 import { NetworkPage, type TransferPage } from './pages/NetworkPage';
 import { useNetwork } from './hooks/useNetwork';
+import { useSendSelection } from './hooks/useSendSelection';
 import { frontendPreview } from './api/runtime';
 export default function App() {
   const [page, setPage] = useState<PageKey>('send');
   const [exitHint, setExitHint] = useState(false);
   const network = useNetwork();
+  const sendSelection = useSendSelection();
   const currentPage = useRef<PageKey>('send');
   const pageHistory = useRef<PageKey[]>(['send']);
   const exitDeadline = useRef(0);
@@ -92,7 +94,7 @@ export default function App() {
     if (frontendPreview) return;
     const receive = (paths: string[]) => {
       if (!paths.length) return;
-      window.dispatchEvent(new CustomEvent('nodesend-shared-files', { detail: paths }));
+      sendSelection.setPaths(old => [...new Set([...old, ...paths])]);
       navigate('send');
     };
     let dispose: (() => void) | undefined;
@@ -101,10 +103,10 @@ export default function App() {
       .then(unlisten => { dispose = unlisten; })
       .catch(() => {});
     return () => dispose?.();
-  }, []);
+  }, [navigate, sendSelection.setPaths]);
   return <AppLayout current={page} onNavigate={navigate} status={network.status}>
     {page === 'send' && exitHint && <div className="back-exit-hint" role="status">再按一次返回退出</div>}
-    {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} onNavigate={navigate} />}
+    {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} onNavigate={navigate} selection={sendSelection} />}
     {page === 'dashboard' && <DashboardPage network={network.status} onSaved={network.refresh} />}
     {page === 'shares' && <ShareCenterPage />}
     {page === 'trusted' && <TrustedPage />}
