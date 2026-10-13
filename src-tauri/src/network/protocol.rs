@@ -18,10 +18,33 @@ pub const MANIFEST_TIMEOUT: std::time::Duration = crate::tuning::MANIFEST_ACK_TI
 /// 等于 26 万个块，JSON 约 2 MB，且每 750ms 一次。顺序传输下块号是连续的，
 /// 用区间表示通常只剩几个元素；缺口多时最坏退化为"每块一个区间"，
 /// 也比逐个数字小得多（每个区间 2 个 32 位整数）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CompletedRanges {
     #[serde(default)]
     ranges: Vec<[u32; 2]>,
+}
+
+// Read legacy v3 arrays as well as the v4 compact object. Serialization remains
+// the v4 compact shape so this build interoperates with the committed GitHub build.
+impl<'de> Deserialize<'de> for CompletedRanges {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Compact {
+                #[serde(default)]
+                ranges: Vec<[u32; 2]>,
+            },
+            Legacy(Vec<usize>),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Compact { ranges } => Ok(Self { ranges }),
+            Repr::Legacy(indices) => Ok(Self::from_sorted(indices)),
+        }
+    }
 }
 
 impl CompletedRanges {
@@ -81,7 +104,8 @@ impl CompletedRanges {
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Request {    SkipFile {
+pub enum Request {
+    SkipFile {
         id: String,
         file: usize,
     },
@@ -178,7 +202,9 @@ pub enum Response {
         length: u64,
     },
     Ready,
-    ManifestResume { next_index: usize },
+    ManifestResume {
+        next_index: usize,
+    },
     Error {
         message: String,
     },
@@ -220,4 +246,21 @@ pub async fn read_frame_with_timeout<R: AsyncRead + Unpin + ?Sized, T: Deseriali
     })
     .await
     .map_err(|_| AppError::Other("网络读取超时".into()))?
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::CompletedRanges;
+
+    #[test]
+    fn completed_ranges_accepts_legacy_and_compact_wire_shapes() {
+        let legacy: CompletedRanges = serde_json::from_str("[0,1,2,5]").unwrap();
+        assert_eq!(legacy.iter().collect::<Vec<_>>(), vec![0, 1, 2, 5]);
+
+        let compact: CompletedRanges = serde_json::from_str(r#"{"ranges":[[0,2],[5,5]]}"#).unwrap();
+        assert_eq!(compact.iter().collect::<Vec<_>>(), vec![0, 1, 2, 5]);
+
+        let encoded = serde_json::to_string(&compact).unwrap();
+        assert_eq!(encoded, r#"{"ranges":[[0,2],[5,5]]}"#);
+    }
 }
