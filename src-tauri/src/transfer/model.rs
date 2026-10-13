@@ -292,7 +292,11 @@ impl Manifest {
     pub fn summary(&self) -> ManifestSummary {
         ManifestSummary {
             scan_complete: true,
-            top_level_count: self.entries.iter().filter(|entry| !entry.path.contains('/')).count(),
+            top_level_count: self
+                .entries
+                .iter()
+                .filter(|entry| !entry.path.contains('/'))
+                .count(),
             file_count: self.entries.iter().filter(|e| !e.directory).count(),
             directory_count: self.entries.iter().filter(|e| e.directory).count(),
             total_size: self.total(),
@@ -305,7 +309,11 @@ impl Manifest {
     pub fn offer_summary(&self) -> OfferSummary {
         OfferSummary {
             streaming: false,
-            top_level_count: self.entries.iter().filter(|entry| !entry.path.contains('/')).count(),
+            top_level_count: self
+                .entries
+                .iter()
+                .filter(|entry| !entry.path.contains('/'))
+                .count(),
             file_count: self.entries.len(),
             directory_count: self.entries.iter().filter(|e| e.directory).count(),
             total_size: self.total(),
@@ -567,6 +575,8 @@ impl TaskRecord {
         self.verify_hash = manifest.verify_hash;
         self.file_count = manifest.entries.len();
         self.directory_count = manifest.entries.iter().filter(|e| e.directory).count();
+        self.scan_progress_count = self.file_count;
+        self.scan_progress_directories = self.directory_count;
         self.total_size = manifest.total();
         self.chunk_count = manifest.chunk_count();
         self.manifest = manifest;
@@ -574,7 +584,7 @@ impl TaskRecord {
     pub fn event(&mut self, text: impl Into<String>) {
         self.updated_at = chrono::Utc::now().to_rfc3339();
         self.events
-            .push(format!("{} {}", self.updated_at, text.into()));
+            .push(format!("{} {}", chrono::Local::now().to_rfc3339(), text.into()));
         if self.events.len() > 100 {
             self.events.remove(0);
         }
@@ -594,9 +604,20 @@ impl TaskRecord {
     /// 任务快照（Stage 2 拆分）：只含计数、总量与进度，**不含清单明细**。
     /// 因此无需加载 bulk，也不会再把整份清单经 IPC 传到前端（明细走分页接口）。
     pub fn snapshot(&self) -> TaskSnapshot {
-        let show_scan_progress = self.direction == "send"
-            && !self.scan_complete
-            && (self.scan_progress_count > 0 || self.scan_last_seq == 0);
+        // Send-side live counters may be ahead of the last durable manifest
+        // cursor. Never replace a known count with zero just because a pause,
+        // resume, or snapshot happens between scan batches. `scan_last_seq`
+        // is also a durable lower bound for the number of scanned entries.
+        let (file_count, directory_count) = if self.direction == "send" {
+            (
+                self.file_count
+                    .max(self.scan_progress_count)
+                    .max(self.scan_last_seq),
+                self.directory_count.max(self.scan_progress_directories),
+            )
+        } else {
+            (self.file_count, self.directory_count)
+        };
         TaskSnapshot {
             warnings: self
                 .skipped_paths
@@ -610,8 +631,8 @@ impl TaskRecord {
             status: self.status.clone(),
             scan_complete: self.scan_complete,
             top_level_count: self.top_level_count,
-            file_count: if show_scan_progress { self.scan_progress_count } else { self.file_count },
-            directory_count: if show_scan_progress { self.scan_progress_directories } else { self.directory_count },
+            file_count,
+            directory_count,
             total_bytes: self.total_size.saturating_sub(self.skipped_bytes),
             completed_bytes: self.completed_bytes,
             transport: self.transport.clone(),

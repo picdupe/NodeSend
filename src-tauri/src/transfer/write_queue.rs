@@ -103,7 +103,9 @@ fn cached_handle(
     file: usize,
 ) -> Option<Arc<AsyncMutex<tokio::fs::File>>> {
     let runtime = service.runtime_if_exists(task_id)?;
-    let handle = crate::locks::lock(&runtime.receive_files).get(&file).cloned();
+    let handle = crate::locks::lock(&runtime.receive_files)
+        .get(&file)
+        .cloned();
     handle
 }
 
@@ -253,13 +255,13 @@ impl Writer {
 /// 写一个块到缓存盘分段文件，并在成功后 `sync_data`。
 /// 缓存盘写满（ENOSPC）时不报错：阻塞等待转写任务释放空间后重试。
 async fn store_cached(service: &Arc<TransferService>, chunk: &PendingChunk) -> AppResult<bool> {
-    let Some(cache_root) = service.cache_root.as_ref() else {
+    let Some(cache_root) = service.cache_root_for_task(&chunk.task_id) else {
         return Err(AppError::Other("缓存目录不可用".into()));
     };
-    let dir = paths::cache_task(cache_root, &chunk.task_id);
+    let dir = paths::cache_task(&cache_root, &chunk.task_id);
     std::fs::create_dir_all(&dir)?;
     let path = paths::cache_segment(
-        cache_root,
+        &cache_root,
         &chunk.task_id,
         chunk.file,
         chunk.offset / relay::SEG_BYTES,
@@ -312,10 +314,9 @@ async fn open_buffer(
     if use_cache {
         // 缓存模式：只为缓存盘建目录，绝不触碰目标盘。
         let cache_root = service
-            .cache_root
-            .as_ref()
+            .cache_root_for_task(id)
             .ok_or_else(|| AppError::Other("缓存目录不可用".into()))?;
-        std::fs::create_dir_all(paths::cache_task(cache_root, id))?;
+        std::fs::create_dir_all(paths::cache_task(&cache_root, id))?;
         return Ok(FileBuffer {
             ready: BTreeMap::new(),
             next_offset,

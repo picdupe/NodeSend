@@ -38,7 +38,6 @@ impl DiscoveryProbe {
 impl Announcement {
     pub fn valid(&self) -> bool {
         self.app == "nodesend"
-            && self.protocol_version == VERSION
             && valid_id(&self.node_id)
             && self.port != 0
             && self.quic_port != 0

@@ -4,7 +4,7 @@ param(
     [switch]$Fast,
     [ValidateSet('aarch64', 'armv7', 'i686', 'x86_64')]
     [string]$Target = 'aarch64',
-    [string]$JavaHome = 'D:\Program Files\Java\jdk-21.0.12.1'
+    [string]$JavaHome = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,14 +19,21 @@ Write-Output $versionAction
 $properties = Join-Path $projectRoot 'src-tauri/gen/android/local.properties'
 if (Test-Path -LiteralPath $properties) {
     $sdkLine = Get-Content -LiteralPath $properties | Where-Object { $_ -match '^sdk\.dir=' } | Select-Object -First 1
-}
 if ($sdkLine) {
     $sdkRoot = $sdkLine.Substring('sdk.dir='.Length).Trim()
 } else {
-    $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } elseif ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { 'D:\Users\picdupe\AppData\Local\Android\Sdk' }
+    $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } elseif ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $null }
+    if (-not $sdkRoot) { throw 'Android SDK path is not configured. Set ANDROID_SDK_ROOT or ANDROID_HOME, or provide sdk.dir in src-tauri/gen/android/local.properties.' }
     $sdkRoot = $sdkRoot -replace '\\', '/'
     Set-Content -LiteralPath $properties -Value "sdk.dir=$sdkRoot" -Encoding ASCII
     Write-Output "Created Android local.properties: sdk.dir=$sdkRoot"
+}
+$JavaHome = if ($JavaHome) { $JavaHome } elseif ($env:JAVA_HOME) { $env:JAVA_HOME } else {
+    $javaCommand = Get-Command java.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($javaCommand) { Split-Path (Split-Path $javaCommand.Source -Parent) -Parent } else { $null }
+}
+if (-not $JavaHome) { throw 'JDK 21 was not found. Set JAVA_HOME or add the JDK bin directory to PATH.' }
+$JavaHome = (Resolve-Path -LiteralPath $JavaHome).Path
 }
 $missing = @()
 if (-not (Test-Path "$JavaHome/bin/java.exe")) { $missing += "Java: $JavaHome" }
@@ -134,6 +141,43 @@ try {
     Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs') -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in '.apk', '.aab' -and $_.FullName -match "/$variant/|${variant}" } |
         Select-Object FullName, Length, LastWriteTime
+
+    # Generate Android update metadata during the same release build as
+    # Windows/Linux. Fast/debug builds must never replace release metadata.
+    if (-not $fastBuild) {
+        $versionData = Get-Content -LiteralPath (Join-Path $projectRoot 'version.json') -Raw | ConvertFrom-Json
+        $publicVersion = "v$($versionData.version).$($versionData.build)"
+        $internalVersion = "$($versionData.version)-build.$($versionData.build)"
+        $outputRoot = Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs'
+        $apkCandidates = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.apk' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "(?i)[/\\]$([Regex]::Escape($Target))[/\\]release[/\\]|$([Regex]::Escape($Target)).*release.*\.apk$" })
+        if ($apkCandidates.Count -ne 1) {
+            throw "Cannot generate Android update manifest: expected one release APK for target '$Target', found $($apkCandidates.Count). Inspect $outputRoot and ensure the release build produces a single APK for this target."
+        }
+        $apk = $apkCandidates[0]
+        $apkName = "NodeSend_${publicVersion}_android_${Target}.apk"
+        $publishedApk = Join-Path $apk.DirectoryName $apkName
+        if ($apk.FullName -ne $publishedApk) {
+            if (Test-Path -LiteralPath $publishedApk) { Remove-Item -LiteralPath $publishedApk -Force }
+            Move-Item -LiteralPath $apk.FullName -Destination $publishedApk
+        }
+
+        $downloadBase = if ($env:NODESEND_UPDATE_DOWNLOAD_BASE_URL -and $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim()) {
+            $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim().TrimEnd('/')
+        } else {
+            "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)"
+        }
+        $downloadUri = $null
+        if (-not [Uri]::TryCreate("$downloadBase/$apkName", [UriKind]::Absolute, [ref]$downloadUri) -or $downloadUri.Scheme -ne 'https') {
+            throw 'Android updater download URL must be HTTPS. Set NODESEND_UPDATE_DOWNLOAD_BASE_URL to a valid HTTPS base URL.'
+        }
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $python) { throw 'Python 3 is required to generate Android update metadata.' }
+        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel stable --apk $publishedApk --url $downloadUri.AbsoluteUri
+        if ($LASTEXITCODE -ne 0) { throw 'Could not merge Android APK metadata into updates/stable/latest.json.' }
+        Write-Output "Android release APK: $publishedApk"
+        Write-Output "Android updater download URL: $($downloadUri.AbsoluteUri)"
+    }
 } finally {
     Pop-Location
     foreach ($key in $previous.Keys) {

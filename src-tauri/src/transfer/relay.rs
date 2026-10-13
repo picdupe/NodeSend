@@ -51,9 +51,11 @@ const PENDING_CLEANUP_KEY: &str = "pending_cleanup";
 pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(Some(dir)) = app.get_setting("cache_directory") {
-        if !dir.trim().is_empty() {
-            candidates.push(PathBuf::from(dir));
+        // An explicitly empty setting means the user disabled caching.
+        if dir.trim().is_empty() {
+            return None;
         }
+        candidates.push(PathBuf::from(dir));
     }
     #[cfg(windows)]
     {
@@ -77,14 +79,14 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
 /// 缓存盘可用空间不足时阻塞，等待转写任务腾出空间。
 /// 用于接收路径：把「缓存盘写满」转化为对接收的**背压**，而不是错误。
 pub(crate) async fn await_cache_space(service: &TransferService, task_id: &str) -> AppResult<()> {
-    let Some(cache_root) = service.cache_root.as_ref() else {
+    let Some(cache_root) = service.cache_root_for_task(task_id) else {
         return Ok(());
     };
     loop {
         if !writable(&service.status_of(task_id)?) {
             return Ok(());
         }
-        if fs2::available_space(cache_root).unwrap_or(u64::MAX) >= CACHE_FREE_FLOOR {
+        if fs2::available_space(&cache_root).unwrap_or(u64::MAX) >= CACHE_FREE_FLOOR {
             return Ok(());
         }
         tokio::time::sleep(TICK).await;
@@ -125,6 +127,17 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
                             }
                         });
                     }
+                    // The sender may have disconnected after every chunk was
+                    // acknowledged but before its final Commit arrived. Once
+                    // the local relay is complete, finish the filesystem
+                    // commit here instead of leaving .part files indefinitely.
+                    for id in service.receive_ids() {
+                        if service.auto_commit_ready(&id) {
+                            if let Err(err) = service.commit(&id).await {
+                                tracing::warn!(task = %id, "自动恢复接收任务提交失败：{err}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -156,10 +169,10 @@ pub(crate) fn relay_done(state: &RelayState) -> bool {
 /// 明细只在启动时取一次（`RelayPlan`）；进度用 `relayed_at` 按文件读取，
 /// 状态用 `status_of` 读取，因此每轮巡检都不再克隆整份清单（百万级清单仍 O(1)）。
 async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
-    let Some(cache_root) = service.cache_root.clone() else {
+    let Some(cache_root) = service.cache_root_for_task(id) else {
         return Ok(());
     };
-    let plan = service.relay_plan(id)?;
+    let mut plan = service.relay_plan(id)?;
     if !plan.use_cache {
         return Ok(());
     }
@@ -167,6 +180,12 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
         let state = service.relay_state(id)?;
         if !writable(&state.status) || !state.use_cache {
             return Ok(());
+        }
+        // 接收端可能在传输过程中继续追加清单。不能只使用启动时的快照：
+        // 否则转写器会永远看不到后续文件，缓存不断增长，暂停/继续重启转写后才可能推进。
+        // 只有条目数量发生变化时才重新加载清单，避免每轮复制几十万条记录。
+        if plan.entries.len() < state.file_count {
+            plan = service.relay_plan(id)?;
         }
         if relay_done(&state) {
             return Ok(());
@@ -298,7 +317,7 @@ fn fail_relay(service: &Arc<TransferService>, task_id: &str, err: &AppError) {
 /// 1. 重试上次删除失败的「待清理」项；
 /// 2. 扫描缓存根目录，删除没有对应活动任务的孤儿缓存目录（进程崩溃遗留）。
 pub(crate) fn sweep(service: &Arc<TransferService>) {
-    let Some(cache_root) = service.cache_root.clone() else {
+    let Some(cache_root) = service.current_cache_root() else {
         return;
     };
     retry_pending_cleanup(service);
@@ -309,7 +328,7 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
             service
                 .status_of(id)
                 .map(|status| {
-                    ["waiting", "accepted", "transferring", "paused"].contains(&status.as_str())
+                    ["waiting", "accepted", "transferring", "paused", "interrupted"].contains(&status.as_str())
                 })
                 .unwrap_or(false)
         })

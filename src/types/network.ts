@@ -9,7 +9,7 @@ export interface ManifestSummary { scan_complete: boolean; top_level_count: numb
 export interface PreviewStatus { scanning: boolean; exceeded: boolean; top_level_count: number; file_count: number; directory_count: number; total_size: number; chunk_count: number; chunk_size: number }
 export type TaskStatus = 'queued' | 'connecting' | 'waiting' | 'accepted' | 'transferring' | 'paused' | 'interrupted' | 'failed' | 'incompatible' | 'completed' | 'rejected' | 'cancelled';
 export interface TransferTask { warnings?: string[]; bytes_per_second?: number; id: string; peer_id: string; peer_name: string; direction: 'send' | 'receive'; status: TaskStatus; scan_complete: boolean; top_level_count: number; file_count: number; directory_count: number; total_bytes: number; completed_bytes: number; transport: 'quic' | 'tcp' | null; error: string | null; destination: string | null; events: string[]; created_at: string; verify_hash: boolean }
-export interface NetworkStatus { node_id: string; display_name: string; tcp_port: number; quic_port: number; addresses: string[]; discovery: { mdns: boolean; udp: boolean; warnings: string[] }; peers: Peer[]; tasks: TransferTask[]; receive_directory: string; receive_policy: 'ask' | 'trusted' | 'reject' }
+export interface NetworkStatus { node_id: string; display_name: string; tcp_port: number; quic_port: number; addresses: string[]; discovery: { mdns: boolean; udp: boolean; warnings: string[] }; peers: Peer[]; tasks: TransferTask[]; receive_directory: string; cache_directory: string; receive_policy: 'ask' | 'trusted' | 'reject' }
 export type ConflictPolicy = 'rename' | 'skip' | 'overwrite';
 
 

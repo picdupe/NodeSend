@@ -94,6 +94,10 @@ if path.exists():
         if not isinstance(platforms, dict):
             raise SystemExit(f"Cannot merge existing updater manifest {path}: 'platforms' must be an object.")
         manifest["platforms"].update(platforms)
+        if "android" in existing:
+            manifest["android"] = existing["android"]
+        if isinstance(existing.get("notes"), str):
+            manifest["notes"] = existing["notes"]
         print(f"Merging updater manifest for existing version/build: {version}")
 
 manifest["platforms"][platform] = {

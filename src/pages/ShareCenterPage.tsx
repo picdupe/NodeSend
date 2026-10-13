@@ -22,9 +22,14 @@ export function ShareCenterPage() {
   const [showConnect, setShowConnect] = useState(false);
   const [incomingShare, setIncomingShare] = useState('');
   const refresh = useCallback(async () => {
-    try { const items = await listBrowserConnections(); setConnections(items); if (!active && items.find(item => item.connected)) setActive(items.find(item => item.connected)!.id); }
+    try {
+      const items = await listBrowserConnections();
+      setConnections(items);
+      const firstConnected = items.find(item => item.connected);
+      if (firstConnected) setActive(current => current || firstConnected.id);
+    }
     catch (err) { setError(errorText(err)); }
-  }, [active]);
+  }, []);
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { if (active) void load(active, ''); }, [active]);
   useEffect(() => {

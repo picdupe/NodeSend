@@ -337,6 +337,7 @@ async fn connect_quic(
 pub async fn hello(channel: &mut Channel, app: &AppService) -> AppResult<(String, u16, u16)> {
     match channel
         .request(&Request::Hello {
+            // Match the protocol version used by the committed GitHub build.
             version: protocol::VERSION,
             node_id: app.identity.node_id.clone(),
             display_name: display_name(app),
@@ -553,22 +554,19 @@ async fn register_identity(
 }
 
 async fn serve_tcp_session(state: SessionState, stream: TcpStream, remote: SocketAddr) {
-    let Ok(Ok(stream)) = tokio::time::timeout(
-        crate::tuning::ACCEPT_TIMEOUT,
-        state.acceptor.accept(stream),
-    )
-    .await
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(crate::tuning::ACCEPT_TIMEOUT, state.acceptor.accept(stream)).await
     else {
         return;
     };
-    let certificates = stream.get_ref().1.peer_certificates().unwrap_or(&[]).to_vec();
-    let Some(peer_id) = register_identity(
-        &state.transfers,
-        certificates,
-        remote,
-        SessionKind::Tcp,
-    )
-    .await
+    let certificates = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .unwrap_or(&[])
+        .to_vec();
+    let Some(peer_id) =
+        register_identity(&state.transfers, certificates, remote, SessionKind::Tcp).await
     else {
         return;
     };
@@ -597,17 +595,15 @@ async fn serve_quic_session(state: SessionState, incoming: quinn::Incoming, remo
     else {
         return;
     };
-    let Some(identity) = connection
-        .peer_identity()
-        .and_then(|value| {
-            value
-                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                .ok()
-        })
-    else {
+    let Some(identity) = connection.peer_identity().and_then(|value| {
+        value
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()
+    }) else {
         return;
     };
-    let Some(peer_id) = register_identity(&state.transfers, *identity, remote, SessionKind::Quic).await
+    let Some(peer_id) =
+        register_identity(&state.transfers, *identity, remote, SessionKind::Quic).await
     else {
         return;
     };
@@ -647,7 +643,11 @@ async fn finish_session(
     }
     // Send TLS close_notify (or finish the QUIC stream) on our own exit.
     // A closed stream still does not substitute for a durable commit ACK.
-    let _ = tokio::time::timeout(crate::tuning::SHUTDOWN_FLUSH_TIMEOUT, channel.writer.shutdown()).await;
+    let _ = tokio::time::timeout(
+        crate::tuning::SHUTDOWN_FLUSH_TIMEOUT,
+        channel.writer.shutdown(),
+    )
+    .await;
 }
 
 async fn session(
@@ -658,8 +658,16 @@ async fn session(
     tcp_port: u16,
     quic_port: u16,
 ) -> AppResult<()> {
-    let request: Request = protocol::read_frame(&mut *channel.reader).await?;
-    let name = match request {
+    let request: Request = protocol::read_frame(&mut *channel.reader).await.map_err(|error| {
+        tracing::warn!(
+            peer_id = %channel.peer_id,
+            transport = channel.kind,
+            %error,
+            "底层连接已建立，但读取首个 NodeSend HELLO 请求失败"
+        );
+        error
+    })?;
+    let peer_name = match request {
         Request::Hello {
             version,
             node_id,
@@ -697,7 +705,11 @@ async fn session(
                     "收到清单分片"
                 );
             }
-            Request::ManifestDone { file_count, total_size, .. } => {
+            Request::ManifestDone {
+                file_count,
+                total_size,
+                ..
+            } => {
                 tracing::info!(
                     peer = %channel.peer_id,
                     transport = channel.kind,
@@ -860,7 +872,7 @@ async fn session(
             }
             other => {
                 transfers
-                    .control(&channel.peer_id, &name, other, channel.kind)
+                    .control(&channel.peer_id, &peer_name, other, channel.kind)
                     .await
             }
         };

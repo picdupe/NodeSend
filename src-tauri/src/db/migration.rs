@@ -28,8 +28,9 @@ pub fn run_migrations(db: &Db) -> AppResult<()> {
             continue;
         }
         db.with_transaction(|tx| {
-            tx.execute_batch(sql)
-                .map_err(|err| AppError::Other(format!("迁移 {version:04} 执行失败，已回滚: {err}")))?;
+            tx.execute_batch(sql).map_err(|err| {
+                AppError::Other(format!("迁移 {version:04} 执行失败，已回滚: {err}"))
+            })?;
             // user_version 无法在事务内用参数绑定，版本号来自代码常量，安全。
             tx.execute_batch(&format!("PRAGMA user_version = {version}"))?;
             Ok(())

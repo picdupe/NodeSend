@@ -7,7 +7,10 @@ use tauri::{AppHandle, Manager};
 const DEFAULT_CONFIG: &str = include_str!("../../update-sources.json");
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let tauri_dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let tauri_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let data_dir = crate::config::app_data_dir(tauri_dir).map_err(|error| error.to_string())?;
     Ok(data_dir.join("update-sources.json"))
 }
@@ -36,31 +39,52 @@ fn merge_defaults(config: &mut Value, defaults: &Value) -> bool {
         changed = true;
     }
 
-    let config_channels = config.get_mut("channels").and_then(Value::as_object_mut).unwrap();
+    let config_channels = config
+        .get_mut("channels")
+        .and_then(Value::as_object_mut)
+        .unwrap();
     let default_channels = defaults.get("channels").and_then(Value::as_object).unwrap();
     for (channel, default_channel) in default_channels {
         if !config_channels.get(channel).is_some_and(Value::is_object) {
             config_channels.insert(channel.clone(), json!({"sources": []}));
             changed = true;
         }
-        let channel_config = config_channels.get_mut(channel).and_then(Value::as_object_mut).unwrap();
+        let channel_config = config_channels
+            .get_mut(channel)
+            .and_then(Value::as_object_mut)
+            .unwrap();
         // Migrate the earlier split-list format without reordering existing entries.
         if !channel_config.get("sources").is_some_and(Value::is_array) {
             let mut legacy_sources = Vec::new();
-            if let Some(intranet) = channel_config.get("intranet_sources").and_then(Value::as_array) {
+            if let Some(intranet) = channel_config
+                .get("intranet_sources")
+                .and_then(Value::as_array)
+            {
                 legacy_sources.extend(intranet.iter().cloned());
             }
-            if let Some(public) = channel_config.get("public_source").filter(|value| value.is_object()) {
+            if let Some(public) = channel_config
+                .get("public_source")
+                .filter(|value| value.is_object())
+            {
                 legacy_sources.push(public.clone());
             }
             channel_config.insert("sources".into(), Value::Array(legacy_sources));
             changed = true;
         }
-        let sources = channel_config.get_mut("sources").and_then(Value::as_array_mut).unwrap();
-        let mut ids: HashSet<String> = sources.iter().filter_map(source_id).map(str::to_owned).collect();
+        let sources = channel_config
+            .get_mut("sources")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        let mut ids: HashSet<String> = sources
+            .iter()
+            .filter_map(source_id)
+            .map(str::to_owned)
+            .collect();
         if let Some(default_sources) = default_channel.get("sources").and_then(Value::as_array) {
             for source in default_sources {
-                let Some(id) = source_id(source) else { continue };
+                let Some(id) = source_id(source) else {
+                    continue;
+                };
                 if ids.insert(id.to_owned()) {
                     sources.push(source.clone());
                     changed = true;
@@ -74,7 +98,8 @@ fn merge_defaults(config: &mut Value, defaults: &Value) -> bool {
 fn write_atomically(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
     let temporary = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
-    fs::write(&temporary, contents).map_err(|error| format!("无法写入更新源配置临时文件：{error}"))?;
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("无法写入更新源配置临时文件：{error}"))?;
     if path.exists() {
         if backup.exists() {
             fs::remove_file(&backup).map_err(|error| format!("无法清理更新源配置备份：{error}"))?;
@@ -94,21 +119,30 @@ fn write_atomically(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
 }
 
 fn load_and_merge(path: &PathBuf) -> Result<Value, String> {
-    let defaults: Value = serde_json::from_str(DEFAULT_CONFIG).map_err(|error| error.to_string())?;
+    let defaults: Value =
+        serde_json::from_str(DEFAULT_CONFIG).map_err(|error| error.to_string())?;
     if !path.exists() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("无法创建更新配置目录：{error}"))?;
         }
-        fs::write(path, serde_json::to_vec_pretty(&defaults).map_err(|error| error.to_string())?)
-            .map_err(|error| format!("无法初始化更新源配置：{error}"))?;
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&defaults).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("无法初始化更新源配置：{error}"))?;
         return Ok(defaults);
     }
 
-    let contents = fs::read_to_string(path).map_err(|error| format!("无法读取更新源配置：{error}"))?;
-    let mut config: Value = serde_json::from_str(&contents)
-        .map_err(|error| format!("update-sources.json 格式无效；为保护用户配置，未覆盖原文件：{error}"))?;
+    let contents =
+        fs::read_to_string(path).map_err(|error| format!("无法读取更新源配置：{error}"))?;
+    let mut config: Value = serde_json::from_str(&contents).map_err(|error| {
+        format!("update-sources.json 格式无效；为保护用户配置，未覆盖原文件：{error}")
+    })?;
     if merge_defaults(&mut config, &defaults) {
-        write_atomically(path, &serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?)?;
+        write_atomically(
+            path,
+            &serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?,
+        )?;
     }
     Ok(config)
 }
@@ -118,12 +152,15 @@ pub fn load_sources(app: &AppHandle, channel: &str) -> Result<Vec<String>, Strin
         return Err("更新通道无效。".into());
     }
     let config = load_and_merge(&config_path(app)?)?;
-    let sources = config.pointer(&format!("/channels/{channel}/sources"))
+    let sources = config
+        .pointer(&format!("/channels/{channel}/sources"))
         .and_then(Value::as_array)
         .ok_or_else(|| format!("更新源配置缺少 {channel}.sources 列表。"))?;
     let mut endpoints = Vec::new();
     for source in sources {
-        let Some(url) = source.get("manifest_url").and_then(Value::as_str) else { continue };
+        let Some(url) = source.get("manifest_url").and_then(Value::as_str) else {
+            continue;
+        };
         // URL validation and HTTPS enforcement also happen in updater.rs.
         if !url.trim().is_empty() {
             endpoints.push(url.to_owned());

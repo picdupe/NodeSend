@@ -88,9 +88,9 @@ impl SourceScanner {
             return Err(AppError::BadRequest("扫描游标缺少最后路径".into()));
         }
         for seq in 1..=last_seq {
-            let entry = self.next_entry()?.ok_or_else(|| {
-                AppError::Conflict("源目录已变化，无法恢复清单扫描位置".into())
-            })?;
+            let entry = self
+                .next_entry()?
+                .ok_or_else(|| AppError::Conflict("源目录已变化，无法恢复清单扫描位置".into()))?;
             if seq == last_seq && entry.path != last_path {
                 return Err(AppError::Conflict(
                     "源目录的确定性扫描顺序已变化，无法恢复清单扫描位置".into(),
@@ -259,7 +259,10 @@ pub fn collect(selected: Vec<String>, verify_hash: bool) -> AppResult<(Manifest,
 pub fn source_path(task: &TaskRecord, relative: &str) -> AppResult<PathBuf> {
     source_path_from_roots(&task.sources, relative)
 }
-pub fn source_path_from_roots(roots: &[super::model::SourceRoot], relative: &str) -> AppResult<PathBuf> {
+pub fn source_path_from_roots(
+    roots: &[super::model::SourceRoot],
+    relative: &str,
+) -> AppResult<PathBuf> {
     let root = roots
         .iter()
         .find(|r| relative == r.name || relative.starts_with(&format!("{}/", r.name)))
@@ -418,10 +421,23 @@ mod fingerprint_tests {
         let committed = scanner.next_batch(2).unwrap();
         assert_eq!(committed.last().unwrap().path, "first/a.txt");
 
+        let mut full_scan = SourceScanner::new(selected.clone()).unwrap();
+        let mut expected = Vec::new();
+        while let Some(entry) = full_scan.next_entry().unwrap() {
+            expected.push(entry.path);
+        }
         let mut resumed = SourceScanner::new(selected).unwrap();
         resumed.resume_after(2, "first/a.txt").unwrap();
-        let next = resumed.next_entry().unwrap().unwrap();
-        assert_eq!(next.path, "first/b.txt");
+        let mut suffix = Vec::new();
+        while let Some(entry) = resumed.next_entry().unwrap() {
+            suffix.push(entry.path);
+        }
+        assert_eq!(
+            suffix,
+            expected[2..],
+            "从已落库游标恢复后，剩余清单必须与完整扫描的后缀逐项一致"
+        );
+        assert_eq!(2 + suffix.len(), expected.len(), "恢复扫描不得漏项或多项");
 
         let mut invalid = SourceScanner::new(vec![first.to_string_lossy().into_owned()]).unwrap();
         assert!(invalid.resume_after(2, "first/not-a.txt").is_err());

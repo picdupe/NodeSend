@@ -15,6 +15,8 @@ export interface UpdateInfo {
   downloadUrl: string;
   releasePageUrl: string;
   channel: UpdateChannel;
+  sha256?: string;
+  versionCode?: number;
 }
 
 export interface UpdateDownloadProgress {
@@ -33,6 +35,41 @@ export function checkUpdate(channel: UpdateChannel, endpoints: UpdateEndpoints) 
     channel,
     sourceEndpoints: endpoints.sources,
   });
+}
+
+export async function checkAndroidUpdate(channel: UpdateChannel): Promise<(UpdateInfo & { versionCode: number; sha256: string }) | null> {
+  const result = await invoke<{
+    updateAvailable: boolean;
+    version?: string;
+    currentVersion?: string;
+    notes?: string;
+    downloadUrl?: string;
+    sha256?: string;
+    versionCode?: number;
+  }>('check_android_update', { channel });
+  if (!result.updateAvailable) return null;
+  if (!result.version || !result.downloadUrl || !result.sha256 || !result.versionCode) {
+    throw new Error('Android 更新清单内容不完整。');
+  }
+  return {
+    version: result.version,
+    currentVersion: result.currentVersion ?? '',
+    notes: result.notes ?? null,
+    publishedAt: null,
+    downloadUrl: result.downloadUrl,
+    releasePageUrl: result.downloadUrl,
+    channel,
+    sha256: result.sha256,
+    versionCode: result.versionCode,
+  };
+}
+
+export function downloadAndroidUpdate(url: string, sha256: string) {
+  return invoke<string>('download_android_update', { url, sha256 });
+}
+
+export function installAndroidUpdate(path: string) {
+  return invoke<void>('install_android_update', { path });
 }
 
 export function downloadUpdate(onProgress: (progress: UpdateDownloadProgress) => void) {

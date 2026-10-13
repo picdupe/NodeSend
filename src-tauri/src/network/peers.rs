@@ -81,8 +81,9 @@ impl PeerStore {
         if peers.len() >= 2048 && !peers.contains_key(&node_id) {
             return Err(AppError::Forbidden("发现设备数量超出限制".into()));
         }
+        let previous = peers.get(&node_id).cloned();
         let peer = peers.entry(node_id.clone()).or_insert(Peer {
-            node_id,
+            node_id: node_id.clone(),
             display_name: name.clone(),
             endpoints: vec![],
             online: true,
@@ -113,14 +114,29 @@ impl PeerStore {
             }
         }
         let json = serde_json::to_string(peer)?;
-        self.app.db.with_conn(|conn| {
+        if let Err(error) = self.app.db.with_conn(|conn| {
             conn.execute("INSERT INTO nodes(node_id,record) VALUES(?1,?2) ON CONFLICT(node_id) DO UPDATE SET record=excluded.record",rusqlite::params![peer.node_id, json])?;
             Ok(())
-        })?;
+        }) {
+            if let Some(previous) = previous {
+                peers.insert(node_id, previous);
+            } else {
+                peers.remove(&node_id);
+            }
+            return Err(error);
+        }
         Ok(())
     }
     pub fn list(&self) -> Vec<Peer> {
-        let trusted = crate::registry::list(&self.app.db).unwrap_or_default();
+        // A failed Trust query must not be interpreted as "nobody is trusted".
+        // Preserve the last known in-memory flag and log the database error.
+        let trusted = match crate::registry::list(&self.app.db) {
+            Ok(trusted) => Some(trusted),
+            Err(error) => {
+                tracing::error!(%error, "读取受信任设备列表失败；保留已知 Trust 状态");
+                None
+            }
+        };
         let mut peers = self
             .peers
             .lock_or_recover()
@@ -141,7 +157,9 @@ impl PeerStore {
             p.online = p.endpoints.iter().any(|e| {
                 e.error.is_none() && (e.source == "mdns" || now.saturating_sub(e.last_seen) < 300)
             });
-            p.trusted = trusted.iter().any(|t| t.node_id == p.node_id);
+            if let Some(trusted) = &trusted {
+                p.trusted = trusted.iter().any(|t| t.node_id == p.node_id);
+            }
             p.endpoints
                 .sort_by_key(|e| (e.error.is_some(), std::cmp::Reverse(e.last_seen)));
         }
@@ -159,6 +177,7 @@ impl PeerStore {
         let Some(peer) = peers.get_mut(id) else {
             return Ok(());
         };
+        let previous = peer.clone();
         let now = chrono::Utc::now().timestamp();
         peer.endpoints.retain(|e| retain_previous_address(e, now));
         for endpoint in endpoints {
@@ -173,13 +192,16 @@ impl PeerStore {
             }
         }
         let json = serde_json::to_string(peer)?;
-        self.app.db.with_conn(|conn| {
+        if let Err(error) = self.app.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE nodes SET record=?1 WHERE node_id=?2",
                 rusqlite::params![json, id],
             )?;
             Ok(())
-        })?;
+        }) {
+            peers.insert(id.to_string(), previous);
+            return Err(error);
+        }
         Ok(())
     }
     pub fn failure(&self, id: &str, ep: &Endpoint, error: String) {
@@ -206,13 +228,14 @@ impl PeerStore {
         }
     }
     pub fn remove(&self, id: &str) -> AppResult<()> {
-        crate::locks::lock(&self.peers).remove(id);
-        self.app.db.with_conn(|conn| {
-            conn.execute("DELETE FROM nodes WHERE node_id=?1", [id])?;
-            conn.execute("DELETE FROM trusted_nodes WHERE node_id=?1", [id])?;
-            conn.execute("DELETE FROM node_certificates WHERE node_id=?1", [id])?;
+        self.app.db.with_transaction(|tx| {
+            tx.execute("DELETE FROM nodes WHERE node_id=?1", [id])?;
+            tx.execute("DELETE FROM trusted_nodes WHERE node_id=?1", [id])?;
+            tx.execute("DELETE FROM node_certificates WHERE node_id=?1", [id])?;
             Ok(())
-        })
+        })?;
+        crate::locks::lock(&self.peers).remove(id);
+        Ok(())
     }
 }
 pub fn valid_id(id: &str) -> bool {

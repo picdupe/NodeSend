@@ -4,7 +4,7 @@ param(
     [switch]$Fast,
     [ValidateSet('all', 'nsis', 'msi')]
     [string]$Bundle = 'all',
-    [string]$WindowsSdk = '10.0.22621.0',
+    [string]$WindowsSdk = '',
     [string]$UpdateDownloadBaseUrl = ''
 )
 
@@ -18,11 +18,14 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not synchronize NodeSend version metadat
 Write-Output $versionAction
 $msvcScript = Join-Path $PSScriptRoot 'msvc.cmd'
 
-$vswhereCandidates = @(
-    (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'),
-    (Join-Path $env:ProgramFiles 'Microsoft Visual Studio/Installer/vswhere.exe'),
-    'D:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
-) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+$vswhereCandidates = @()
+if (${env:ProgramFiles(x86)}) {
+    $vswhereCandidates += Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+}
+if ($env:ProgramFiles) {
+    $vswhereCandidates += Join-Path $env:ProgramFiles 'Microsoft Visual Studio/Installer/vswhere.exe'
+}
+$vswhereCandidates = $vswhereCandidates | Where-Object { Test-Path -LiteralPath $_ }
 $vswhere = $vswhereCandidates | Select-Object -First 1
 if (-not $vswhere) { throw 'vswhere.exe was not found. Install Visual Studio Installer first.' }
 
@@ -30,14 +33,15 @@ $vsInstall = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Co
 if (-not $vsInstall) { throw 'Visual Studio C++ x64 build tools were not found.' }
 $vcvars = Join-Path $vsInstall 'VC/Auxiliary/Build/vcvarsall.bat'
 if (-not (Test-Path -LiteralPath $vcvars)) { throw "vcvarsall.bat was not found: $vcvars" }
-
-$sdkRoot = if ($env:WindowsSdkDir) { $env:WindowsSdkDir.TrimEnd('\') } else { 'D:\Windows Kits\10' }
-$rc = Join-Path $sdkRoot "bin/$WindowsSdk/x64/rc.exe"
-if (-not (Test-Path -LiteralPath $rc)) {
-    $rc = Get-ChildItem -LiteralPath (Join-Path $sdkRoot 'bin') -Filter rc.exe -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '\\x64\\rc\.exe$' } |
-        Sort-Object FullName -Descending |
-        Select-Object -First 1 -ExpandProperty FullName
+$rc = $null
+if ($env:WindowsSdkDir -and $env:WindowsSDKVersion) {
+    $sdkVersion = if ($WindowsSdk) { $WindowsSdk } else { $env:WindowsSDKVersion.TrimEnd('\') }
+    $candidate = Join-Path $env:WindowsSdkDir "bin/$sdkVersion/x64/rc.exe"
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { $rc = $candidate }
+}
+if (-not $rc) {
+    $rcCommand = Get-Command rc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($rcCommand -and (Test-Path -LiteralPath $rcCommand.Source -PathType Leaf)) { $rc = $rcCommand.Source }
 }
 $missing = @()
 if (-not (Test-Path -LiteralPath $rc)) { $missing += "Windows SDK rc.exe ($WindowsSdk)" }
@@ -59,7 +63,6 @@ if (-not $Dev -and -not $Fast) {
     if (-not $env:NODESEND_UPDATER_PUBLIC_KEY.Trim()) { throw 'The updater public key is missing from src-tauri/tauri.conf.json. Run scripts/signing.ps1 first.' }
 }
 
-# msvc.cmd imports vcvarsall's INCLUDE/LIB/PATH and explicitly sets RC for
 # tauri-winres. Run the complete build in that same cmd.exe environment.
 $env:NODESEND_VSWHERE = $vswhere
 $env:NODESEND_WINDOWS_SDK = $WindowsSdk
@@ -190,6 +193,8 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         # target the exact same release version/build. A different version
         # starts a clean manifest so stale platform artifacts are not retained.
         $platforms = [ordered]@{}
+        $androidUpdate = $null
+        $manifestNotes = "优化机械盘传输及大文件夹传输"
         if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
             try {
                 $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -197,6 +202,8 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
                     foreach ($property in $existingManifest.platforms.PSObject.Properties) {
                         $platforms[$property.Name] = $property.Value
                     }
+                    if ($null -ne $existingManifest.android) { $androidUpdate = $existingManifest.android }
+                    if ($null -ne $existingManifest.notes) { $manifestNotes = [string]$existingManifest.notes }
                     Write-Output "Merging updater manifest for existing version/build: $internalVersion"
                 }
             } catch {
@@ -209,10 +216,12 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         }
         $manifest = [ordered]@{
             version = $internalVersion
-            notes = "优化机械盘传输及大文件夹传输"
+            notes = $manifestNotes
             platforms = $platforms
         }
-        $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+        if ($null -ne $androidUpdate) { $manifest.android = $androidUpdate }
+        $manifestJson = $manifest | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
         Write-Output "Updater manifest generated: $manifestPath"
         Write-Output "Installer download URL: $($downloadUri.AbsoluteUri)"
     } else {

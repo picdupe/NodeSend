@@ -48,6 +48,7 @@ pub struct NetworkStatus {
     pub peers: Vec<Peer>,
     pub tasks: Vec<TaskSnapshot>,
     pub receive_directory: String,
+    pub cache_directory: String,
     pub receive_policy: String,
 }
 pub struct NetworkManager {
@@ -135,8 +136,8 @@ impl NetworkManager {
             peers: self.peers.list(),
             tasks: self.transfers.snapshots(),
             receive_directory: self.transfers.default_destination(),
-            receive_policy: self
-                .app
+            cache_directory: self.transfers.cache_directory(),
+            receive_policy: self.app
                 .get_setting("receive_policy")
                 .ok()
                 .flatten()
@@ -168,8 +169,68 @@ impl NetworkManager {
             .await
             {
                 Ok(mut channel) => {
-                    let (name, tcp_port, quic_port) =
-                        transport::hello(&mut channel, &self.app).await?;
+                    let handshake = transport::hello(&mut channel, &self.app).await;
+                    let (mut channel, (name, tcp_port, quic_port)) = match handshake {
+                        Ok(result) => (channel, result),
+                        Err(error) if channel.kind == "quic" => {
+                            tracing::warn!(
+                                address = %endpoint.address,
+                                tcp = endpoint.tcp_port,
+                                quic = endpoint.quic_port,
+                                peer_id = %channel.peer_id,
+                                error = %error,
+                                "QUIC 通道已建立，但 HELLO 失败；手动连接改用 TCP 重试"
+                            );
+                            let mut tcp_channel = transport::connect(
+                                &self.app,
+                                &endpoint,
+                                expected.as_deref(),
+                                true,
+                                allow_public,
+                            )
+                            .await
+                            .map_err(|tcp_error| {
+                                tracing::warn!(
+                                    address = %endpoint.address,
+                                    tcp = endpoint.tcp_port,
+                                    quic_error = %error,
+                                    tcp_error = %tcp_error,
+                                    "QUIC HELLO 失败，TCP 回退连接也失败"
+                                );
+                                AppError::Other(format!(
+                                    "QUIC 握手失败：{error}；TCP 回退也失败：{tcp_error}"
+                                ))
+                            })?;
+                            let result = transport::hello(&mut tcp_channel, &self.app)
+                                .await
+                                .map_err(|tcp_error| {
+                                    tracing::warn!(
+                                        address = %endpoint.address,
+                                        tcp = endpoint.tcp_port,
+                                        quic_error = %error,
+                                        tcp_error = %tcp_error,
+                                        "QUIC 与 TCP 的 NodeSend HELLO 握手均失败"
+                                    );
+                                    AppError::Other(format!(
+                                        "QUIC 握手失败：{error}；TCP 握手也失败：{tcp_error}"
+                                    ))
+                                })?;
+                            (tcp_channel, result)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                address = %endpoint.address,
+                                tcp = endpoint.tcp_port,
+                                transport = channel.kind,
+                                peer_id = %channel.peer_id,
+                                error = %error,
+                                "手动连接已建立底层通道，但 NodeSend HELLO 握手失败"
+                            );
+                            return Err(AppError::Other(format!(
+                                "已连接到对方端口，但 NodeSend 握手失败：{error}"
+                            )));
+                        }
+                    };
                     if channel.peer_id == self.app.identity.node_id {
                         return Err(AppError::BadRequest("不能添加本机作为远端设备".into()));
                     }
@@ -423,7 +484,7 @@ impl NetworkManager {
         }
         Ok(())
     }
-    pub fn settings(&self, name: String, directory: String, policy: String) -> AppResult<()> {
+    pub fn settings(&self, name: String, directory: String, cache_directory: String, policy: String) -> AppResult<()> {
         if name.trim().is_empty()
             || name.len() > 128
             || !["ask", "trusted", "reject"].contains(&policy.as_str())
@@ -436,9 +497,22 @@ impl NetworkManager {
             std::fs::create_dir_all(&directory)?;
         }
         crate::transfer::paths::destination(&directory)?;
+        if !cache_directory.trim().is_empty() {
+            let cache_path = std::path::Path::new(cache_directory.trim());
+            if !cache_path.is_absolute() {
+                return Err(AppError::BadRequest("缓存目录必须是绝对路径".into()));
+            }
+            std::fs::create_dir_all(cache_path)?;
+            if !cache_path.is_dir() {
+                return Err(AppError::BadRequest("请选择有效的缓存目录".into()));
+        }
+        }
         self.app.set_setting("display_name", name.trim())?;
         self.app.set_setting("receive_directory", &directory)?;
+        self.app.set_setting("cache_directory", cache_directory.trim())?;
         self.app.set_setting("receive_policy", &policy)?;
+        // 设置保存成功后立即切换新任务使用的缓存目录；已运行任务仍固定在旧目录。
+        self.transfers.refresh_cache_root_from_settings();
         Ok(())
     }
     pub async fn shutdown(&self) {
@@ -619,7 +693,11 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
     )
     .await
     .map_err(|_| AppError::Other("地址解析超时".into()))??;
-    tracing::info!(input, port = default_tcp, "UDP 发现无应答，回退默认 TCP 端口");
+    tracing::info!(
+        input,
+        port = default_tcp,
+        "UDP 发现无应答，回退默认 TCP 端口"
+    );
     let fallback = fallback_addresses
         .map(|addr| Endpoint {
             address: endpoint_address(addr),

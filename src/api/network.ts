@@ -17,7 +17,7 @@ export const addEndpoint = (address: string, expectedNodeId: string | null, allo
 export const removePeer = (nodeId: string) => invoke<void>('remove_peer', { nodeId });
 export const decideIncoming = (id: string, accepted: boolean, destination: string | null, conflict: ConflictPolicy, selected: string[] | null = null, trustDevice = false) => invoke<void>('decide_incoming_transfer', { id, accepted, destination, conflict, selected, trustDevice });
 export const transferAction = (id: string, action: string) => invoke<void>('transfer_action', { id, action });
-export const setNetworkSettings = (name: string, directory: string, policy: string) => invoke<void>('set_network_settings', { name, directory, policy });
+export const setNetworkSettings = (name: string, directory: string, cacheDirectory: string, policy: string) => invoke<void>('set_network_settings', { name, directory, cacheDirectory, policy });
 export function errorText(error: unknown): string {
   const raw = typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error);
   if (/10051|无法连接的网络|network is unreachable/i.test(raw)) {

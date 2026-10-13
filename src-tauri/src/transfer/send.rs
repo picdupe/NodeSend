@@ -73,7 +73,10 @@ impl TransferService {
             if page.is_empty() {
                 break;
             }
-            let send_offset = state.resume_manifest_at.saturating_sub(first).min(page.len());
+            let send_offset = state
+                .resume_manifest_at
+                .saturating_sub(first)
+                .min(page.len());
             if send_offset < page.len() {
                 let requested = std::time::Instant::now();
                 let response = control
@@ -130,11 +133,7 @@ impl TransferService {
             first += page.len();
             // Keep the sender UI responsive between durable 5000-entry batches.
             // These counters are in-memory only; recovery still uses the durable cursor.
-            self.update_live_scan_progress(
-                &task.id,
-                first,
-                state.directories,
-            )?;
+            self.update_live_scan_progress(&task.id, first, state.directories)?;
             // 扫满一个落库批次才写数据库：扫描/发送按 256 条小步推进，
             // 数据库按 5000 条摊销事务；两者互不阻塞。
             if state.db_buffer.len() >= MANIFEST_PAGE {
@@ -217,7 +216,11 @@ impl TransferService {
                             if !retry || attempt == 2 {
                                 return Err(err);
                             }
-                            cooldown.store(chrono::Utc::now().timestamp() + crate::tuning::SEND_RETRY_COOLDOWN_SECS, Ordering::Relaxed);
+                            cooldown.store(
+                                chrono::Utc::now().timestamp()
+                                    + crate::tuning::SEND_RETRY_COOLDOWN_SECS,
+                                Ordering::Relaxed,
+                            );
                             service.edit(&id, |t| {
                                 t.status = "paused".into();
                                 t.error = Some(err.to_string());
@@ -329,7 +332,9 @@ impl TransferService {
         let chunk_count = task.chunk_count;
         tracing::info!(task = %id, cursor, "清单扫描未完成，继续扫描剩余条目");
         self.edit(id, |t| {
-            t.event(format!("接收方已有该任务：从第 {cursor} 条继续扫描剩余清单"))
+            t.event(format!(
+                "接收方已有该任务：从第 {cursor} 条继续扫描剩余清单"
+            ))
         })?;
         let scanner = tokio::task::spawn_blocking(move || {
             let mut scanner = source::SourceScanner::new(selected)?;
@@ -389,7 +394,11 @@ impl TransferService {
         pending: &mut VecDeque<(usize, usize)>,
         sent: &mut BTreeSet<usize>,
     ) -> AppResult<()> {
-        let state = control.request(&Request::Poll { id: task.wire_id.clone() }).await?;
+        let state = control
+            .request(&Request::Poll {
+                id: task.wire_id.clone(),
+            })
+            .await?;
         let (status, completed) = match state {
             Response::State { status, completed } => (status, completed),
             _ => return Err(AppError::Other("接收方未返回清单扫描状态".into())),
@@ -422,7 +431,9 @@ impl TransferService {
             let Some(entry) = entries.get(file_index) else {
                 return Err(AppError::Conflict("扫描中的文件索引不连续".into()));
             };
-            if entry.directory || entry.size == 0 { continue; }
+            if entry.directory || entry.size == 0 {
+                continue;
+            }
             handled += 1;
             let chunk_count = entry.size.div_ceil(task.chunk_size) as usize;
             let mut truncated = false;
@@ -440,7 +451,9 @@ impl TransferService {
                     return Ok(());
                 }
                 let index = first_chunk + local_index;
-                if sent.contains(&index) || remote_completed.contains(&index) { continue; }
+                if sent.contains(&index) || remote_completed.contains(&index) {
+                    continue;
+                }
                 let offset = local_index as u64 * task.chunk_size;
                 let length = task.chunk_size.min(entry.size - offset) as usize;
                 let bytes = match self
@@ -449,18 +462,39 @@ impl TransferService {
                 {
                     Ok(bytes) => bytes,
                     Err(AppError::Conflict(_)) => {
-                        match control.request(&Request::SkipFile { id: task.wire_id.clone(), file: file_index }).await? {
-                            Response::Ack => {},
+                        match control
+                            .request(&Request::SkipFile {
+                                id: task.wire_id.clone(),
+                                file: file_index,
+                            })
+                            .await?
+                        {
+                            Response::Ack => {}
                             _ => return Err(AppError::Other("接收方未确认跳过变化文件".into())),
                         }
                         self.mark_skipped(&task.id, file_index)?;
-                        for skipped in first_chunk..first_chunk + chunk_count { sent.insert(skipped); }
+                        for skipped in first_chunk..first_chunk + chunk_count {
+                            sent.insert(skipped);
+                        }
                         break;
                     }
                     Err(error) => return Err(error),
                 };
-                let sha256 = task.verify_hash.then(|| format!("{:x}", Sha256::digest(&bytes)));
-                match control.chunk(&Request::Chunk { id: task.wire_id.clone(), index, length: bytes.len(), sha256 }, &bytes).await? {
+                let sha256 = task
+                    .verify_hash
+                    .then(|| format!("{:x}", Sha256::digest(&bytes)));
+                match control
+                    .chunk(
+                        &Request::Chunk {
+                            id: task.wire_id.clone(),
+                            index,
+                            length: bytes.len(),
+                            sha256,
+                        },
+                        &bytes,
+                    )
+                    .await?
+                {
                     Response::Ack => {
                         self.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
                         sent.insert(index);
@@ -469,15 +503,25 @@ impl TransferService {
                         // 否则界面会在整个清单/数据阶段一直显示正在连接。
                         if sent_chunks_now == 1 {
                             self.edit(&task.id, |record| {
-                                if ["queued", "connecting", "waiting"].contains(&record.status.as_str()) {
+                                if ["queued", "connecting", "waiting"]
+                                    .contains(&record.status.as_str())
+                                {
                                     record.status = "transferring".into();
                                     record.event("已开始发送文件数据");
                                 }
                             })?;
                         }
                     }
-                    Response::State { status, .. } if status == "paused" => { pending.push_front((file_index, first_chunk)); return Ok(()); }
-                    Response::State { status, .. } if ["cancelled", "rejected"].contains(&status.as_str()) => { self.edit(&task.id, |record| record.status = status)?; return Ok(()); }
+                    Response::State { status, .. } if status == "paused" => {
+                        pending.push_front((file_index, first_chunk));
+                        return Ok(());
+                    }
+                    Response::State { status, .. }
+                        if ["cancelled", "rejected"].contains(&status.as_str()) =>
+                    {
+                        self.edit(&task.id, |record| record.status = status)?;
+                        return Ok(());
+                    }
                     _ => return Err(AppError::Other("接收方未确认流式数据块".into())),
                 }
             }
@@ -532,7 +576,12 @@ impl TransferService {
                 record.attach_manifest(Manifest::new(roots, super::CHUNK_SIZE, verify_hash));
                 record.digest.clear();
                 record.scan_last_seq = record.file_count;
-                record.scan_last_path = record.manifest.entries.last().map(|entry| entry.path.clone()).unwrap_or_default();
+                record.scan_last_path = record
+                    .manifest
+                    .entries
+                    .last()
+                    .map(|entry| entry.path.clone())
+                    .unwrap_or_default();
                 record.scan_complete = false;
                 record.completed.clear();
                 record.completed_count = 0;
@@ -548,7 +597,9 @@ impl TransferService {
                 record.error = None;
                 record.event("顶层项目元数据变化，已清除旧恢复状态并重新扫描");
             })?;
-            self.save_entries(&task)?;
+            // The old manifest was cleared above; persist the replacement
+            // roots through the incremental manifest writer.
+            self.append_entries(&task.id, 0, &task.manifest.entries)?;
             stale_wire = Some(old_wire);
         }
         let mut control = self.channel(&peers, &task, &cooldown).await?;
@@ -663,7 +714,10 @@ impl TransferService {
             }
             let selected = task.sources.iter().map(|root| root.path.clone()).collect();
             let roots_count = entries.len();
-            let last_root = entries.last().map(|entry| entry.path.clone()).unwrap_or_default();
+            let last_root = entries
+                .last()
+                .map(|entry| entry.path.clone())
+                .unwrap_or_default();
             tracing::info!(task = %task.wire_id, roots = roots_count, "清单阶段：顶层已发送，准备继续扫描目录");
             let scanner = tokio::task::spawn_blocking(move || {
                 let mut scanner = source::SourceScanner::new(selected)?;
@@ -690,7 +744,9 @@ impl TransferService {
             let first = self
                 .stream_scan(&mut control, &task, &mut stream, scanner, roots_count)
                 .await?;
-            let ScanStream { entries, digest, .. } = stream;
+            let ScanStream {
+                entries, digest, ..
+            } = stream;
             let final_digest = digest.finish();
             let manifest = Manifest::new(entries, task.chunk_size, task.verify_hash);
             manifest.validate()?;
@@ -742,8 +798,12 @@ impl TransferService {
                                     .chunk(index)
                                     .is_some_and(|c| !t.skipped_files.contains(&c.file))
                             {
-                                added = added
-                                    .saturating_add(t.manifest.chunk(index).map(|c| c.length as u64).unwrap_or(0));
+                                added = added.saturating_add(
+                                    t.manifest
+                                        .chunk(index)
+                                        .map(|c| c.length as u64)
+                                        .unwrap_or(0),
+                                );
                             }
                         }
                         t.completed_count = t.completed.len();
@@ -817,7 +877,17 @@ impl TransferService {
             .filter(|(i, _)| !self.is_completed(id, *i))
             .map(|(i, c)| (i, *c))
             .collect::<VecDeque<_>>();
-        let concurrency = pending.len().clamp(1, 4);
+        // 根据当前活跃发送任务数动态分配每个任务的 Chunk 工作协程数：
+        // 任务少时允许单任务使用多路连接；任务增多时减少单任务连接数，
+        // 避免每个任务都固定开 4 路而让总连接数膨胀。实际带宽仍由 QUIC/TCP
+        // 拥塞控制和两端 IO 能力共同决定，不设置僵硬的每任务带宽上限。
+        let active_sends = crate::tuning::MAX_ACTIVE_SENDS
+            .saturating_sub(self.scheduler.available_permits())
+            .max(1);
+        let per_task_workers = crate::tuning::MAX_ACTIVE_SENDS
+            .div_ceil(active_sends)
+            .clamp(1, 4);
+        let concurrency = pending.len().clamp(1, per_task_workers);
         let queue = Arc::new(Mutex::new(pending));
         let mut workers = tokio::task::JoinSet::new();
         // Close the idle control connection while file workers own active streams.

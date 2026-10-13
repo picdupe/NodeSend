@@ -166,14 +166,7 @@ pub async fn update_share(
         ));
     }
     let share = share_repo::update(&state.db, &id, input.name, input.path, input.access_mode)?;
-    manager.stop(&id).await;
-    match manager.start(state.inner().clone(), &share).await {
-        Ok(_) => Ok(share),
-        Err(err) => {
-            share_repo::set_enabled(&state.db, &id, false)?;
-            Err(err)
-        }
-    }
+    restart_share(state.inner(), manager.inner(), share).await
 }
 
 #[tauri::command]
@@ -184,14 +177,7 @@ pub async fn toggle_share(
     enabled: bool,
 ) -> AppResult<ShareConfig> {
     let share = share_repo::set_enabled(&state.db, &id, enabled)?;
-    manager.stop(&id).await;
-    match manager.start(state.inner().clone(), &share).await {
-        Ok(port) => share_repo::set_protocol(&state.db, &id, share.protocol, port),
-        Err(err) => {
-            share_repo::set_enabled(&state.db, &id, false)?;
-            Err(err)
-        }
-    }
+    restart_share(state.inner(), manager.inner(), share).await
 }
 
 #[tauri::command]
@@ -201,14 +187,7 @@ pub async fn rotate_share_token(
     id: String,
 ) -> AppResult<ShareConfig> {
     let share = share_repo::rotate_token(&state.db, &id)?;
-    manager.stop(&id).await;
-    match manager.start(state.inner().clone(), &share).await {
-        Ok(_) => Ok(share),
-        Err(err) => {
-            share_repo::set_enabled(&state.db, &id, false)?;
-            Err(err)
-        }
-    }
+    restart_share(state.inner(), manager.inner(), share).await
 }
 
 #[tauri::command]
@@ -243,6 +222,58 @@ pub async fn remove_trusted_node(
     node_id: String,
 ) -> AppResult<()> {
     registry::remove(&state.db, &node_id)
+}
+
+/// Restart a share listener after its persisted configuration changes.
+/// A failed restart disables the share in the database so UI state cannot
+/// claim that a listener is running when the bind/start operation failed.
+async fn restart_share(
+    state: &Arc<AppService>,
+    manager: &ProtocolManager,
+    share: ShareConfig,
+) -> AppResult<ShareConfig> {
+    manager.stop(&share.id).await;
+    match manager.start(Arc::clone(state), &share).await {
+        Ok(port) => match share_repo::set_protocol(&state.db, &share.id, share.protocol, port) {
+            Ok(updated) => Ok(updated),
+            Err(error) => {
+                // The listener must not outlive a failed persistence step: the
+                // database is the source of truth for the advertised port and
+                // enabled state. Stop it and make a best-effort disable.
+                manager.stop(&share.id).await;
+                if let Err(disable_error) = share_repo::set_enabled(&state.db, &share.id, false) {
+                    tracing::error!(
+                        share_id = %share.id,
+                        %error,
+                        %disable_error,
+                        "共享监听已停止，但持久化端口失败且禁用状态写入也失败"
+                    );
+                    return Err(crate::error::AppError::Other(format!(
+                        "共享端口保存失败：{error}；禁用共享也失败：{disable_error}"
+                    )));
+                }
+                tracing::error!(share_id = %share.id, %error, "共享端口保存失败，已停止监听并禁用共享");
+                Err(error)
+            }
+        },
+        Err(error) => match share_repo::set_enabled(&state.db, &share.id, false) {
+            Ok(_) => {
+                tracing::error!(share_id = %share.id, %error, "共享配置已保存，但监听重启失败；共享已禁用");
+                Err(error)
+            }
+            Err(disable_error) => {
+                tracing::error!(
+                    share_id = %share.id,
+                    %error,
+                    %disable_error,
+                    "共享监听重启失败，且无法持久化禁用状态"
+                );
+                Err(crate::error::AppError::Other(format!(
+                    "共享监听重启失败：{error}；禁用共享也失败：{disable_error}"
+                )))
+            }
+        },
+    }
 }
 
 /// 生成共享 ID（uuid v4 风格，不引入 uuid 依赖）。

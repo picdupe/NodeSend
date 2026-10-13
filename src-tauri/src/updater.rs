@@ -1,7 +1,13 @@
 //! Desktop update mechanism. Update sources are tried in the configured order.
 use serde::Serialize;
 use serde_json::Value;
-use std::{sync::{atomic::{AtomicU64, Ordering}, Mutex}, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
 use tauri::{ipc::Channel, AppHandle, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use url::Url;
@@ -53,7 +59,11 @@ fn trusted_public_key() -> Result<&'static str, String> {
 
 fn validate_endpoint(value: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|_| "更新地址格式无效。".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err("更新地址必须使用有效的 HTTP 或 HTTPS 地址。".into());
     }
     Ok(url)
@@ -68,16 +78,35 @@ async fn probe_endpoint(endpoint: &Url) -> Result<ProbeResult, String> {
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()
         .map_err(|error| error.to_string())?;
-    let response = client.get(endpoint.clone()).send().await.map_err(|error| error.to_string())?;
+    let response = client
+        .get(endpoint.clone())
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
     if response.status() == reqwest::StatusCode::NO_CONTENT {
         return Ok(ProbeResult::HealthyNoUpdate);
     }
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let payload: Value = response.json().await.map_err(|error| format!("更新清单不是有效 JSON：{error}"))?;
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取更新清单响应失败：{error}"))?;
+    // Some Windows-side JSON writers emit a UTF-8 BOM. JSON text exchanged
+    // over HTTP should be BOM-free, but accepting it here avoids treating an
+    // otherwise valid manifest as an unavailable source.
+    let json_body = body.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&body);
+    let payload: Value = serde_json::from_slice(json_body).map_err(|error| {
+        let preview = String::from_utf8_lossy(&body);
+        let preview = preview.chars().take(160).collect::<String>();
+        let preview = preview.replace('\n', " ").replace('\r', " ");
+        format!("更新清单不是有效 JSON：{error}；响应内容：{preview}")
+    })?;
     let valid_manifest = payload.get("version").is_some() && payload.get("platforms").is_some()
-        || payload.get("version").is_some() && payload.get("url").is_some() && payload.get("signature").is_some();
+        || payload.get("version").is_some()
+            && payload.get("url").is_some()
+            && payload.get("signature").is_some();
     if !valid_manifest {
         return Err("响应内容不符合 Tauri 更新清单格式。".into());
     }
@@ -105,24 +134,25 @@ async fn download_verified(
     on_progress: &Channel<DownloadProgress>,
 ) -> Result<Vec<u8>, tauri_plugin_updater::Error> {
     let downloaded = AtomicU64::new(0);
-    update.download(
-        |chunk_length, content_length| {
-            downloaded.fetch_add(chunk_length as u64, Ordering::Relaxed);
-            let _ = on_progress.send(DownloadProgress {
-                downloaded_bytes: downloaded.load(Ordering::Relaxed),
-                total_bytes: content_length,
-                finished: false,
-            });
-        },
-        || {
-            let _ = on_progress.send(DownloadProgress {
-                downloaded_bytes: downloaded.load(Ordering::Relaxed),
-                total_bytes: Some(downloaded.load(Ordering::Relaxed)),
-                finished: true,
-            });
-        },
-    )
-    .await
+    update
+        .download(
+            |chunk_length, content_length| {
+                downloaded.fetch_add(chunk_length as u64, Ordering::Relaxed);
+                let _ = on_progress.send(DownloadProgress {
+                    downloaded_bytes: downloaded.load(Ordering::Relaxed),
+                    total_bytes: content_length,
+                    finished: false,
+                });
+            },
+            || {
+                let _ = on_progress.send(DownloadProgress {
+                    downloaded_bytes: downloaded.load(Ordering::Relaxed),
+                    total_bytes: Some(downloaded.load(Ordering::Relaxed)),
+                    finished: true,
+                });
+            },
+        )
+        .await
 }
 
 /// Checks sources in the exact order configured by the user. An available
@@ -141,7 +171,10 @@ pub async fn check_update(
     if public_key.trim().is_empty() {
         return Err("更新签名公钥尚未配置。".into());
     }
-    *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = None;
+    *pending
+        .0
+        .lock()
+        .map_err(|_| "更新状态暂时不可用。".to_string())? = None;
 
     let mut failures = Vec::new();
     let ordered = source_endpoints.clone();
@@ -157,7 +190,10 @@ pub async fn check_update(
         let probe = match probe_endpoint(&endpoint).await {
             Ok(result) => result,
             Err(error) => {
-                failures.push(format!("{}：{error}", endpoint.host_str().unwrap_or("更新源")));
+                failures.push(format!(
+                    "{}：{error}",
+                    endpoint.host_str().unwrap_or("更新源")
+                ));
                 continue;
             }
         };
@@ -179,7 +215,10 @@ pub async fn check_update(
                 | tauri_plugin_updater::Error::Http(_)
                 | tauri_plugin_updater::Error::InvalidUpdaterFormat
                 | tauri_plugin_updater::Error::Serialization(_) => {
-                    failures.push(format!("{}：{error}", endpoint.host_str().unwrap_or("更新源")));
+                    failures.push(format!(
+                        "{}：{error}",
+                        endpoint.host_str().unwrap_or("更新源")
+                    ));
                     continue;
                 }
                 _ => return Err(format!("更新清单验证失败：{error}")),
@@ -188,7 +227,9 @@ pub async fn check_update(
         let Some(update) = update else {
             return Ok(None);
         };
-        let release_page_url = update.raw_json.get("release_page_url")
+        let release_page_url = update
+            .raw_json
+            .get("release_page_url")
             .or_else(|| update.raw_json.get("releasePageUrl"))
             .and_then(Value::as_str)
             .filter(|url| validate_endpoint(url).is_ok())
@@ -203,7 +244,10 @@ pub async fn check_update(
             release_page_url,
             channel,
         };
-        *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(PendingUpdate {
+        *pending
+            .0
+            .lock()
+            .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(PendingUpdate {
             update,
             downloaded: None,
             fallback_endpoints: ordered.iter().skip(index + 1).cloned().collect(),
@@ -225,12 +269,19 @@ pub async fn download_update(
     on_progress: Channel<DownloadProgress>,
 ) -> Result<(), String> {
     let public_key = trusted_public_key()?;
-    let mut current = pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())?
-        .take().ok_or_else(|| "请先检查更新。".to_string())?;
+    let mut current = pending
+        .0
+        .lock()
+        .map_err(|_| "更新状态暂时不可用。".to_string())?
+        .take()
+        .ok_or_else(|| "请先检查更新。".to_string())?;
     match download_verified(&current.update, &on_progress).await {
         Ok(bytes) => {
             current.downloaded = Some(bytes);
-            *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+            *pending
+                .0
+                .lock()
+                .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
             Ok(())
         }
         Err(original_error) => {
@@ -242,25 +293,48 @@ pub async fn download_update(
                     | tauri_plugin_updater::Error::Http(_)
             );
             if !can_fallback {
-                *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                *pending
+                    .0
+                    .lock()
+                    .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
                 return Err(format!("更新包签名或版本验证失败：{original_error}"));
             }
             let expected_version = current.update.version.clone();
             for raw_endpoint in current.fallback_endpoints.clone() {
-                let Ok(endpoint) = validate_endpoint(&raw_endpoint) else { continue };
-                let Ok(ProbeResult::HealthyManifest) = probe_endpoint(&endpoint).await else { continue };
-                let Ok(Some(candidate)) = check_source(&app, &endpoint, public_key).await else { continue };
-                if candidate.version != expected_version { continue; }
-                let _ = on_progress.send(DownloadProgress { downloaded_bytes: 0, total_bytes: None, finished: false });
+                let Ok(endpoint) = validate_endpoint(&raw_endpoint) else {
+                    continue;
+                };
+                let Ok(ProbeResult::HealthyManifest) = probe_endpoint(&endpoint).await else {
+                    continue;
+                };
+                let Ok(Some(candidate)) = check_source(&app, &endpoint, public_key).await else {
+                    continue;
+                };
+                if candidate.version != expected_version {
+                    continue;
+                }
+                let _ = on_progress.send(DownloadProgress {
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    finished: false,
+                });
                 if let Ok(bytes) = download_verified(&candidate, &on_progress).await {
                     current.update = candidate;
                     current.downloaded = Some(bytes);
-                    *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                    *pending
+                        .0
+                        .lock()
+                        .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
                     return Ok(());
                 }
             }
-            *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
-            Err(format!("更新源下载失败，且未能从备用源取得相同版本：{original_error}"))
+            *pending
+                .0
+                .lock()
+                .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+            Err(format!(
+                "更新源下载失败，且未能从备用源取得相同版本：{original_error}"
+            ))
         }
     }
 }
@@ -276,23 +350,36 @@ pub fn install_update(
     if !confirmed {
         return Err("需要用户确认后才能安装更新。".into());
     }
-    let active = network.status().tasks.iter().any(|task| matches!(
-        task.status.as_str(), "queued" | "connecting" | "waiting" | "accepted" | "transferring" | "interrupted"
-    ));
+    let active = network.status().tasks.iter().any(|task| {
+        matches!(
+            task.status.as_str(),
+            "queued" | "connecting" | "waiting" | "accepted" | "transferring" | "interrupted"
+        )
+    });
     if active {
         return Err("当前仍有传输任务，请完成或暂停传输后再安装更新。".into());
     }
-    let mut current = pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())?
-        .take().ok_or_else(|| "请先检查更新并完成下载。".to_string())?;
+    let mut current = pending
+        .0
+        .lock()
+        .map_err(|_| "更新状态暂时不可用。".to_string())?
+        .take()
+        .ok_or_else(|| "请先检查更新并完成下载。".to_string())?;
     let Some(bytes) = current.downloaded.take() else {
-        *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+        *pending
+            .0
+            .lock()
+            .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
         return Err("更新尚未下载完成。".into());
     };
     match current.update.install(&bytes) {
         Ok(()) => Ok(()),
         Err(error) => {
             current.downloaded = Some(bytes);
-            *pending.0.lock().map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+            *pending
+                .0
+                .lock()
+                .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
             Err(format!("启动更新安装程序失败：{error}"))
         }
     }
@@ -303,10 +390,15 @@ pub fn open_update_url(url: String) -> Result<(), String> {
     let url = validate_endpoint(&url)?;
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("rundll32.exe")
-        .args(["url.dll,FileProtocolHandler", url.as_str()]).spawn();
+        .args(["url.dll,FileProtocolHandler", url.as_str()])
+        .spawn();
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(url.as_str()).spawn();
     #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(url.as_str()).spawn();
-    result.map(|_| ()).map_err(|error| format!("无法打开更新链接：{error}"))
+    let result = std::process::Command::new("xdg-open")
+        .arg(url.as_str())
+        .spawn();
+    result
+        .map(|_| ())
+        .map_err(|error| format!("无法打开更新链接：{error}"))
 }

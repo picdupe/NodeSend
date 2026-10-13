@@ -12,9 +12,7 @@ use crate::{
     locks,
     service::AppService,
 };
-use model::{
-    random_id, Chunk, ConflictPolicy, FileEntry, Manifest, TaskRecord, TaskSnapshot,
-};
+use model::{random_id, Chunk, ConflictPolicy, FileEntry, Manifest, TaskRecord, TaskSnapshot};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
@@ -42,6 +40,8 @@ pub(crate) const SEND_HANDLES_LIMIT: usize = crate::tuning::SEND_HANDLES_LIMIT;
 pub(crate) struct RelayState {
     pub status: String,
     pub use_cache: bool,
+    /// 当前已收到的清单条目数；接收清单时会持续增长。
+    pub file_count: usize,
     /// 转写错误（`None` 表示正常）；转写失败后调度器不再重试。
     pub error: Option<String>,
     pub completed_count: usize,
@@ -97,8 +97,10 @@ pub struct TransferService {
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
     /// 接收写入队列（有界，满时背压接收路径）。见 `write_queue` 模块。
     pub(crate) write_tx: mpsc::Sender<write_queue::PendingChunk>,
-    /// 缓存盘中转目录（`None` 表示缓存不可用，全部任务自动回退直写）。见 `relay` 模块。
-    pub(crate) cache_root: Option<PathBuf>,
+    /// 当前缓存目录；设置变更后立即更新。
+    pub(crate) cache_root: Mutex<Option<PathBuf>>,
+    /// 已选择缓存模式的任务固定使用原目录，避免运行中切换目录导致分块散落。
+    task_cache_roots: Mutex<HashMap<String, PathBuf>>,
 }
 impl TransferService {
     pub fn new(app: Arc<AppService>) -> AppResult<Arc<Self>> {
@@ -127,13 +129,30 @@ impl TransferService {
             ]
             .contains(&task.status.as_str())
             {
-                task.status = "paused".into();
-                task.event("上次意外中断，已暂停；点击继续恢复传输");
+                // Preserve an intentional user pause. Tasks that were active
+                // at shutdown are marked interrupted and can resume through
+                // the normal peer/checkpoint handshake. Outgoing tasks are
+                // re-queued so the scheduler reconnects without a manual click.
+                task.status = if task.direction == "send" {
+                    "queued".into()
+                } else if task.destination.is_some() {
+                    // A confirmed receive task can finish local cache relay and
+                    // commit without requiring the sender to reconnect first.
+                    "accepted".into()
+                } else {
+                    "interrupted".into()
+                };
+                task.event("检测到上次运行中断，将在连接对端并校验续传状态后自动恢复");
             }
             tasks.insert(task.id.clone(), task);
         }
         let (write_tx, write_rx) = mpsc::channel(write_queue::QUEUE_CHUNKS);
         let cache_root = relay::resolve_cache_root(&app);
+        let task_cache_roots = tasks
+            .values()
+            .filter(|task| task.direction == "receive" && task.use_cache && !["completed", "cancelled", "rejected"].contains(&task.status.as_str()))
+            .filter_map(|task| cache_root.clone().map(|root| (task.id.clone(), root)))
+            .collect();
         let service = Arc::new(Self {
             app,
             tasks: Mutex::new(tasks),
@@ -141,7 +160,8 @@ impl TransferService {
             scheduler: Arc::new(Semaphore::new(crate::tuning::MAX_ACTIVE_SENDS)),
             shutdown: tokio_util::sync::CancellationToken::new(),
             write_tx,
-            cache_root,
+            cache_root: Mutex::new(cache_root.clone()),
+            task_cache_roots: Mutex::new(task_cache_roots),
         });
         write_queue::spawn(Arc::clone(&service), write_rx);
         relay::spawn(Arc::clone(&service));
@@ -186,9 +206,29 @@ impl TransferService {
                 return Err(AppError::Conflict("任务已经存在".into()));
             }
         }
-        // 清单明细可能达百万条：落库在锁外进行，避免长时间阻塞状态查询（UI 轮询）。
-        self.persist(&task)?;
-        self.save_entries(&task)?;
+        // The scalar task record and manifest rows form one durable unit. A
+        // failed manifest insert must not leave an orphan task after restart.
+        let json = serde_json::to_string(&task)?;
+        self.app.db.with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO transfer_tasks(id,record) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+                rusqlite::params![task.id, json],
+            )?;
+            if !task.manifest.entries.is_empty() {
+                let mut stmt = tx.prepare("INSERT OR REPLACE INTO task_entries(task_id,index_no,path,size,modified_ms,directory) VALUES(?1,?2,?3,?4,?5,?6)")?;
+                for (i, entry) in task.manifest.entries.iter().enumerate() {
+                    stmt.execute(rusqlite::params![
+                        task.id,
+                        i as i64,
+                        entry.path,
+                        entry.size as i64,
+                        entry.modified_ms as i64,
+                        entry.directory as i64
+                    ])?;
+                }
+            }
+            Ok(())
+        })?;
         locks::lock(&self.tasks).insert(task.id.clone(), task);
         Ok(())
     }
@@ -200,26 +240,6 @@ impl TransferService {
                 "INSERT INTO transfer_tasks(id,record) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record",
                 rusqlite::params![task.id, json],
             )?;
-            Ok(())
-        })
-    }
-    /// 写入某任务的清单明细（创建任务时一次）。
-    fn save_entries(&self, task: &TaskRecord) -> AppResult<()> {
-        if task.manifest.entries.is_empty() {
-            return Ok(());
-        }
-        self.app.db.with_transaction(|tx| {
-            let mut stmt = tx.prepare("INSERT OR REPLACE INTO task_entries(task_id,index_no,path,size,modified_ms,directory) VALUES(?1,?2,?3,?4,?5,?6)")?;
-            for (i, e) in task.manifest.entries.iter().enumerate() {
-                stmt.execute(rusqlite::params![
-                    task.id,
-                    i as i64,
-                    e.path,
-                    e.size as i64,
-                    e.modified_ms as i64,
-                    e.directory as i64
-                ])?;
-            }
             Ok(())
         })
     }
@@ -261,14 +281,38 @@ impl TransferService {
         let task = map
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound("传输任务不存在".into()))?;
+        let previous = (
+            task.file_count,
+            task.directory_count,
+            task.scan_progress_count,
+            task.scan_progress_directories,
+            task.total_size,
+            task.chunk_count,
+            task.scan_last_seq,
+            task.scan_last_path.clone(),
+            task.updated_at.clone(),
+        );
         task.file_count = count;
         task.directory_count = directories;
+        task.scan_progress_count = task.scan_progress_count.max(count);
+        task.scan_progress_directories = task.scan_progress_directories.max(directories);
         task.total_size = total_size;
         task.chunk_count = chunk_count;
         task.scan_last_seq = count;
         task.scan_last_path = last_path.to_string();
         task.updated_at = chrono::Utc::now().to_rfc3339();
-        self.persist(task)?;
+        if let Err(error) = self.persist(task) {
+            task.file_count = previous.0;
+            task.directory_count = previous.1;
+            task.scan_progress_count = previous.2;
+            task.scan_progress_directories = previous.3;
+            task.total_size = previous.4;
+            task.chunk_count = previous.5;
+            task.scan_last_seq = previous.6;
+            task.scan_last_path = previous.7;
+            task.updated_at = previous.8;
+            return Err(error);
+        }
         Ok(())
     }
     /// Update sender-only live scan counters without advancing the durable
@@ -283,8 +327,11 @@ impl TransferService {
         let task = map
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound("传输任务不存在".into()))?;
-        task.scan_progress_count = count;
-        task.scan_progress_directories = directories;
+        // A resumed scan can restart from the last durable manifest cursor,
+        // which may be behind the latest in-memory UI progress. Never let
+        // that older cursor make the visible counters move backwards.
+        task.scan_progress_count = task.scan_progress_count.max(count);
+        task.scan_progress_directories = task.scan_progress_directories.max(directories);
         Ok(())
     }
     /// Append a sender-side batch to the durable table and live manifest without
@@ -308,18 +355,70 @@ impl TransferService {
         if task.manifest.entries.len() != first {
             return Err(AppError::Conflict("本地清单游标与持久化条目不一致".into()));
         }
-        self.append_entries(id, first, entries)?;
+        let previous = (
+            task.file_count,
+            task.directory_count,
+            task.scan_progress_count,
+            task.scan_progress_directories,
+            task.total_size,
+            task.chunk_count,
+            task.scan_last_seq,
+            task.scan_last_path.clone(),
+            task.updated_at.clone(),
+        );
         let mut all = std::mem::take(&mut task.manifest.entries);
         all.extend(entries.iter().cloned());
         task.manifest = Manifest::new(all, task.chunk_size, task.verify_hash);
         task.file_count = first + entries.len();
         task.directory_count = directories;
+        // `stream_scan` reports live progress more frequently than we commit
+        // manifest pages. On resume, the durable cursor can be behind that
+        // live count; appending a page must not overwrite the larger live
+        // value and make the next snapshot jump backwards.
+        task.scan_progress_count = task.scan_progress_count.max(task.file_count);
+        task.scan_progress_directories = task.scan_progress_directories.max(directories);
         task.total_size = total_size;
         task.chunk_count = chunk_count;
         task.scan_last_seq = task.file_count;
-        task.scan_last_path = entries.last().map(|entry| entry.path.clone()).unwrap_or_default();
+        task.scan_last_path = entries
+            .last()
+            .map(|entry| entry.path.clone())
+            .unwrap_or_default();
         task.updated_at = chrono::Utc::now().to_rfc3339();
-        self.persist(task)?;
+        let json = serde_json::to_string(&*task)?;
+        let persisted = self.app.db.with_transaction(|tx| {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO task_entries(task_id,index_no,path,size,modified_ms,directory) VALUES(?1,?2,?3,?4,?5,?6)")?;
+            for (i, entry) in entries.iter().enumerate() {
+                stmt.execute(rusqlite::params![
+                    id,
+                    (first + i) as i64,
+                    entry.path,
+                    entry.size as i64,
+                    entry.modified_ms as i64,
+                    entry.directory as i64
+                ])?;
+            }
+            tx.execute(
+                "UPDATE transfer_tasks SET record=?1 WHERE id=?2",
+                rusqlite::params![json, id],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = persisted {
+            let mut entries = std::mem::take(&mut task.manifest.entries);
+            entries.truncate(first);
+            task.manifest = Manifest::new(entries, task.chunk_size, task.verify_hash);
+            task.file_count = previous.0;
+            task.directory_count = previous.1;
+            task.scan_progress_count = previous.2;
+            task.scan_progress_directories = previous.3;
+            task.total_size = previous.4;
+            task.chunk_count = previous.5;
+            task.scan_last_seq = previous.6;
+            task.scan_last_path = previous.7;
+            task.updated_at = previous.8;
+            return Err(error);
+        }
         Ok(())
     }
     pub(crate) fn finish_source_scan(&self, id: &str, digest: String) -> AppResult<()> {
@@ -327,16 +426,54 @@ impl TransferService {
         let task = map
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound("发送任务不存在".into()))?;
+        let previous = (
+            task.file_count,
+            task.directory_count,
+            task.scan_progress_count,
+            task.scan_progress_directories,
+            task.total_size,
+            task.chunk_count,
+            task.digest.clone(),
+            task.scan_last_seq,
+            task.scan_last_path.clone(),
+            task.scan_complete,
+            task.updated_at.clone(),
+        );
         task.file_count = task.manifest.entries.len();
-        task.directory_count = task.manifest.entries.iter().filter(|entry| entry.directory).count();
+        task.directory_count = task
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.directory)
+            .count();
+        task.scan_progress_count = task.scan_progress_count.max(task.file_count);
+        task.scan_progress_directories = task.scan_progress_directories.max(task.directory_count);
         task.total_size = task.manifest.total();
         task.chunk_count = task.manifest.chunk_count();
         task.digest = digest;
         task.scan_last_seq = task.file_count;
-        task.scan_last_path = task.manifest.entries.last().map(|entry| entry.path.clone()).unwrap_or_default();
+        task.scan_last_path = task
+            .manifest
+            .entries
+            .last()
+            .map(|entry| entry.path.clone())
+            .unwrap_or_default();
         task.scan_complete = true;
         task.updated_at = chrono::Utc::now().to_rfc3339();
-        self.persist(task)?;
+        if let Err(error) = self.persist(task) {
+            task.file_count = previous.0;
+            task.directory_count = previous.1;
+            task.scan_progress_count = previous.2;
+            task.scan_progress_directories = previous.3;
+            task.total_size = previous.4;
+            task.chunk_count = previous.5;
+            task.digest = previous.6;
+            task.scan_last_seq = previous.7;
+            task.scan_last_path = previous.8;
+            task.scan_complete = previous.9;
+            task.updated_at = previous.10;
+            return Err(error);
+        }
         Ok(())
     }
     fn load_bulk_locked(&self, map: &mut HashMap<String, TaskRecord>, id: &str) -> AppResult<()> {
@@ -426,7 +563,8 @@ impl TransferService {
         let (completed, skipped, targets, relayed) = self.app.db.with_conn(|conn| {
             let mut completed = BTreeSet::new();
             {
-                let mut stmt = conn.prepare("SELECT chunk_index FROM task_chunks WHERE task_id=?1")?;
+                let mut stmt =
+                    conn.prepare("SELECT chunk_index FROM task_chunks WHERE task_id=?1")?;
                 let rows = stmt.query_map([base.id.as_str()], |r| r.get::<_, i64>(0))?;
                 for row in rows {
                     completed.insert(row? as usize);
@@ -434,7 +572,8 @@ impl TransferService {
             }
             let mut skipped = BTreeSet::new();
             {
-                let mut stmt = conn.prepare("SELECT file_index FROM task_skipped WHERE task_id=?1")?;
+                let mut stmt =
+                    conn.prepare("SELECT file_index FROM task_skipped WHERE task_id=?1")?;
                 let rows = stmt.query_map([base.id.as_str()], |r| r.get::<_, i64>(0))?;
                 for row in rows {
                     skipped.insert(row? as usize);
@@ -510,135 +649,180 @@ impl TransferService {
     /// 记录一个「真正落盘完成」的块：内存去重 + 增量写 `task_chunks` + 推进进度标量。
     /// 不克隆清单明细，也不重写整份进度集合，因此对百万级清单仍是 O(1)。
     pub(crate) fn mark_chunk_done(&self, id: &str, index: usize, bytes: u64) -> AppResult<bool> {
-        let json = {
-            // bulk 明细在锁外载入（见 ensure_bulk），避免读几十万行时占住任务锁。
-            self.ensure_bulk(id)?;
-            let mut map = locks::lock(&self.tasks);
-            self.load_bulk_locked(&mut map, id)?;
-            let task = map
-                .get_mut(id)
-                .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
-            let mut changed = false;
-            if task.completed.insert(index) {
-                task.completed_count = task.completed.len();
-                task.completed_bytes = task.completed_bytes.saturating_add(bytes);
-                changed = true;
+        // A chunk is complete only after its durable marker and scalar summary
+        // commit together. Keep the in-memory mutation reversible if SQLite fails.
+        self.ensure_bulk(id)?;
+        let mut map = locks::lock(&self.tasks);
+        self.load_bulk_locked(&mut map, id)?;
+        let task = map
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
+        let old_status = task.status.clone();
+        let old_count = task.completed_count;
+        let old_bytes = task.completed_bytes;
+        let old_updated_at = task.updated_at.clone();
+        let inserted = task.completed.insert(index);
+        let mut changed = inserted;
+        if inserted {
+            task.completed_count = task.completed.len();
+            task.completed_bytes = task.completed_bytes.saturating_add(bytes);
+        }
+        if task.status == "accepted" {
+            task.status = "transferring".into();
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        task.updated_at = chrono::Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&*task)?;
+        let persisted = self.app.db.with_transaction(|tx| {
+            if inserted {
+                tx.execute(
+                    "INSERT OR IGNORE INTO task_chunks(task_id,chunk_index) VALUES(?1,?2)",
+                    rusqlite::params![id, index as i64],
+                )?;
             }
-            if task.status == "accepted" {
-                task.status = "transferring".into();
-                changed = true;
-            }
-            if !changed {
-                return Ok(false);
-            }
-            task.updated_at = chrono::Utc::now().to_rfc3339();
-            serde_json::to_string(&*task)?
-        };
-        self.app.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO task_chunks(task_id,chunk_index) VALUES(?1,?2)",
-                rusqlite::params![id, index as i64],
-            )?;
-            conn.execute(
+            tx.execute(
                 "UPDATE transfer_tasks SET record=?1 WHERE id=?2",
                 rusqlite::params![json, id],
             )?;
             Ok(())
-        })?;
+        });
+        if let Err(error) = persisted {
+            if inserted {
+                task.completed.remove(&index);
+            }
+            task.completed_count = old_count;
+            task.completed_bytes = old_bytes;
+            task.status = old_status;
+            task.updated_at = old_updated_at;
+            return Err(error);
+        }
         Ok(true)
     }
     /// 记录缓存中转的转写进度（只写非零行；进度以 `task_relay` 表为权威）。
     pub(crate) fn set_relayed(&self, id: &str, file: usize, bytes: u64) -> AppResult<()> {
-        {
-            // bulk 明细在锁外载入（见 ensure_bulk），避免读几十万行时占住任务锁。
-            self.ensure_bulk(id)?;
-            let mut map = locks::lock(&self.tasks);
-            self.load_bulk_locked(&mut map, id)?;
-            let task = map
-                .get_mut(id)
-                .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
-            if task.relayed.len() < task.file_count {
-                task.relayed.resize(task.file_count, 0);
-            }
-            let old = task.relayed.get(file).copied().unwrap_or(0);
-            if bytes <= old {
-                return Ok(());
-            }
-            task.relayed_total = task.relayed_total.saturating_add(bytes - old);
-            task.relayed[file] = bytes;
-            task.updated_at = chrono::Utc::now().to_rfc3339();
+        self.ensure_bulk(id)?;
+        let mut map = locks::lock(&self.tasks);
+        self.load_bulk_locked(&mut map, id)?;
+        let task = map
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
+        if file >= task.file_count {
+            return Err(AppError::BadRequest("转写文件编号非法".into()));
         }
-        self.app.db.with_conn(|conn| {
-            conn.execute(
+        if task.relayed.len() < task.file_count {
+            task.relayed.resize(task.file_count, 0);
+        }
+        let old = task.relayed.get(file).copied().unwrap_or(0);
+        if bytes <= old {
+            return Ok(());
+        }
+        let old_total = task.relayed_total;
+        let old_updated_at = task.updated_at.clone();
+        task.relayed_total = task.relayed_total.saturating_add(bytes - old);
+        task.relayed[file] = bytes;
+        task.updated_at = chrono::Utc::now().to_rfc3339();
+        let persisted = self.app.db.with_transaction(|tx| {
+            tx.execute(
                 "INSERT INTO task_relay(task_id,file_index,relayed) VALUES(?1,?2,?3) ON CONFLICT(task_id,file_index) DO UPDATE SET relayed=excluded.relayed",
                 rusqlite::params![id, file as i64, bytes as i64],
             )?;
             Ok(())
-        })
+        });
+        if let Err(error) = persisted {
+            task.relayed[file] = old;
+            task.relayed_total = old_total;
+            task.updated_at = old_updated_at;
+            return Err(error);
+        }
+        Ok(())
     }
     /// 标记文件被跳过（源文件变化）：内存 + `task_skipped`/`task_chunks`/`task_targets` 增量写入。
     pub(crate) fn mark_skipped(&self, id: &str, file: usize) -> AppResult<()> {
-        let (json, chunks, newly) = {
-            // bulk 明细在锁外载入（见 ensure_bulk），避免读几十万行时占住任务锁。
-            self.ensure_bulk(id)?;
-            let mut map = locks::lock(&self.tasks);
-            self.load_bulk_locked(&mut map, id)?;
-            let task = map
-                .get_mut(id)
-                .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
-            let entry = task
-                .manifest
-                .entries
-                .get(file)
-                .cloned()
-                .ok_or_else(|| AppError::BadRequest("文件编号非法".into()))?;
-            let base = task.manifest.file_base(file);
-            let count = if entry.directory {
-                0
-            } else {
-                entry.size.div_ceil(task.chunk_size) as usize
-            };
-            let mut added = Vec::new();
-            for i in base..base + count {
-                if task.completed.insert(i) {
-                    added.push(i);
-                }
-            }
-            task.completed_count = task.completed.len();
-            if task.targets.len() > file {
-                task.targets[file] = None;
-            }
-            let newly = !task.skipped_files.contains(&file);
-            task.note_skipped(file, entry.size, &entry.path);
-            if newly {
-                task.event(format!("源文件已变化，跳过：{}", entry.path));
-            }
-            (serde_json::to_string(&*task)?, added, newly)
+        self.ensure_bulk(id)?;
+        let mut map = locks::lock(&self.tasks);
+        self.load_bulk_locked(&mut map, id)?;
+        let task = map
+            .get_mut(id)
+            .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
+        let entry = task
+            .manifest
+            .entries
+            .get(file)
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest("文件编号非法".into()))?;
+        let base = task.manifest.file_base(file);
+        let count = if entry.directory {
+            0
+        } else {
+            entry.size.div_ceil(task.chunk_size) as usize
         };
-        self.app.db.with_conn(|conn| {
+        let old_count = task.completed_count;
+        let old_skipped_bytes = task.skipped_bytes;
+        let old_skipped_paths = task.skipped_paths.clone();
+        let old_events = task.events.clone();
+        let old_updated_at = task.updated_at.clone();
+        let old_target = task.targets.get(file).cloned();
+        let was_skipped = task.skipped_files.contains(&file);
+        let mut added = Vec::new();
+        for index in base..base + count {
+            if task.completed.insert(index) {
+                added.push(index);
+            }
+        }
+        task.completed_count = task.completed.len();
+        if task.targets.len() > file {
+            task.targets[file] = None;
+        }
+        let newly = !was_skipped;
+        task.note_skipped(file, entry.size, &entry.path);
+        if newly {
+            task.event(format!("源文件已变化，跳过：{}", entry.path));
+        }
+        let json = serde_json::to_string(&*task)?;
+        let persisted = self.app.db.with_transaction(|tx| {
             {
-                let mut stmt = conn
-                    .prepare("INSERT OR IGNORE INTO task_chunks(task_id,chunk_index) VALUES(?1,?2)")?;
-                for i in &chunks {
-                    stmt.execute(rusqlite::params![id, *i as i64])?;
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO task_chunks(task_id,chunk_index) VALUES(?1,?2)",
+                )?;
+                for index in &added {
+                    stmt.execute(rusqlite::params![id, *index as i64])?;
                 }
             }
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO task_skipped(task_id,file_index) VALUES(?1,?2)",
                 rusqlite::params![id, file as i64],
             )?;
-            if newly {
-                conn.execute(
-                    "DELETE FROM task_targets WHERE task_id=?1 AND file_index=?2",
-                    rusqlite::params![id, file as i64],
-                )?;
-            }
-            conn.execute(
+            tx.execute(
+                "DELETE FROM task_targets WHERE task_id=?1 AND file_index=?2",
+                rusqlite::params![id, file as i64],
+            )?;
+            tx.execute(
                 "UPDATE transfer_tasks SET record=?1 WHERE id=?2",
                 rusqlite::params![json, id],
             )?;
             Ok(())
-        })
+        });
+        if let Err(error) = persisted {
+            for index in added {
+                task.completed.remove(&index);
+            }
+            task.completed_count = old_count;
+            task.skipped_bytes = old_skipped_bytes;
+            task.skipped_paths = old_skipped_paths;
+            task.events = old_events;
+            task.updated_at = old_updated_at;
+            if !was_skipped {
+                task.skipped_files.remove(&file);
+            }
+            if let Some(target) = task.targets.get_mut(file) {
+                *target = old_target.flatten();
+            }
+            return Err(error);
+        }
+        Ok(())
     }
     /// `decide` 后把内存中的「目标路径 + 已完成集合 + 转写目标字节数」整体写回明细表。
     pub(crate) fn save_decision(&self, id: &str) -> AppResult<()> {
@@ -695,21 +879,54 @@ impl TransferService {
     /// 清空某任务已收的清单片段（清单传输中断后重传前调用），并让内存缓存失效，
     /// 使后续 `record()` 从明细表重新载入完整清单。
     pub(crate) fn clear_entries(&self, id: &str) -> AppResult<()> {
-        self.app.db.with_conn(|conn| {
-            conn.execute("DELETE FROM task_entries WHERE task_id=?1", [id])?;
-            Ok(())
-        })?;
         let mut map = locks::lock(&self.tasks);
         if let Some(task) = map.get_mut(id) {
-            task.manifest = Manifest::default();
+            let previous_manifest = std::mem::replace(&mut task.manifest, Manifest::default());
+            let previous = (
+                task.file_count,
+                task.directory_count,
+                task.scan_progress_count,
+                task.scan_progress_directories,
+                task.total_size,
+                task.chunk_count,
+                task.scan_last_seq,
+                task.scan_last_path.clone(),
+                task.scan_complete,
+                task.updated_at.clone(),
+            );
             task.file_count = 0;
             task.directory_count = 0;
+            task.scan_progress_count = 0;
+            task.scan_progress_directories = 0;
             task.total_size = 0;
             task.chunk_count = 0;
             task.scan_last_seq = 0;
             task.scan_last_path.clear();
             task.scan_complete = false;
-            self.persist(task)?;
+            task.updated_at = chrono::Utc::now().to_rfc3339();
+            let json = serde_json::to_string(&*task)?;
+            let persisted = self.app.db.with_transaction(|tx| {
+                tx.execute("DELETE FROM task_entries WHERE task_id=?1", [id])?;
+                tx.execute(
+                    "UPDATE transfer_tasks SET record=?1 WHERE id=?2",
+                    rusqlite::params![json, id],
+                )?;
+                Ok(())
+            });
+            if let Err(error) = persisted {
+                task.manifest = previous_manifest;
+                task.file_count = previous.0;
+                task.directory_count = previous.1;
+                task.scan_progress_count = previous.2;
+                task.scan_progress_directories = previous.3;
+                task.total_size = previous.4;
+                task.chunk_count = previous.5;
+                task.scan_last_seq = previous.6;
+                task.scan_last_path = previous.7;
+                task.scan_complete = previous.8;
+                task.updated_at = previous.9;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -752,6 +969,7 @@ impl TransferService {
         Ok(RelayState {
             status: task.status.clone(),
             use_cache: task.use_cache,
+            file_count: task.file_count,
             error: task.error.clone(),
             completed_count: task.completed_count,
             chunk_count: task.chunk_count,
@@ -759,6 +977,22 @@ impl TransferService {
             relayed_total: task.relayed_total,
             relay_target_bytes: task.relay_target_bytes,
         })
+    }
+    /// Cheap scalar-only gate for recovering a fully received task whose peer
+    /// disconnected before sending the final Commit message.
+    pub(crate) fn auto_commit_ready(&self, id: &str) -> bool {
+        let map = locks::lock(&self.tasks);
+        let Some(task) = map.get(id) else { return false };
+        task.direction == "receive"
+            // A peer can disconnect after the final chunk is durably received
+            // but before Commit arrives. Recover these complete tasks even if
+            // the connection already marked them interrupted.
+            && ["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
+            && task.error.is_none()
+            && task.destination.is_some()
+            && task.scan_complete
+            && task.completed_count >= task.chunk_count
+            && (!task.use_cache || task.relayed_total >= task.relay_target_bytes)
     }
     /// 转写任务需要的只读计划（每文件条目、块基址、目标路径），一次取齐。
     /// 已转写进度不在此缓存，转写循环按需用 `relayed_at` 读取，避免每轮克隆大数组。
@@ -889,26 +1123,30 @@ impl TransferService {
     }
     /// 状态流转为 transferring（幂等：无变化则跳过写库）。
     pub(crate) fn mark_transferring(&self, id: &str, transport: &str) -> AppResult<()> {
-        let json = {
-            let mut map = locks::lock(&self.tasks);
-            let task = map
-                .get_mut(id)
-                .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
-            if task.status == "transferring" && task.transport.as_deref() == Some(transport) {
-                return Ok(());
-            }
-            task.status = "transferring".into();
-            task.transport = Some(transport.into());
-            task.updated_at = chrono::Utc::now().to_rfc3339();
-            serde_json::to_string(&*task)?
-        };
+        let mut map = locks::lock(&self.tasks);
+        let mut task = map
+            .get(id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
+        if task.status == "transferring" && task.transport.as_deref() == Some(transport) {
+            return Ok(());
+        }
+        task.status = "transferring".into();
+        task.transport = Some(transport.into());
+        task.updated_at = chrono::Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&task)?;
+        // Persist the candidate state before publishing it to readers. A
+        // failed SQLite write must not leave memory claiming that the task is
+        // transferring while the durable record still says otherwise.
         self.app.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE transfer_tasks SET record=?1 WHERE id=?2",
                 rusqlite::params![json, id],
             )?;
             Ok(())
-        })
+        })?;
+        map.insert(id.to_string(), task);
+        Ok(())
     }
     pub(crate) fn edit(
         &self,
@@ -983,10 +1221,9 @@ impl TransferService {
         TransferService::preview_cancel();
         // Establish the task and connect without recursively scanning the selected
         // directories. Only the selected roots are stat'ed before the first Offer.
-        let mut scanner =
-            tokio::task::spawn_blocking(move || source::SourceScanner::new(paths))
-                .await
-                .map_err(|e| AppError::Other(e.to_string()))??;
+        let mut scanner = tokio::task::spawn_blocking(move || source::SourceScanner::new(paths))
+            .await
+            .map_err(|e| AppError::Other(e.to_string()))??;
         let sources = scanner.roots().to_vec();
         let root_entries = scanner.next_batch(sources.len().max(1))?;
         if root_entries.is_empty() {
@@ -1133,7 +1370,8 @@ impl TransferService {
             .collect();
         // 缓存盘中转：缓存可用且与目标盘不同卷时启用（同卷会加倍 I/O，自动回退直写）。
         // 同卷判断要查询卷信息，属于同步文件系统调用，同样放到阻塞线程池。
-        let use_cache = match self.cache_root.clone() {
+        let current_cache_root = self.current_cache_root();
+        let use_cache = match current_cache_root.clone() {
             Some(cache) => {
                 let root_probe = root.clone();
                 tokio::task::spawn_blocking(move || !paths::same_volume(&cache, &root_probe))
@@ -1177,6 +1415,11 @@ impl TransferService {
                 "接收方已确认保存位置和冲突策略"
             });
         })?;
+        if use_cache {
+            if let Some(cache_root) = current_cache_root {
+                locks::lock(&self.task_cache_roots).insert(id.to_string(), cache_root);
+            }
+        }
         // 把目标路径与完成集合（含未选中文件的块）整体落明细表（一次性）。
         self.save_decision(id)?;
         Ok(())
@@ -1212,6 +1455,10 @@ impl TransferService {
         self.edit(id, |t| {
             t.status = state.into();
             t.error = None;
+            // Keep file_count/scan_last_seq as the durable manifest cursor.
+            // The snapshot combines them with the live progress counters for
+            // display; promoting live progress here would make resume skip
+            // entries that were never committed to task_entries.
             t.event(format!("用户操作：{action}"));
         })?;
         if action == "cancel" && task.direction == "receive" {
@@ -1242,8 +1489,8 @@ impl TransferService {
         // 关闭直写模式复用的目标盘句柄。
         self.release_files(&id);
         // 删缓存目录。
-        if let Some(cache_root) = self.cache_root.as_ref() {
-            let dir = paths::cache_task(cache_root, &id);
+        if let Some(cache_root) = self.cache_root_for_task(&id) {
+            let dir = paths::cache_task(&cache_root, &id);
             if dir.exists() {
                 if let Err(err) = std::fs::remove_dir_all(&dir) {
                     tracing::warn!(dir = %dir.display(), "取消时清理缓存失败：{err}");
@@ -1355,6 +1602,41 @@ impl TransferService {
                     dirs::download_dir().unwrap_or_else(|| self.app.paths.data_dir.clone());
                 download.join("NodeSend").to_string_lossy().into_owned()
             })
+    }
+    pub fn cache_directory(&self) -> String {
+        self.current_cache_root()
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+    pub(crate) fn current_cache_root(&self) -> Option<PathBuf> {
+        locks::lock(&self.cache_root).clone()
+    }
+    pub(crate) fn cache_root_for_task(&self, id: &str) -> Option<PathBuf> {
+        locks::lock(&self.task_cache_roots)
+            .get(id)
+            .cloned()
+            .or_else(|| self.current_cache_root())
+    }
+    pub(crate) fn update_cache_root(&self, new_root: Option<PathBuf>) {
+        let old_root = self.current_cache_root();
+        if old_root != new_root {
+            let active_cached: Vec<String> = locks::lock(&self.tasks)
+                .values()
+                .filter(|task| task.direction == "receive" && task.use_cache && !["completed", "cancelled", "rejected"].contains(&task.status.as_str()))
+                .map(|task| task.id.clone())
+                .collect();
+            if let Some(old_root) = old_root {
+                let mut roots = locks::lock(&self.task_cache_roots);
+                for id in active_cached {
+                    roots.entry(id).or_insert_with(|| old_root.clone());
+                }
+            }
+            *locks::lock(&self.cache_root) = new_root;
+        }
+    }
+    pub(crate) fn refresh_cache_root_from_settings(&self) {
+        self.update_cache_root(relay::resolve_cache_root(&self.app));
     }
     pub fn is_active(&self, id: &str) -> bool {
         self.runtime_if_exists(id)

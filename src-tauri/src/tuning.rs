@@ -62,8 +62,8 @@ pub(crate) const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_PENDING_REQUESTS: usize = 128;
 /// 会话并发上限：达到上限时拒绝新连接并打 WARN。
 pub(crate) const MAX_SESSIONS: usize = 64;
-/// 同时进行的发送任务上限。
-pub(crate) const MAX_ACTIVE_SENDS: usize = 4;
+/// 同时进行的发送任务上限；超出任务在调度器中等待空位。
+pub(crate) const MAX_ACTIVE_SENDS: usize = 10;
 
 // --- 发送端 ---
 

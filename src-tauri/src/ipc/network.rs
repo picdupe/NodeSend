@@ -264,9 +264,10 @@ pub async fn set_network_settings(
     network: State<'_, Arc<NetworkManager>>,
     name: String,
     directory: String,
+    cache_directory: String,
     policy: String,
 ) -> AppResult<()> {
-    network.settings(name, directory, policy)
+    network.settings(name, directory, cache_directory, policy)
 }
 #[tauri::command]
 pub async fn remove_peer(

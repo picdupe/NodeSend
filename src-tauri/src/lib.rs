@@ -10,6 +10,8 @@
 pub mod access;
 #[cfg(target_os = "android")]
 pub mod android_import;
+#[cfg(target_os = "android")]
+pub mod android_updater;
 pub mod browser;
 pub mod config;
 pub mod db;
@@ -24,12 +26,12 @@ pub mod service;
 pub mod share;
 pub mod transfer;
 #[cfg(desktop)]
+pub mod tray;
+pub(crate) mod tuning;
+#[cfg(desktop)]
 pub mod update_sources;
 #[cfg(desktop)]
-pub mod tray;
-#[cfg(desktop)]
 pub mod updater;
-pub(crate) mod tuning;
 
 use std::sync::Arc;
 
@@ -64,6 +66,7 @@ pub fn run() {
     #[cfg(target_os = "android")]
     {
         builder = builder.plugin(android_import::init());
+        builder = builder.plugin(android_updater::init());
     }
     builder
         .setup(|app| {
@@ -166,6 +169,12 @@ pub fn run() {
             ipc::browser::rename_browser_entry,
             ipc::browser::move_browser_entry,
             ipc::browser::choose_browser_download_path,
+            #[cfg(target_os = "android")]
+            android_updater::check_android_update,
+            #[cfg(target_os = "android")]
+            android_updater::download_android_update,
+            #[cfg(target_os = "android")]
+            android_updater::install_android_update,
             #[cfg(desktop)]
             updater::check_update,
             #[cfg(desktop)]
@@ -182,9 +191,36 @@ pub fn run() {
 }
 
 /// 初始化日志（tracing）。RUST_LOG 环境变量可覆盖级别，默认 info。
+/// 桌面程序没有可见控制台，因此同时写入应用数据目录下的 logs/nodesend.log。
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
-    let _ = fmt().with_env_filter(filter).try_init();
+
+    // Windows 默认位于 %APPDATA%\NodeSend\logs\nodesend.log。
+    // 使用 dirs 获取平台数据目录，避免把用户目录或盘符硬编码进程序。
+    if let Some(data_dir) = dirs::data_dir() {
+        let log_dir = data_dir.join("NodeSend").join("logs");
+        let log_path = log_dir.join("nodesend.log");
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .with_writer(move || file.try_clone().expect("克隆 NodeSend 日志文件句柄失败"))
+                    .try_init();
+                return;
+            }
+        }
+    }
+
+    // 日志目录不可用时保留控制台输出，避免日志初始化失败导致应用无法启动。
+    let fallback_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
+    let _ = fmt().with_env_filter(fallback_filter).try_init();
 }
