@@ -74,7 +74,6 @@ pub(crate) const SEND_DATA_SLICE: Duration = Duration::from_millis(1500);
 pub(crate) const SEND_POLL_INTERVAL: Duration = Duration::from_millis(750);
 /// 连接中断后的重试等待与冷却时间。
 pub(crate) const SEND_RETRY_DELAY: Duration = Duration::from_secs(2);
-pub(crate) const SEND_RETRY_COOLDOWN_SECS: i64 = 30;
 /// 发送端保留的读句柄上限：机械盘顺序读需要复用句柄，但不能无界累积。
 pub(crate) const SEND_HANDLES_LIMIT: usize = 32;
 /// 单次请求耗时超过该值就打 WARN，便于区分"慢"与"卡死"。

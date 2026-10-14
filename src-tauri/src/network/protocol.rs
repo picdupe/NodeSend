@@ -120,6 +120,11 @@ pub enum Request {
         id: String,
         summary: OfferSummary,
     },
+    /// Sender has automatically reconnected after an interruption; resume only
+    /// recoverable interrupted receive tasks, never an intentional user pause.
+    Reconnect {
+        id: String,
+    },
     /// 清单分片：`first` 为本片首条在整份清单中的下标（0 起，按序递增）。
     ManifestChunk {
         id: String,

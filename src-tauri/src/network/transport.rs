@@ -904,6 +904,7 @@ fn request_label(request: &Request) -> &'static str {
         Request::Addresses => "Addresses",
         Request::Hello { .. } => "Hello",
         Request::Offer { .. } => "Offer",
+        Request::Reconnect { .. } => "Reconnect",
         Request::ManifestChunk { .. } => "ManifestChunk",
         Request::ManifestDone { .. } => "ManifestDone",
         Request::Poll { .. } => "Poll",

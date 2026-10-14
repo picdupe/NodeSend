@@ -199,7 +199,8 @@ impl TransferService {
                     .await
                     .map_err(|e| AppError::Other(e.to_string()))?;
                 let cooldown = Arc::new(AtomicI64::new(0));
-                for attempt in 0..3 {
+                let mut attempt = 0u32;
+                loop {
                     if service.stopped(&id)? {
                         return Ok(());
                     }
@@ -213,24 +214,30 @@ impl TransferService {
                                 return Ok(());
                             }
                             let retry = matches!(err, AppError::Io(_) | AppError::Other(_));
-                            if !retry || attempt == 2 {
+                            if !retry {
                                 return Err(err);
                             }
-                            cooldown.store(
-                                chrono::Utc::now().timestamp()
-                                    + crate::tuning::SEND_RETRY_COOLDOWN_SECS,
-                                Ordering::Relaxed,
-                            );
+                            // Once this run falls back to TCP, keep using TCP until
+                            // the user manually pauses and resumes the task. A new
+                            // start_task invocation creates a fresh cooldown (QUIC first).
+                            cooldown.store(i64::MAX, Ordering::Relaxed);
+                            attempt = attempt.saturating_add(1);
                             service.edit(&id, |t| {
-                                t.status = "paused".into();
+                                // Unexpected network failures are recoverable, not
+                                // user pauses. Keep this run alive so it reconnects
+                                // automatically; stopped() still exits immediately
+                                // when the user explicitly pauses or cancels.
+                                t.status = "interrupted".into();
                                 t.error = Some(err.to_string());
-                                t.event("连接中断，已暂停；点击继续后重新检查所有地址");
+                                t.event(format!(
+                                    "连接中断，{:?} 后自动重试（第 {attempt} 次）",
+                                    crate::tuning::SEND_RETRY_DELAY
+                                ));
                             })?;
                             tokio::time::sleep(crate::tuning::SEND_RETRY_DELAY).await;
                         }
                     }
                 }
-                Ok(())
             };
             let result = tokio::select! {r=run=>r,_=service.shutdown.cancelled()=>Ok(())};
             if let Err(err) = result {
@@ -281,13 +288,49 @@ impl TransferService {
             .await
             {
                 Ok(mut channel) => {
-                    transport::hello(&mut channel, &self.app).await?;
-                    peers.seen(&task.peer_id, endpoint);
-                    // TCP is a fallback for this connection only. Do not keep
-                    // a cooldown: the next reconnect must probe QUIC again.
-                    if channel.kind == "tcp" {
-                        cooldown.store(0, Ordering::Relaxed);
+                    if let Err(quic_error) = transport::hello(&mut channel, &self.app).await {
+                        if channel.kind != "quic" {
+                            last = quic_error.to_string();
+                            peers.failure(&task.peer_id, endpoint, last.clone());
+                            continue;
+                        }
+                        tracing::warn!(
+                            peer_id = %task.peer_id,
+                            address = %endpoint.address,
+                            error = %quic_error,
+                            "QUIC HELLO/读取失败，立即回退 TCP 重试"
+                        );
+                        // Share the fallback decision with every worker and every
+                        // reconnect in this transfer run; do not let another worker
+                        // silently switch back to QUIC.
+                        cooldown.store(i64::MAX, Ordering::Relaxed);
+                        let mut tcp_channel = match transport::connect(
+                            &self.app,
+                            endpoint,
+                            Some(&task.peer_id),
+                            true,
+                            task.allow_public,
+                        )
+                        .await
+                        {
+                            Ok(channel) => channel,
+                            Err(tcp_error) => {
+                                last = format!("QUIC 读取失败：{quic_error}；TCP 回退失败：{tcp_error}");
+                                peers.failure(&task.peer_id, endpoint, last.clone());
+                                continue;
+                            }
+                        };
+                        if let Err(tcp_error) = transport::hello(&mut tcp_channel, &self.app).await {
+                            last = format!("QUIC 读取失败：{quic_error}；TCP HELLO 失败：{tcp_error}");
+                            peers.failure(&task.peer_id, endpoint, last.clone());
+                            continue;
+                        }
+                        channel = tcp_channel;
                     }
+                    peers.seen(&task.peer_id, endpoint);
+                    // Keep the TCP preference for the whole retry window. Clearing
+                    // it as soon as one worker connects via TCP lets other workers
+                    // (and later reconnects in the same transfer) jump back to QUIC.
                     self.edit(&task.id, |t| {
                         if t.transport.as_deref() != Some(channel.kind) {
                             t.event(format!(
@@ -621,6 +664,16 @@ impl TransferService {
                 summary: offer_summary,
             })
             .await?;
+        // Explicitly notify the receiver that this is an automatic reconnect.
+        // The receiver resumes interrupted tasks, but preserves intentional pauses.
+        if let Err(err) = control
+            .request(&Request::Reconnect {
+                id: task.wire_id.clone(),
+            })
+            .await
+        {
+            tracing::warn!(task = %task.wire_id, error = %err, "自动恢复信号发送失败，将继续通过 Offer/续传握手恢复");
+        }
         let mut resume_manifest_at = 0usize;
         state = match state {
             Response::ManifestResume { next_index } => {

@@ -151,6 +151,14 @@ try {
         $outputRoot = Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs'
         $apkCandidates = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.apk' -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "(?i)[/\\]$([Regex]::Escape($Target))[/\\]release[/\\]|$([Regex]::Escape($Target)).*release.*\.apk$" })
+        # Tauri's Android Gradle project may package a single-ABI build under
+        # apk/universal/release rather than including the Rust target in the
+        # output path. Since this invocation passes exactly one --target, that
+        # universal output is the artifact for the requested target.
+        if ($apkCandidates.Count -eq 0) {
+            $apkCandidates = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.apk' -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '(?i)[/\\]apk[/\\]universal[/\\]release[/\\]' })
+        }
         if ($apkCandidates.Count -ne 1) {
             throw "Cannot generate Android update manifest: expected one release APK for target '$Target', found $($apkCandidates.Count). Inspect $outputRoot and ensure the release build produces a single APK for this target."
         }

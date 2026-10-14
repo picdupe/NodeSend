@@ -52,6 +52,26 @@ impl TransferService {
                 Ok(Response::Ack)
             }
             Request::Offer { id, summary } => self.offer(peer, name, &id, summary, transport).await,
+            Request::Reconnect { id } => {
+                let id = super::super::model::incoming_id(peer, &id);
+                let gate = self.gate(&id);
+                let _lock = gate.lock().await;
+                if self.status_of(&id).is_ok() {
+                    let task = self.record(&id)?;
+                    // Never override a manual pause. Interrupted tasks with an
+                    // already selected destination can safely continue resuming.
+                    if task.status == "interrupted" && task.destination.is_some() {
+                        self.edit(&id, |task| {
+                            task.status = "accepted".into();
+                            task.error = None;
+                            task.event("发送方已自动重连，接收任务已自动恢复");
+                        })?;
+                    }
+                    self.remote_state(&id)
+                } else {
+                    Ok(Response::Ack)
+                }
+            }
             Request::ManifestChunk { id, first, entries } => {
                 self.manifest_chunk(peer, &id, first, entries).await
             }
