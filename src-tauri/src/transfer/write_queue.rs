@@ -224,6 +224,26 @@ impl Writer {
             // 增量写入：只推进该块与汇总标量，不重写整份清单/进度。
             service.mark_chunk_done(&chunk.task_id, chunk.index, chunk.data.len() as u64)?;
             discard_one(service, &chunk.task_id, chunk.index);
+            if !use_cache {
+                let task = service.record(&chunk.task_id)?;
+                let complete = task.manifest.entries.get(chunk.file).is_some_and(|entry| {
+                    let base = task.manifest.file_base(chunk.file);
+                    let count = entry.size.div_ceil(task.chunk_size) as usize;
+                    (base..base + count).all(|index| task.completed.contains(&index))
+                });
+                if complete {
+                    // Windows cannot rename an open staging file. Drop both
+                    // the local handle and the writer's buffer before commit.
+                    drop(handle);
+                    if let Some(buffer) = self.files.remove(key) {
+                        for pending in buffer.ready.values() {
+                            discard_one(service, &pending.task_id, pending.index);
+                        }
+                    }
+                    service.commit_ready_files(&chunk.task_id).await?;
+                    return Ok(());
+                }
+            }
         }
     }
 

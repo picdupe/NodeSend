@@ -203,6 +203,10 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
                     return Ok(());
                 }
                 if done >= entry.size {
+                    // The target-side staging file has been synced by
+                    // relay_file_step. Publish this file now instead of
+                    // waiting for the final file in the folder.
+                    service.commit_ready_files(id).await?;
                     break;
                 }
                 match relay_file_step(service, &plan, &cache_root, id, file, entry.size, done)
@@ -211,6 +215,9 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
                     Some(next) => {
                         done = next;
                         progressed = true;
+                        if done >= entry.size {
+                            service.commit_ready_files(id).await?;
+                        }
                     }
                     None => break, // 所需块未到，先处理下一个文件，下一轮再回来
                 }

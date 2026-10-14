@@ -14,14 +14,35 @@ impl TransferService {
     ) -> AppResult<()> {
         std::fs::create_dir_all(stage)?;
         for (i, entry) in task.manifest.entries.iter().enumerate() {
+            Self::commit_staged_file(task, root, stage, i)?;
+            // Directories are created by commit_staged_file as they become
+            // available in the streaming manifest.
+            let _ = entry;
+        }
+        Ok(())
+    }
+
+    /// Commit one file only after the caller has verified that all its bytes
+    /// are durable at the destination staging path. A missing/incomplete part
+    /// is deliberately not treated as an error by the incremental scheduler;
+    /// the final task commit still validates every file.
+    pub(super) fn commit_staged_file(
+        task: &TaskRecord,
+        root: &Path,
+        stage: &Path,
+        i: usize,
+    ) -> AppResult<()> {
+        let Some(entry) = task.manifest.entries.get(i) else {
+            return Ok(());
+        };
             let Some(target) = task.targets.get(i).and_then(Option::as_ref) else {
-                continue;
+                return Ok(());
             };
             let target = Path::new(target);
             paths::ensure_under(root, target)?;
             if entry.directory {
                 std::fs::create_dir_all(target)?;
-                continue;
+                return Ok(());
             }
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -32,7 +53,7 @@ impl TransferService {
             paths::ensure_under(root, &done)?;
             // Rename stays on the same filesystem and is atomic on the normal path.
             if done.exists() {
-                continue;
+                return Ok(());
             }
             if !part.exists() && entry.size == 0 {
                 std::fs::File::create(&part)?.sync_all()?;
@@ -43,7 +64,7 @@ impl TransferService {
             if target.exists() {
                 if same_file::is_same_file(&part, target).unwrap_or(false) {
                     std::fs::File::create(&done)?.sync_all()?;
-                    continue;
+                    return Ok(());
                 }
                 if matches!(task.conflict, ConflictPolicy::Overwrite) {
                     let backup = stage.join(format!("{i}.previous"));
@@ -55,7 +76,7 @@ impl TransferService {
                         ));
                     }
                 } else if matches!(task.conflict, ConflictPolicy::Skip) {
-                    continue;
+                    return Ok(());
                 } else {
                     return Err(AppError::Conflict(format!(
                         "保存期间目标已出现：{}",
@@ -71,7 +92,6 @@ impl TransferService {
                 return Err(AppError::Io(err));
             }
             std::fs::File::create(&done)?.sync_all()?;
-        }
         Ok(())
     }
 }

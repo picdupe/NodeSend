@@ -170,7 +170,7 @@ impl NetworkManager {
             {
                 Ok(mut channel) => {
                     let handshake = transport::hello(&mut channel, &self.app).await;
-                    let (mut channel, (name, tcp_port, quic_port)) = match handshake {
+                    let (channel, (name, tcp_port, quic_port)) = match handshake {
                         Ok(result) => (channel, result),
                         Err(error) if channel.kind == "quic" => {
                             tracing::warn!(
