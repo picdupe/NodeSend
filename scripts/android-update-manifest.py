@@ -16,7 +16,6 @@ def main() -> None:
     parser.add_argument("--channel", choices=("stable", "test"), required=True)
     parser.add_argument("--apk", type=Path, required=True, help="Path to the signed APK produced by this build")
     parser.add_argument("--url", required=True, help="Public HTTPS URL where this APK will be published")
-    parser.add_argument("--notes", default="", help="Release notes")
     args = parser.parse_args()
 
     if not args.url.startswith("https://"):
@@ -51,21 +50,22 @@ def main() -> None:
                 raise SystemExit(f"Cannot merge existing updater manifest {manifest_path}: 'platforms' must be an object.")
             print(f"Merging updater manifest for existing version/build: {internal_version}")
         else:
-            manifest = {"version": internal_version, "notes": args.notes or "优化机械盘传输及大文件夹传输", "platforms": {}}
+            manifest = {"version": internal_version, "platforms": {}}
     else:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest = {"version": internal_version, "notes": args.notes or "优化机械盘传输及大文件夹传输", "platforms": {}}
+        manifest = {"version": internal_version, "platforms": {}}
 
     manifest.setdefault("version", internal_version)
     manifest.setdefault("platforms", {})
+    # This manifest contains update metadata only; remove any legacy notes
+    # field when merging an existing manifest.
+    manifest.pop("notes", None)
     manifest["android"] = {
         "version": f"{version}.{build}",
         "versionCode": version_code,
         "url": args.url,
         "sha256": digest.hexdigest(),
     }
-    if args.notes:
-        manifest["notes"] = args.notes
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Updated {manifest_path.relative_to(ROOT)}")

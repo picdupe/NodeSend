@@ -2,13 +2,21 @@ param(
     [switch]$Check,
     [switch]$Debug,
     [switch]$Fast,
-    [ValidateSet('aarch64', 'armv7', 'i686', 'x86_64')]
-    [string]$Target = 'aarch64',
+    [Alias('Target')]
+    [ValidateSet('arm64-v8a', 'armeabi-v7a', 'x86_64', 'universal')]
+    [string]$Architecture = '',
     [string]$JavaHome = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $fastBuild = $Fast -or $Debug
+$architectureMap = [ordered]@{
+    'arm64-v8a' = 'aarch64'
+    'armeabi-v7a' = 'armv7'
+    'x86_64' = 'x86_64'
+    'universal' = ''
+}
+$architectures = if ($Architecture) { @($Architecture) } else { @($architectureMap.Keys) }
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $versionScript = Join-Path $PSScriptRoot 'version.py'
 $python = Get-Command python -ErrorAction SilentlyContinue
@@ -17,24 +25,26 @@ $versionAction = & $python.Source $versionScript sync
 if ($LASTEXITCODE -ne 0) { throw 'Could not synchronize NodeSend version metadata.' }
 Write-Output $versionAction
 $properties = Join-Path $projectRoot 'src-tauri/gen/android/local.properties'
+$sdkRoot = $null
 if (Test-Path -LiteralPath $properties) {
     $sdkLine = Get-Content -LiteralPath $properties | Where-Object { $_ -match '^sdk\.dir=' } | Select-Object -First 1
-if ($sdkLine) {
-    $sdkRoot = $sdkLine.Substring('sdk.dir='.Length).Trim()
-} else {
+    if ($sdkLine) { $sdkRoot = $sdkLine.Substring('sdk.dir='.Length).Trim() }
+}
+if (-not $sdkRoot) {
     $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } elseif ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $null }
     if (-not $sdkRoot) { throw 'Android SDK path is not configured. Set ANDROID_SDK_ROOT or ANDROID_HOME, or provide sdk.dir in src-tauri/gen/android/local.properties.' }
     $sdkRoot = $sdkRoot -replace '\\', '/'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $properties) | Out-Null
     Set-Content -LiteralPath $properties -Value "sdk.dir=$sdkRoot" -Encoding ASCII
     Write-Output "Created Android local.properties: sdk.dir=$sdkRoot"
 }
+$sdkRoot = (Resolve-Path -LiteralPath $sdkRoot).Path
 $JavaHome = if ($JavaHome) { $JavaHome } elseif ($env:JAVA_HOME) { $env:JAVA_HOME } else {
     $javaCommand = Get-Command java.exe -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($javaCommand) { Split-Path (Split-Path $javaCommand.Source -Parent) -Parent } else { $null }
 }
 if (-not $JavaHome) { throw 'JDK 21 was not found. Set JAVA_HOME or add the JDK bin directory to PATH.' }
 $JavaHome = (Resolve-Path -LiteralPath $JavaHome).Path
-}
 $missing = @()
 if (-not (Test-Path "$JavaHome/bin/java.exe")) { $missing += "Java: $JavaHome" }
 if (Test-Path "$JavaHome/release") {
@@ -131,59 +141,96 @@ try {
     & (Join-Path $PSScriptRoot 'icons.ps1')
     & npm.cmd run build
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
-    $arguments = @('run', 'tauri', '--', 'android', 'build', '--target', $Target, '--config', 'src-tauri/tauri.android.package.json')
-    if ($fastBuild) { $arguments += @('--debug', '--apk') }
-    & npm.cmd @arguments
-    if ($LASTEXITCODE -ne 0) { throw "Android build failed (exit $LASTEXITCODE)." }
-
     $variant = if ($fastBuild) { 'debug' } else { 'release' }
-    Write-Output 'Android artifacts:'
-    Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs') -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -in '.apk', '.aab' -and $_.FullName -match "/$variant/|${variant}" } |
-        Select-Object FullName, Length, LastWriteTime
+    $outputRoot = Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs'
+    $releaseRoot = Join-Path $projectRoot 'dist/android'
+    New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
+    $builtApks = @{}
+    foreach ($architectureName in $architectures) {
+        $rustTarget = $architectureMap[$architectureName]
+        $arguments = @('run', 'tauri', '--', 'android', 'build', '--config', 'src-tauri/tauri.android.package.json')
+        if ($rustTarget) {
+            $arguments += @('--target', $rustTarget, '--split-per-abi')
+        }
+        if ($fastBuild) { $arguments += @('--debug', '--apk') }
+        Write-Output "Building Android architecture: $architectureName"
+        & npm.cmd @arguments
+        if ($LASTEXITCODE -ne 0) { throw "Android build failed for '$architectureName' (exit $LASTEXITCODE)." }
 
-    # Generate Android update metadata during the same release build as
-    # Windows/Linux. Fast/debug builds must never replace release metadata.
-    if (-not $fastBuild) {
+        $apkFiles = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.apk' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "(?i)[/\\]$variant[/\\]" -and $_.Name -notlike 'NodeSend_*' })
+        if ($architectureName -eq 'universal') {
+            $candidates = @($apkFiles | Where-Object { $_.FullName -match '(?i)[/\\]apk[/\\]universal[/\\]' })
+        } else {
+            $pathPattern = switch ($architectureName) {
+                'arm64-v8a' { '(?i)[/\\](arm64-v8a|aarch64|arm64)[/\\]' }
+                'armeabi-v7a' { '(?i)[/\\](armeabi-v7a|armv7|arm)[/\\]' }
+                'x86_64' { '(?i)[/\\]x86_64[/\\]' }
+            }
+            $candidates = @($apkFiles | Where-Object { $_.FullName -match $pathPattern })
+        }
+        if ($candidates.Count -ne 1) {
+            throw "Expected exactly one $variant APK for '$architectureName', found $($candidates.Count). Inspect $outputRoot."
+        }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($candidates[0].FullName)
+        try {
+            $nativeAbis = @($archive.Entries | ForEach-Object {
+                if ($_.FullName -match '^lib/([^/]+)/[^/]+\.so$') { $Matches[1] }
+            } | Sort-Object -Unique)
+        } finally {
+            $archive.Dispose()
+        }
+        $expectedAbi = switch ($architectureName) {
+            'arm64-v8a' { 'arm64-v8a' }
+            'armeabi-v7a' { 'armeabi-v7a' }
+            'x86_64' { 'x86_64' }
+        }
+        if ($architectureName -eq 'universal') {
+            $requiredAbis = @('arm64-v8a', 'armeabi-v7a', 'x86_64')
+            $missingAbis = @($requiredAbis | Where-Object { $_ -notin $nativeAbis })
+            if ($missingAbis.Count -gt 0) {
+                throw "The APK in the universal output directory is not a verified universal package; missing native ABIs: $($missingAbis -join ', '). Found: $($nativeAbis -join ', ')."
+            }
+        } elseif ($expectedAbi -notin $nativeAbis) {
+            throw "APK architecture mismatch for '$architectureName'. Expected ABI '$expectedAbi'; found: $($nativeAbis -join ', ')."
+        }
+
         $versionData = Get-Content -LiteralPath (Join-Path $projectRoot 'version.json') -Raw | ConvertFrom-Json
         $publicVersion = "v$($versionData.version).$($versionData.build)"
-        $internalVersion = "$($versionData.version)-build.$($versionData.build)"
-        $outputRoot = Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs'
-        $apkCandidates = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.apk' -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "(?i)[/\\]$([Regex]::Escape($Target))[/\\]release[/\\]|$([Regex]::Escape($Target)).*release.*\.apk$" })
-        # Tauri's Android Gradle project may package a single-ABI build under
-        # apk/universal/release rather than including the Rust target in the
-        # output path. Since this invocation passes exactly one --target, that
-        # universal output is the artifact for the requested target.
-        if ($apkCandidates.Count -eq 0) {
-            $apkCandidates = @(Get-ChildItem -LiteralPath $outputRoot -Recurse -File -Filter '*.apk' -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match '(?i)[/\\]apk[/\\]universal[/\\]release[/\\]' })
+        $suffix = switch ($architectureName) {
+            'arm64-v8a' { '-arm64-v8a' }
+            'armeabi-v7a' { '-armeabi-v7a' }
+            'x86_64' { '-x86_64' }
+            'universal' { '' }
         }
-        if ($apkCandidates.Count -ne 1) {
-            throw "Cannot generate Android update manifest: expected one release APK for target '$Target', found $($apkCandidates.Count). Inspect $outputRoot and ensure the release build produces a single APK for this target."
-        }
-        $apk = $apkCandidates[0]
-        $apkName = "NodeSend_${publicVersion}_android_${Target}.apk"
-        $publishedApk = Join-Path $apk.DirectoryName $apkName
-        if ($apk.FullName -ne $publishedApk) {
-            if (Test-Path -LiteralPath $publishedApk) { Remove-Item -LiteralPath $publishedApk -Force }
-            Move-Item -LiteralPath $apk.FullName -Destination $publishedApk
-        }
+        $apkName = if ($fastBuild) { "NodeSend_$($publicVersion)$suffix-debug.apk" } else { "NodeSend_$($publicVersion)$suffix-release.apk" }
+        $publishedApk = Join-Path $releaseRoot $apkName
+        Copy-Item -LiteralPath $candidates[0].FullName -Destination $publishedApk -Force
+        $builtApks[$architectureName] = $publishedApk
+        Write-Output "Android APK ($architectureName): $publishedApk"
+    }
 
+    # Update the legacy Android updater entry with the ARM64 build when it is
+    # part of this run. Never point it at a universal APK merely because its
+    # output directory happens to be named universal.
+    if (-not $fastBuild -and $builtApks.ContainsKey('arm64-v8a')) {
+        $versionData = Get-Content -LiteralPath (Join-Path $projectRoot 'version.json') -Raw | ConvertFrom-Json
         $downloadBase = if ($env:NODESEND_UPDATE_DOWNLOAD_BASE_URL -and $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim()) {
             $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim().TrimEnd('/')
         } else {
             "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)"
         }
         $downloadUri = $null
-        if (-not [Uri]::TryCreate("$downloadBase/$apkName", [UriKind]::Absolute, [ref]$downloadUri) -or $downloadUri.Scheme -ne 'https') {
+        $arm64Name = Split-Path -Leaf $builtApks['arm64-v8a']
+        if (-not [Uri]::TryCreate("$downloadBase/$arm64Name", [UriKind]::Absolute, [ref]$downloadUri) -or $downloadUri.Scheme -ne 'https') {
             throw 'Android updater download URL must be HTTPS. Set NODESEND_UPDATE_DOWNLOAD_BASE_URL to a valid HTTPS base URL.'
         }
         $python = Get-Command python -ErrorAction SilentlyContinue
         if (-not $python) { throw 'Python 3 is required to generate Android update metadata.' }
-        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel stable --apk $publishedApk --url $downloadUri.AbsoluteUri
+        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel stable --apk $builtApks['arm64-v8a'] --url $downloadUri.AbsoluteUri
         if ($LASTEXITCODE -ne 0) { throw 'Could not merge Android APK metadata into updates/stable/latest.json.' }
-        Write-Output "Android release APK: $publishedApk"
         Write-Output "Android updater download URL: $($downloadUri.AbsoluteUri)"
     }
 } finally {
