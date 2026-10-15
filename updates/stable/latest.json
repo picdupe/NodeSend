@@ -1,15 +1,9 @@
 {
-  "version": "0.1.1-build.96",
-  "platforms": {
-    "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0pkcHJYMnNtMGR4UkdER3U3amR6NzFPUTBXbkFDS2g0NU1uSy93bmUxSXoxWEhqc1dUenVzTmptS0hFMXlLMVFHd3YvN0tBc3ZXSzQxTWVXK2hTRFFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTg2NTUxCWZpbGU6Tm9kZVNlbmRfMC4xLjEtYnVpbGQuOTZfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4xLWJ1aWxkLjk2CmNXdWlZdXVzMHRZOFM1RVdGTmpaZllLazZsdTVDakZnT3pwTGpEMHhpR2lsZ2xPMC9LaUZ4YzJ5RlEvMHB5YkVrQjRScG9qWXFxMmQ3M0RPWDBjNEJ3PT0K",
-      "url": "https://github.com/picdupe/NodeSend/releases/download/v0.1.1/NodeSend_0.1.1.96_x64-setup.exe"
-    }
-  },
-  "android": {
-    "version": "0.1.1.96",
-    "versionCode": 1010096,
-    "url": "https://github.com/picdupe/NodeSend/releases/download/v0.1.1/NodeSend_v0.1.1.96-arm64-v8a-release.apk",
-    "sha256": "23a6ef3ec8db98d8a311ed469382ff2b096a95d68ba1585232f670f815e098c0"
-  }
+    "version":  "0.1.1-build.98",
+    "platforms":  {
+                      "windows-x86_64":  {
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0lhbGtNeXpCWE1ENVFEdUM3MDVuUUpITXc0b3NLT3FPamttMjZnQ25aVzh4OGxkbWlYYjVwMzYwWG40UWxObk01Nk5lZXo2ZWVBSTVXT2VCdm51cmdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMDMzNzg4CWZpbGU6Tm9kZVNlbmRfMC4xLjEtYnVpbGQuOThfeDY0LXNldHVwLmV4ZQl2ZXJzaW9uOjAuMS4xLWJ1aWxkLjk4CkRscnNKcSswTWJHMVRjTGNXR2xOVkplL09IRkFZbWFOdkdJancvNVQycFkvcG8yMjdJRUtHdTI5dnQvRnZqbTkybUVidlRMaVhwSDhKRW1JMHVnWUFBPT0K",
+                                             "url":  "https://github.com/picdupe/NodeSend/releases/download/v0.1.1/NodeSend_0.1.1.98_x64-setup.exe"
+                                         }
+                  }
 }
