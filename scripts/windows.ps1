@@ -98,9 +98,9 @@ $artifacts = @(foreach ($kind in $bundleKinds) {
     Get-ChildItem -LiteralPath (Join-Path $bundleRoot $kind) -Filter $extension -File -ErrorAction Stop
 })
 # Keep Tauri's semver (0.1.1-build.80) for internal package metadata, but use
-# the public release label (v0.1.1.80) in distributable artifact filenames.
+# the public release label (0.1.1.80) in distributable artifact filenames.
 $versionData = Get-Content -LiteralPath (Join-Path $projectRoot 'version.json') -Raw | ConvertFrom-Json
-$publicVersion = "v$($versionData.version).$($versionData.build)"
+$publicVersion = "$($versionData.version).$($versionData.build)"
 $internalVersion = "$($versionData.version)-build.$($versionData.build)"
 foreach ($artifact in $artifacts) {
     if ($artifact.Name.Contains($internalVersion)) {
@@ -194,7 +194,6 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         # starts a clean manifest so stale platform artifacts are not retained.
         $platforms = [ordered]@{}
         $androidUpdate = $null
-        $manifestNotes = "优化机械盘传输及大文件夹传输"
         if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
             try {
                 $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -203,7 +202,6 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
                         $platforms[$property.Name] = $property.Value
                     }
                     if ($null -ne $existingManifest.android) { $androidUpdate = $existingManifest.android }
-                    if ($null -ne $existingManifest.notes) { $manifestNotes = [string]$existingManifest.notes }
                     Write-Output "Merging updater manifest for existing version/build: $internalVersion"
                 }
             } catch {
@@ -216,10 +214,12 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         }
         $manifest = [ordered]@{
             version = $internalVersion
-            notes = $manifestNotes
             platforms = $platforms
         }
         if ($null -ne $androidUpdate) { $manifest.android = $androidUpdate }
+        # ConvertTo-Json is supported by both Windows PowerShell 5.1 and
+        # PowerShell 7; avoid System.Text.Json types that may not be loaded
+        # in the PowerShell host running this build script.
         $manifestJson = $manifest | ConvertTo-Json -Depth 8
         [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
         Write-Output "Updater manifest generated: $manifestPath"

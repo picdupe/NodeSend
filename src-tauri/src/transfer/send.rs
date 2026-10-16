@@ -842,25 +842,20 @@ impl TransferService {
                         return Err(AppError::BadRequest("对端返回非法分块状态".into()));
                     }
                     self.edit(id, |t| {
-                        // 只累加"本次新增"的块：原先每次都遍历全部已完成块重算
-                        // 总量，几十万块时是 O(n) 重复劳动，会拖慢状态刷新。
-                        let mut added = 0u64;
-                        for index in completed.iter() {
-                            if t.completed.insert(index)
-                                && t.manifest
-                                    .chunk(index)
-                                    .is_some_and(|c| !t.skipped_files.contains(&c.file))
-                            {
-                                added = added.saturating_add(
-                                    t.manifest
-                                        .chunk(index)
-                                        .map(|c| c.length as u64)
-                                        .unwrap_or(0),
-                                );
-                            }
-                        }
+                        // 接收端的 completed 是已经落盘并持久化的权威进度。
+                        // 发送端本地记录的是收到 Ack 的块；接收端可能在 Ack 后写盘失败，
+                        // 若只做并集，发送端会把该块永久视为完成，进度 100% 后提交就会
+                        // 一直报「仍有未提交 Chunk」。因此每次开始发送/续传时必须对齐，
+                        // 丢弃接收端尚未确认落盘的本地完成记录，让这些块重新进入发送队列。
+                        t.completed = completed.iter().collect();
                         t.completed_count = t.completed.len();
-                        t.completed_bytes = t.completed_bytes.saturating_add(added);
+                        t.completed_bytes = t
+                            .completed
+                            .iter()
+                            .filter_map(|index| t.manifest.chunk(*index))
+                            .filter(|chunk| !t.skipped_files.contains(&chunk.file))
+                            .map(|chunk| chunk.length as u64)
+                            .sum();
                         t.status = if status == "completed" {
                             "completed"
                         } else {
@@ -1010,12 +1005,10 @@ impl TransferService {
                                 break;
                             }
                             Response::State { status, .. } if status == "paused" => {
-                                service.edit(&task.id, |t| {
-                                    if t.status == "transferring" {
-                                        t.status = "waiting".into();
-                                        t.event("接收方已暂停，等待对方恢复后自动继续");
-                                    }
-                                })?;
+                                // The Chunk response can race with the receiver's
+                                // cancel action and carry an older `paused` state.
+                                // Only publish a pause after Poll confirms it.
+                                let mut pause_reported = false;
                                 loop {
                                     if service.stopped(&task.id)? {
                                         return Ok(());
@@ -1038,12 +1031,25 @@ impl TransferService {
                                             })?;
                                             break;
                                         }
-                                        Response::State { status, .. } if status == "paused" => {}
+                                        Response::State { status, .. } if status == "paused" => {
+                                            if !pause_reported {
+                                                service.edit(&task.id, |t| {
+                                                    if t.status == "transferring" {
+                                                        t.status = "waiting".into();
+                                                        t.event("接收方已暂停，等待恢复或取消");
+                                                    }
+                                                })?;
+                                                pause_reported = true;
+                                            }
+                                        }
                                         Response::State { status, .. }
                                             if ["cancelled", "rejected"]
                                                 .contains(&status.as_str()) =>
                                         {
-                                            service.edit(&task.id, |t| t.status = status)?;
+                                            service.edit(&task.id, |t| {
+                                                t.status = status;
+                                                t.event("接收方已结束该传输任务");
+                                            })?;
                                             return Ok(());
                                         }
                                         _ => {
@@ -1055,7 +1061,11 @@ impl TransferService {
                                 }
                             }
                             Response::State { status, .. } if status == "cancelled" => {
-                                service.edit(&task.id, |t| t.status = "cancelled".into())?;
+                                service.edit(&task.id, |t| {
+                                    t.status = "cancelled".into();
+                                    t.error = None;
+                                    t.event("接收方已取消任务");
+                                })?;
                                 return Ok(());
                             }
                             _ => return Err(AppError::Other("接收方未提交 Chunk".into())),

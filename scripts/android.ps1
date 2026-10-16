@@ -143,7 +143,18 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
     $variant = if ($fastBuild) { 'debug' } else { 'release' }
     $outputRoot = Join-Path $projectRoot 'src-tauri/gen/android/app/build/outputs'
-    $releaseRoot = Join-Path $projectRoot 'dist/android'
+    $releaseRoot = Join-Path $projectRoot 'dist/Android'
+    # Windows paths are case-insensitive, so New-Item -Force does not correct
+    # the on-disk casing of an existing `dist/android` directory. Rename it
+    # through a temporary sibling to ensure the published directory is `Android`.
+    $distRoot = Join-Path $projectRoot 'dist'
+    $existingReleaseRoot = Get-ChildItem -LiteralPath $distRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ieq 'android' } | Select-Object -First 1
+    if ($existingReleaseRoot -and $existingReleaseRoot.Name -cne 'Android') {
+        $temporaryReleaseRoot = Join-Path $distRoot ('.android-case-' + [Guid]::NewGuid().ToString('N'))
+        Move-Item -LiteralPath $existingReleaseRoot.FullName -Destination $temporaryReleaseRoot
+        Move-Item -LiteralPath $temporaryReleaseRoot -Destination $releaseRoot
+    }
     New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
     $builtApks = @{}
     foreach ($architectureName in $architectures) {

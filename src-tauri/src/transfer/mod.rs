@@ -1477,11 +1477,13 @@ impl TransferService {
     async fn cleanup_receive(&self, task: &TaskRecord) {
         let id = task.id.clone();
         let runtime = self.runtime(&id);
-        // 丢弃写入队列中该任务的未落盘登记（不记录完成，不会再写盘）。
-        locks::lock(&runtime.write_pending).clear();
-        // 等转写任务退出：它退出时会关闭目标盘句柄（Windows 上句柄占用会导致删不掉）。
-        for _ in 0..50 {
-            if !runtime.relay_active.load(Ordering::SeqCst) {
+        // 等所有正在落盘/转写/提交的操作退出。不能先清空 write_pending：
+        // 队列中的写入仍可能正在执行，过早清空会造成删除与写入竞态。
+        loop {
+            if !runtime.relay_active.load(Ordering::SeqCst)
+                && !runtime.committing.load(Ordering::SeqCst)
+                && locks::lock(&runtime.write_pending).is_empty()
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1498,9 +1500,19 @@ impl TransferService {
                 }
             }
         }
-        // 删目标盘暂存目录（含临时文件）；用户原文件不在其中，绝不触碰。
+        // 回滚已增量发布到最终目录的文件，并恢复覆盖前的文件；仅操作本任务
+        // 的提交标记，用户后来修改过的文件不会被直接删除。
         if let Ok(stage) = paths::stage(task) {
             if stage.exists() {
+                let root = PathBuf::from(task.destination.as_deref().unwrap_or_default());
+                if let Err(err) = Self::rollback_committed_files(task, &root, &stage) {
+                    tracing::warn!(task = %id, "取消时回滚已提交文件失败：{err}");
+                    // Do not enqueue this directory for blind recursive
+                    // deletion: it may contain the only backup of an original
+                    // file. Keep it for a safe retry/manual recovery.
+                    self.release_runtime(&id);
+                    return;
+                }
                 if let Err(err) = std::fs::remove_dir_all(&stage) {
                     tracing::warn!(dir = %stage.display(), "取消时清理暂存目录失败：{err}");
                     relay::record_pending_cleanup(self, &stage);

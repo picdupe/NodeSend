@@ -148,7 +148,7 @@ impl SourceScanner {
             }
             if !emit {
                 let mut children = std::fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
-                children.sort_by_key(|entry| entry.file_name());
+                children.sort_unstable_by_key(|entry| entry.file_name());
                 for child in children.into_iter().rev() {
                     let name = child
                         .file_name()
@@ -290,10 +290,12 @@ pub async fn read_entry_chunk_with(
 ) -> AppResult<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let path = source_path_from_roots(roots, &entry.path)?;
-    paths::ensure_plain(&path)?;
-    let meta = tokio::fs::metadata(&path).await?;
-    if meta.len() != entry.size || modified(&meta) != entry.modified_ms {
-        return Err(AppError::Conflict(format!("源文件已变化：{}", entry.path)));
+    if offset == 0 {
+        let meta = tokio::fs::symlink_metadata(&path).await?;
+        paths::ensure_plain_meta(&meta)?;
+        if meta.len() != entry.size || modified(&meta) != entry.modified_ms {
+            return Err(AppError::Conflict(format!("源文件已变化：{}", entry.path)));
+        }
     }
     let mut data = vec![0; length];
     let short_read = |error: std::io::Error| -> AppResult<Vec<u8>> {
@@ -322,12 +324,12 @@ pub async fn read_entry_chunk_with(
             }
         }
     }
-    let after = tokio::fs::metadata(&path).await?;
-    if after.len() != entry.size || modified(&after) != entry.modified_ms {
-        return Err(AppError::Conflict(format!(
-            "读取期间源文件变化：{}",
-            entry.path
-        )));
+    // Check mutations at file boundaries, not after every intermediate chunk.
+    if offset + length as u64 == entry.size {
+        let meta = tokio::fs::metadata(&path).await?;
+        if meta.len() != entry.size || modified(&meta) != entry.modified_ms {
+            return Err(AppError::Conflict(format!("读取期间源文件变化：{}", entry.path)));
+        }
     }
     Ok(data)
 }

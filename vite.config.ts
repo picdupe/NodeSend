@@ -11,6 +11,9 @@ import react from '@vitejs/plugin-react';
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Keep Vite's disposable web bundle separate from distributable installers.
+  // Otherwise a later `npm run build` (including Android builds) clears dist/.
+  build: { outDir: 'frontend-dist' },
   clearScreen: false,
   // Only scan the frontend entry; Rust/Android build directories can contain
   // thousands of generated files and are not frontend dependency entries.

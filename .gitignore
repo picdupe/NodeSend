@@ -1,6 +1,9 @@
 # Node.js / Vite
 node_modules
 dist
+frontend-dist
+**/__pycache__/
+*.py[cod]
 
 # Rust / Tauri
 src-tauri/target

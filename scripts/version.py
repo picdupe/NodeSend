@@ -40,8 +40,9 @@ def replace_one(path: Path, pattern: str, replacement: str, description: str) ->
 
 def sync() -> None:
     version, build, semver, android_code = read_version()
-    # User-facing version label; the semver with a build prerelease stays internal.
-    label = f"v{version}.{build}"
+    # Android's user-visible version must match the Windows release label and
+    # must not expose the internal SemVer build prerelease suffix.
+    label = f"{version}.{build}"
 
     replace_one(ROOT / "package.json", r'("version"\s*:\s*")[^"]+("\s*,)', rf'\g<1>{semver}\2', "package.json version")
     replace_one(ROOT / "package-lock.json", r'("name": "nodesend",\s*"version": ")[^"]+', rf'\g<1>{semver}', "package-lock root version")

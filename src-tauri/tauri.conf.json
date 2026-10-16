@@ -1,14 +1,14 @@
 {
     "$schema":  "https://schema.tauri.app/config/2",
     "productName":  "NodeSend",
-    "version":  "0.1.1-build.95",
+    "version":  "0.1.1-build.104",
     "identifier":  "com.picdupe.nodesend",
     "mainBinaryName":  "nodesend",
     "build":  {
                   "beforeDevCommand":  "npm run dev",
                   "devUrl":  "http://127.0.0.1:1420",
                   "beforeBuildCommand":  "npm run build",
-                  "frontendDist":  "../dist"
+                  "frontendDist":  "../frontend-dist"
               },
     "app":  {
                 "windows":  [

@@ -8,11 +8,43 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-mod commit;
+pub(super) mod commit;
 mod control;
 mod manifest;
 
 impl TransferService {
+    /// Publish one already durable staged file without rescanning the entire manifest.
+    /// The hot path for direct-to-disk reception uses this after each file completes;
+    /// scanning all entries here would make a large folder quadratic.
+    pub(crate) async fn commit_ready_file(&self, id: &str, file: usize) -> AppResult<()> {
+        let task = self.record(id)?;
+        if task.direction != "receive"
+            || task.destination.is_none()
+            || !["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
+            || task.use_cache
+        {
+            return Ok(());
+        }
+        let Some(entry) = task.manifest.entries.get(file) else { return Ok(()); };
+        if entry.directory || task.targets.get(file).and_then(Option::as_ref).is_none() {
+            return Ok(());
+        }
+        let base = task.manifest.file_base(file);
+        let count = entry.size.div_ceil(task.chunk_size) as usize;
+        if !(base..base + count).all(|index| task.completed.contains(&index)) {
+            return Ok(());
+        }
+        let root = PathBuf::from(task.destination.as_deref().unwrap());
+        let stage = paths::stage(&task)?;
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&stage)?;
+            TransferService::commit_staged_file(&task, &root, &stage, file)
+        })
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))??;
+        Ok(())
+    }
+
     /// 将已经完整落到目标盘暂存区的文件逐个发布到最终目录；不等待整个文件夹结束。
     /// 缓存模式以 relay 游标为准，直写模式以持久化的 Chunk 完成记录为准。
     pub(crate) async fn commit_ready_files(&self, id: &str) -> AppResult<()> {
@@ -23,37 +55,54 @@ impl TransferService {
         {
             return Ok(());
         }
-        let root = PathBuf::from(task.destination.as_deref().unwrap());
-        let stage = paths::stage(&task)?;
-        let mut ready = Vec::new();
-        for (file, entry) in task.manifest.entries.iter().enumerate() {
-            if entry.directory || task.targets.get(file).and_then(Option::as_ref).is_none() {
-                continue;
-            }
-            let complete = if task.use_cache {
-                task.relayed.get(file).copied().unwrap_or(0) >= entry.size
-            } else {
-                let base = task.manifest.file_base(file);
-                let count = entry.size.div_ceil(task.chunk_size) as usize;
-                (base..base + count).all(|index| task.completed.contains(&index))
-            };
-            if complete {
-                ready.push(file);
-            }
-        }
-        if ready.is_empty() {
+        // Incremental publication and final commit share one guard. Cancellation
+        // waits for this flag before rolling back already-published files.
+        if !self.begin_commit(id) {
             return Ok(());
         }
-        tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&stage)?;
-            for file in ready {
-                TransferService::commit_staged_file(&task, &root, &stage, file)?;
+        let result = async {
+            let task = self.record(id)?;
+            if task.direction != "receive"
+                || task.destination.is_none()
+                || !["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
+            {
+                return Ok(());
             }
+            let root = PathBuf::from(task.destination.as_deref().unwrap());
+            let stage = paths::stage(&task)?;
+            let mut ready = Vec::new();
+            for (file, entry) in task.manifest.entries.iter().enumerate() {
+                if entry.directory || task.targets.get(file).and_then(Option::as_ref).is_none() {
+                    continue;
+                }
+                let complete = if task.use_cache {
+                    task.relayed.get(file).copied().unwrap_or(0) >= entry.size
+                } else {
+                    let base = task.manifest.file_base(file);
+                    let count = entry.size.div_ceil(task.chunk_size) as usize;
+                    (base..base + count).all(|index| task.completed.contains(&index))
+                };
+                if complete {
+                    ready.push(file);
+                }
+            }
+            if ready.is_empty() {
+                return Ok(());
+            }
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&stage)?;
+                for file in ready {
+                    TransferService::commit_staged_file(&task, &root, &stage, file)?;
+                }
+                Ok::<(), AppError>(())
+            })
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))??;
             Ok::<(), AppError>(())
-        })
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))??;
-        Ok(())
+        }
+        .await;
+        self.finish_commit(id);
+        result
     }
 
     /// 接收一段清单分片：逐片写入 `task_entries`（边收边落库，不驻留内存），返回确认。

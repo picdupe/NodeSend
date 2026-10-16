@@ -75,11 +75,15 @@ struct FileBuffer {
     /// 直写模式复用的目标文件句柄（与 `TransferService::receive_files` 共享）；
     /// 缓存模式为 `None`（缓存分段按块开、写、关，不留长期句柄）。
     handle: Option<Arc<AsyncMutex<tokio::fs::File>>>,
-    /// 直写模式预分配的完整文件大小。
-    expected_size: u64,
     /// 是否缓存中转模式。
     use_cache: bool,
+    /// 直写模式中已经写出但尚未同步到稳定存储的块；只有 sync 成功后才确认完成。
+    dirty: Vec<(String, usize, u64)>,
+    dirty_bytes: u64,
 }
+
+const DIRECT_SYNC_BYTES: u64 = 32 * 1024 * 1024;
+const DIRECT_SYNC_FILES: usize = 8;
 
 /// 任务是否处于可写入状态（供转写调度等「是否继续推进」判定使用）。
 pub(crate) fn writable(status: &str) -> bool {
@@ -202,7 +206,6 @@ impl Writer {
             let end = offset + chunk.data.len() as u64;
             let use_cache = buffer.use_cache;
             let handle = buffer.handle.clone();
-            let expected_size = buffer.expected_size;
             if use_cache {
                 // 缓存模式：写缓存盘分段并 sync，目标盘不参与传输过程。
                 if !store_cached(service, &chunk).await? {
@@ -210,20 +213,22 @@ impl Writer {
                 }
             } else {
                 let mut file = handle.as_ref().expect("直写模式必有目标句柄").lock().await;
-                if file.metadata().await?.len() != expected_size {
-                    file.set_len(expected_size).await?;
-                }
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
                 file.write_all(&chunk.data).await?;
-                file.sync_data().await?;
+                buffer.dirty.push((chunk.task_id.clone(), chunk.index, chunk.data.len() as u64));
+                buffer.dirty_bytes = buffer.dirty_bytes.saturating_add(chunk.data.len() as u64);
             }
             if buffer.next_offset < end {
                 buffer.next_offset = end;
             }
             // 落盘（缓存盘 sync）成功后才记录完成 —— 中断恢复安全的唯一依据。
             // 增量写入：只推进该块与汇总标量，不重写整份清单/进度。
-            service.mark_chunk_done(&chunk.task_id, chunk.index, chunk.data.len() as u64)?;
-            discard_one(service, &chunk.task_id, chunk.index);
+            if use_cache {
+                service.mark_chunk_done(&chunk.task_id, chunk.index, chunk.data.len() as u64)?;
+                discard_one(service, &chunk.task_id, chunk.index);
+            } else if self.direct_sync_due() {
+                self.sync_direct(service).await?;
+            }
             if !use_cache {
                 let task = service.record(&chunk.task_id)?;
                 let complete = task.manifest.entries.get(chunk.file).is_some_and(|entry| {
@@ -240,11 +245,35 @@ impl Writer {
                             discard_one(service, &pending.task_id, pending.index);
                         }
                     }
-                    service.commit_ready_files(&chunk.task_id).await?;
+                    service.commit_ready_file(&chunk.task_id, chunk.file).await?;
                     return Ok(());
                 }
             }
         }
+    }
+
+    fn direct_sync_due(&self) -> bool {
+        let mut bytes = 0u64;
+        let mut dirty_files = 0usize;
+        for buffer in self.files.values().filter(|buffer| !buffer.use_cache) {
+            if !buffer.dirty.is_empty() {
+                dirty_files += 1;
+                bytes = bytes.saturating_add(buffer.dirty_bytes);
+            }
+        }
+        bytes >= DIRECT_SYNC_BYTES || dirty_files >= DIRECT_SYNC_FILES
+    }
+
+    async fn sync_direct(&mut self, service: &Arc<TransferService>) -> AppResult<()> {
+        for buffer in self.files.values_mut().filter(|buffer| !buffer.use_cache && !buffer.dirty.is_empty()) {
+            buffer.handle.as_ref().expect("直写模式必有目标句柄").lock().await.sync_data().await?;
+            for (task_id, index, length) in std::mem::take(&mut buffer.dirty) {
+                service.mark_chunk_done(&task_id, index, length)?;
+                discard_one(service, &task_id, index);
+            }
+            buffer.dirty_bytes = 0;
+        }
+        Ok(())
     }
 
     /// 巡检：任务进入终态则丢弃其未落盘块；否则重试排空（触发缺口超时降级）。
@@ -260,6 +289,9 @@ impl Writer {
                     for chunk in buffer.ready.values() {
                         discard_one(service, &chunk.task_id, chunk.index);
                     }
+                    for (task_id, index, _) in buffer.dirty {
+                        discard_one(service, &task_id, index);
+                    }
                 }
                 continue;
             }
@@ -269,6 +301,41 @@ impl Writer {
                 fail_task(service, &key.0, &err);
             }
         }
+        if let Err(err) = self.sync_direct(service).await {
+            tracing::error!("接收端批量刷盘失败: {err}");
+            for (task_id, _) in self.files.keys() {
+                fail_task(service, task_id, &err);
+            }
+        }
+        for key in self.files.keys().cloned().collect::<Vec<_>>() {
+            if let Err(err) = self.commit_if_complete(service, &key).await {
+                tracing::error!(task = %key.0, "接收文件提交失败: {err}");
+                self.files.remove(&key);
+                fail_task(service, &key.0, &err);
+            }
+        }
+    }
+
+    async fn commit_if_complete(
+        &mut self,
+        service: &Arc<TransferService>,
+        key: &(String, usize),
+    ) -> AppResult<()> {
+        let Some(buffer) = self.files.get(key) else { return Ok(()); };
+        if buffer.use_cache || !buffer.dirty.is_empty() || !buffer.ready.is_empty() {
+            return Ok(());
+        }
+        let task = service.record(&key.0)?;
+        let complete = task.manifest.entries.get(key.1).is_some_and(|entry| {
+            let base = task.manifest.file_base(key.1);
+            let count = entry.size.div_ceil(task.chunk_size) as usize;
+            (base..base + count).all(|index| task.completed.contains(&index))
+        });
+        if complete {
+            self.files.remove(key);
+            service.commit_ready_file(&key.0, key.1).await?;
+        }
+        Ok(())
     }
 }
 
@@ -342,8 +409,9 @@ async fn open_buffer(
             next_offset,
             gap_since: None,
             handle: None,
-            expected_size,
             use_cache: true,
+            dirty: Vec::new(),
+            dirty_bytes: 0,
         });
     }
     let stage = service.stage_dir(id)?;
@@ -366,13 +434,20 @@ async fn open_buffer(
             handle
         }
     };
+    {
+        let opened = handle.lock().await;
+        if opened.metadata().await?.len() != expected_size {
+            opened.set_len(expected_size).await?;
+        }
+    }
     Ok(FileBuffer {
         ready: BTreeMap::new(),
         next_offset,
         gap_since: None,
         handle: Some(handle),
-        expected_size,
         use_cache: false,
+        dirty: Vec::new(),
+        dirty_bytes: 0,
     })
 }
 

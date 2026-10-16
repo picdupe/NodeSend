@@ -60,8 +60,15 @@ android {
             )
         }
     }
+    // The Android build runs on JDK 21. Use the supported Java 17 language
+    // level explicitly instead of AGP's legacy Java 8 defaults, which trigger
+    // javac's "source/target value 8 is obsolete" warnings on newer JDKs.
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
     kotlinOptions {
-        jvmTarget = "1.8"
+        jvmTarget = "17"
     }
     buildFeatures {
         buildConfig = true

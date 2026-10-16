@@ -81,8 +81,9 @@ pub(crate) const SLOW_REQUEST_WARN: Duration = Duration::from_secs(5);
 
 // --- 接收端与写盘 ---
 
-/// 写队列容量（块）。4 MiB × 16 ≈ 64 MiB/任务。
-pub(crate) const QUEUE_CHUNKS: usize = 16;
+/// 写队列容量（块）。4 MiB × 64 ≈ 256 MiB/任务；小文件场景减少网络侧
+/// 因写入器短暂忙碌产生的往返停顿，同时仍保持有界内存。
+pub(crate) const QUEUE_CHUNKS: usize = 64;
 /// 队列满时等待空间的上限（等待期间不持有任务锁）。
 pub(crate) const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// 顺序写等待缺口的上限；超过则降级为乱序写，避免永久等待。

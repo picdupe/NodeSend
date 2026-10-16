@@ -83,7 +83,7 @@ path.parent.mkdir(parents=True, exist_ok=True)
 version = os.environ["NODESEND_MANIFEST_VERSION"]
 platform = os.environ["NODESEND_MANIFEST_PLATFORM"]
 
-manifest = {"version": version, "notes": "优化机械盘传输及大文件夹传输", "platforms": {}}
+manifest = {"version": version, "platforms": {}}
 if path.exists():
     try:
         existing = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -96,8 +96,6 @@ if path.exists():
         manifest["platforms"].update(platforms)
         if "android" in existing:
             manifest["android"] = existing["android"]
-        if isinstance(existing.get("notes"), str):
-            manifest["notes"] = existing["notes"]
         print(f"Merging updater manifest for existing version/build: {version}")
 
 manifest["platforms"][platform] = {
