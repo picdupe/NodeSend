@@ -334,13 +334,14 @@ async fn connect_quic(
         _connection: Some(connection),
     })
 }
-pub async fn hello(channel: &mut Channel, app: &AppService) -> AppResult<(String, u16, u16)> {
+pub async fn hello(channel: &mut Channel, app: &AppService) -> AppResult<(String, String, u16, u16)> {
     match channel
         .request(&Request::Hello {
             // Match the protocol version used by the committed GitHub build.
             version: protocol::VERSION,
             node_id: app.identity.node_id.clone(),
             display_name: display_name(app),
+            device_type: local_device_type().into(),
         })
         .await?
     {
@@ -348,13 +349,29 @@ pub async fn hello(channel: &mut Channel, app: &AppService) -> AppResult<(String
             version,
             node_id,
             display_name,
+            device_type,
             tcp_port,
             quic_port,
         } if version == protocol::VERSION && node_id == channel.peer_id => {
-            Ok((display_name, tcp_port, quic_port))
+            Ok((display_name, device_type, tcp_port, quic_port))
         }
         _ => Err(AppError::Forbidden("Node 身份或协议版本不匹配".into())),
     }
+}
+
+fn local_device_type() -> &'static str {
+    #[cfg(target_os = "android")]
+    { "android" }
+    #[cfg(target_os = "ios")]
+    { "ios" }
+    #[cfg(target_os = "windows")]
+    { "windows" }
+    #[cfg(target_os = "macos")]
+    { "macos" }
+    #[cfg(target_os = "linux")]
+    { "linux" }
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "windows", target_os = "macos", target_os = "linux")))]
+    { "unknown" }
 }
 #[cfg(target_os = "windows")]
 fn windows_device_name() -> Option<String> {
@@ -667,16 +684,17 @@ async fn session(
         );
         error
     })?;
-    let peer_name = match request {
+    let (peer_name, peer_device_type) = match request {
         Request::Hello {
             version,
             node_id,
             display_name,
+            device_type,
         } if version == protocol::VERSION
             && node_id == channel.peer_id
             && display_name.len() <= 128 =>
         {
-            display_name
+            (display_name, device_type)
         }
         _ => return Err(AppError::Forbidden("无效 HELLO".into())),
     };
@@ -686,6 +704,7 @@ async fn session(
             version: protocol::VERSION,
             node_id: transfers.app.identity.node_id.clone(),
             display_name: display_name(&transfers.app),
+            device_type: local_device_type().into(),
             tcp_port,
             quic_port,
         },
@@ -872,7 +891,7 @@ async fn session(
             }
             other => {
                 transfers
-                    .control(&channel.peer_id, &peer_name, other, channel.kind)
+                    .control(&channel.peer_id, &peer_name, &peer_device_type, other, channel.kind)
                     .await
             }
         };

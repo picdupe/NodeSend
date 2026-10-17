@@ -198,29 +198,39 @@ fn init_tracing() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
 
-    // Windows 默认位于 %APPDATA%\NodeSend\logs\nodesend.log。
-    // 使用 dirs 获取平台数据目录，避免把用户目录或盘符硬编码进程序。
-    if let Some(data_dir) = dirs::data_dir() {
-        let log_dir = data_dir.join("NodeSend").join("logs");
-        let log_path = log_dir.join("nodesend.log");
-        if std::fs::create_dir_all(&log_dir).is_ok() {
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                let _ = fmt()
-                    .with_env_filter(filter)
-                    .with_ansi(false)
-                    .with_writer(move || file.try_clone().expect("克隆 NodeSend 日志文件句柄失败"))
-                    .try_init();
-                return;
-            }
-        }
+    // Keep live output in the console window when running a debug build.
+    #[cfg(debug_assertions)]
+    {
+        let _ = fmt().with_env_filter(filter).try_init();
+        return;
     }
 
-    // 日志目录不可用时保留控制台输出，避免日志初始化失败导致应用无法启动。
-    let fallback_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
-    let _ = fmt().with_env_filter(fallback_filter).try_init();
+    #[cfg(not(debug_assertions))]
+    {
+        // Windows 默认位于 %APPDATA%\NodeSend\logs\nodesend.log。
+        // 使用 dirs 获取平台数据目录，避免把用户目录或盘符硬编码进程序。
+        if let Some(data_dir) = dirs::data_dir() {
+            let log_dir = data_dir.join("NodeSend").join("logs");
+            let log_path = log_dir.join("nodesend.log");
+            if std::fs::create_dir_all(&log_dir).is_ok() {
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = fmt()
+                        .with_env_filter(filter)
+                        .with_ansi(false)
+                        .with_writer(move || file.try_clone().expect("克隆 NodeSend 日志文件句柄失败"))
+                        .try_init();
+                    return;
+                }
+            }
+        }
+
+        // 日志目录不可用时保留控制台输出，避免日志初始化失败导致应用无法启动。
+        let fallback_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
+        let _ = fmt().with_env_filter(fallback_filter).try_init();
+    }
 }

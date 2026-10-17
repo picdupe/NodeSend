@@ -170,7 +170,7 @@ impl NetworkManager {
             {
                 Ok(mut channel) => {
                     let handshake = transport::hello(&mut channel, &self.app).await;
-                    let (channel, (name, tcp_port, quic_port)) = match handshake {
+                    let (channel, (name, _device_type, tcp_port, quic_port)) = match handshake {
                         Ok(result) => (channel, result),
                         Err(error) if channel.kind == "quic" => {
                             tracing::warn!(
@@ -321,7 +321,7 @@ impl NetworkManager {
                 } => result,
             };
             match result {
-                Ok(((name, tcp_port, quic_port), channel)) => {
+                Ok(((name, _device_type, tcp_port, quic_port), channel)) => {
                     // 对方证书里的 Node ID 与本机相同：两台设备共用了一份身份
                     // （复制过 %APPDATA%\NodeSend 或指向同一应用数据目录）。
                     // 这种情况必须立刻报错，否则界面会一直停在"连接检测"。

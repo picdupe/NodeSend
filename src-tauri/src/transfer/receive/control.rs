@@ -10,6 +10,7 @@ impl TransferService {
         &self,
         peer: &str,
         name: &str,
+        device_type: &str,
         request: Request,
         transport: &str,
     ) -> AppResult<Response> {
@@ -51,7 +52,7 @@ impl TransferService {
                 }
                 Ok(Response::Ack)
             }
-            Request::Offer { id, summary } => self.offer(peer, name, &id, summary, transport).await,
+            Request::Offer { id, summary } => self.offer(peer, name, device_type, &id, summary, transport).await,
             Request::Reconnect { id } => {
                 let id = super::super::model::incoming_id(peer, &id);
                 let gate = self.gate(&id);

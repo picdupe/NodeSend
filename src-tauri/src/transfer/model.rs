@@ -466,6 +466,8 @@ pub struct TaskRecord {
     pub wire_id: String,
     pub peer_id: String,
     pub peer_name: String,
+    #[serde(default)]
+    pub peer_device_type: String,
     pub direction: String,
     pub status: String,
     /// 顶层来源映射（名称 → 规范化绝对路径）。条目路径在读取时按其顶层名拼接，
@@ -627,6 +629,7 @@ impl TaskRecord {
             id: self.id.clone(),
             peer_id: self.peer_id.clone(),
             peer_name: self.peer_name.clone(),
+            peer_device_type: self.peer_device_type.clone(),
             direction: self.direction.clone(),
             status: self.status.clone(),
             scan_complete: self.scan_complete,
@@ -650,6 +653,7 @@ pub struct TaskSnapshot {
     pub id: String,
     pub peer_id: String,
     pub peer_name: String,
+    pub peer_device_type: String,
     pub direction: String,
     pub status: String,
     pub scan_complete: bool,

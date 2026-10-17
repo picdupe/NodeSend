@@ -10,6 +10,7 @@ const paths = {
   app: 'M5 4h14v16H5V4Zm4 4h2m2 0h2M9 12h2m2 0h2M9 16h6',
   clipboard: 'M9 4h6v3H9V4Zm-3 2H4v14h16V6h-2M8 12h8m-8 4h5',
   device: 'M3 4h18v12H3V4Zm5 16h8m-4-4v4',
+  phone: 'M8 2h8a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm0 3v13h8V5H8Zm3 15h2',
   settings: 'M4 7h16M4 17h16M8 4v6m8 4v6',
   shield: 'M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6l-9-4Zm-4 10 3 3 5-6',
   plus: 'M12 5v14M5 12h14',

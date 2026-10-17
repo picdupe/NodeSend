@@ -1239,6 +1239,7 @@ impl TransferService {
             wire_id,
             peer_id,
             peer_name,
+            peer_device_type: String::new(),
             direction: "send".into(),
             status: "queued".into(),
             sources,

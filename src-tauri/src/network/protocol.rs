@@ -114,6 +114,8 @@ pub enum Request {
         version: u16,
         node_id: String,
         display_name: String,
+        #[serde(default)]
+        device_type: String,
     },
     /// 建立/复用接收任务：只带清单摘要与指纹，返 `Ready` 表示需继续接收分片清单。
     Offer {
@@ -190,6 +192,8 @@ pub enum Response {
         version: u16,
         node_id: String,
         display_name: String,
+        #[serde(default)]
+        device_type: String,
         tcp_port: u16,
         quic_port: u16,
     },
