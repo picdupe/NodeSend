@@ -412,7 +412,16 @@ impl NetworkManager {
         }
         self.transfers
             .decide(&id, accepted, destination, conflict, selected)
-            .await
+            .await?;
+        let task = self.transfers.record(&id)?;
+        if task.direction == "receive" {
+            self.spawn_state_sync(
+                id,
+                if accepted { "resumed" } else { "rejected" }.into(),
+                task.state_revision,
+            );
+        }
+        Ok(())
     }
     pub async fn decide_and_trust(
         &self,
@@ -449,8 +458,17 @@ impl NetworkManager {
             return Ok(());
         }
         self.transfers.action(&id, &action).await?;
+        let task = self.transfers.record(&id)?;
+        if ["pause", "resume", "retry", "cancel"].contains(&action.as_str()) {
+            let status = match action.as_str() {
+                "pause" => "paused",
+                "cancel" => "cancelled",
+                _ => "resumed",
+            };
+            self.spawn_state_sync(id.clone(), status.into(), task.state_revision);
+        }
         if ["resume", "retry"].contains(&action.as_str())
-            && self.transfers.record(&id)?.direction == "send"
+            && task.direction == "send"
         {
             let service = self.transfers.clone();
             let peers = self.peers.clone();
@@ -462,27 +480,72 @@ impl NetworkManager {
                     service.start_task(peers, id);
                 }
             });
-        } else if action == "cancel" && self.transfers.record(&id)?.direction == "send" {
-            let task = self.transfers.record(&id)?;
-            let app = self.app.clone();
-            let peer = self.peers.get(&task.peer_id)?;
-            tokio::spawn(async move {
-                for ep in peer.endpoints {
-                    if let Ok(mut channel) =
-                        transport::connect(&app, &ep, Some(&task.peer_id), false, task.allow_public)
-                            .await
-                    {
-                        if transport::hello(&mut channel, &app).await.is_ok() {
-                            let _ = channel
-                                .request(&protocol::Request::Cancel { id: task.wire_id })
-                                .await;
-                        }
-                        break;
-                    }
-                }
-            });
         }
         Ok(())
+    }
+    fn spawn_state_sync(&self, id: String, status: String, revision: u64) {
+        let service = self.transfers.clone();
+        let app = self.app.clone();
+        let peers = self.peers.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_millis(300);
+            loop {
+                if service.shutdown.is_cancelled() {
+                    return;
+                }
+                let Ok(current) = service.record(&id) else { return };
+                if current.state_revision != revision
+                    || current.status == "completed"
+                    || (current.status == "rejected" && status != "rejected")
+                    || (status != "cancelled" && current.status == "cancelled")
+                {
+                    return;
+                }
+                if let Ok(peer) = peers.get(&current.peer_id) {
+                    for endpoint in peer.endpoints {
+                        let Ok(mut channel) = transport::connect(
+                            &app,
+                            &endpoint,
+                            Some(&current.peer_id),
+                            false,
+                            current.allow_public,
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
+                        if transport::hello(&mut channel, &app).await.is_err() {
+                            continue;
+                        }
+                        if matches!(
+                            channel
+                                .request(&protocol::Request::TaskState {
+                                    id: current.wire_id.clone(),
+                                    revision,
+                                    status: status.clone(),
+                                })
+                                .await,
+                            Ok(protocol::Response::Ack)
+                        ) {
+                            if status == "cancelled" {
+                                let _ = channel
+                                    .request(&protocol::Request::Cancel {
+                                        id: current.wire_id.clone(),
+                                    })
+                                    .await;
+                            }
+                            tracing::info!(task = %id, revision, %status, "对端已确认任务状态");
+                            return;
+                        }
+                    }
+                }
+                tokio::select! {
+                    _ = service.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        });
     }
     pub fn settings(&self, name: String, directory: String, cache_directory: String, policy: String) -> AppResult<()> {
         if name.trim().is_empty()

@@ -155,6 +155,19 @@ pub enum Request {
     Cancel {
         id: String,
     },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    /// Task state control plane. Sent only when state changes; retried while
+    /// the task remains live if the peer is temporarily unreachable.
+    TaskState {
+        id: String,
+        revision: u64,
+        status: String,
+    },
     Browse {
         share_id: Option<String>,
         path: String,

@@ -47,6 +47,7 @@ impl TransferService {
 
     /// 将已经完整落到目标盘暂存区的文件逐个发布到最终目录；不等待整个文件夹结束。
     /// 缓存模式以 relay 游标为准，直写模式以持久化的 Chunk 完成记录为准。
+    #[allow(dead_code)]
     pub(crate) async fn commit_ready_files(&self, id: &str) -> AppResult<()> {
         let task = self.record(id)?;
         if task.direction != "receive"
@@ -120,7 +121,7 @@ impl TransferService {
         // Metadata continues to arrive after an early user decision; terminal
         // tasks ignore retries, while accepted tasks extend their target plan.
         let status = self.status_of(&id)?;
-        if !["waiting", "accepted", "transferring", "paused"].contains(&status.as_str()) {
+        if !["waiting", "accepted", "transferring", "paused", "remote_paused"].contains(&status.as_str()) {
             tracing::info!(task = %id, first, status = %status, "清单分片已到，但任务已处于终态，直接确认");
             return Ok(Response::ManifestAck);
         }
@@ -318,6 +319,8 @@ impl TransferService {
                 Ok(())
             })?;
             self.persist(task)?;
+            drop(map);
+            self.extend_cache_plan(&id, first)?;
             log_manifest_chunk(&id, first, entries.len(), started.elapsed(), true);
             return Ok(Response::ManifestAck);
         }

@@ -27,11 +27,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-
-/// 启动转写的触发线：缓存中已 sync 的字节达到该值即启动转写任务。
-/// **这是触发线，不是上限**；小文件全部收齐时也立即触发。
-pub(crate) const START_RELAY_BYTES: u64 = crate::tuning::RELAY_START_BYTES;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 
 /// 缓存分段大小。见 [`crate::tuning::RELAY_SEGMENT_BYTES`]。
 pub(crate) const SEG_BYTES: u64 = crate::tuning::RELAY_SEGMENT_BYTES;
@@ -155,7 +151,7 @@ fn candidate(state: &RelayState) -> bool {
 
 /// 转写触发条件：缓存中已 sync 的字节 ≥ [`START_RELAY_BYTES`]，或全部块已收齐/跳过。
 fn trigger(state: &RelayState) -> bool {
-    state.completed_count >= state.chunk_count || state.completed_bytes >= START_RELAY_BYTES
+    state.completed_count >= state.chunk_count || state.completed_bytes > 0
 }
 
 /// 转写是否已全部完成（直写模式或未选中的文件视为已完成）。
@@ -194,7 +190,10 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
         // 一个文件尽量连续写完再换下一个，避免在机械盘上多文件交错写入造成寻道。
         // 只有该文件所需块尚未到达缓存（阻塞）时才换到下一个文件。
         for (file, entry) in plan.entries.iter().enumerate() {
-            if entry.directory || plan.targets.get(file).and_then(Option::as_ref).is_none() {
+            if !plan.cache_files.contains(&file)
+                || entry.directory
+                || plan.targets.get(file).and_then(Option::as_ref).is_none()
+            {
                 continue;
             }
             let mut done = service.relayed_at(id, file);
@@ -203,10 +202,6 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
                     return Ok(());
                 }
                 if done >= entry.size {
-                    // The target-side staging file has been synced by
-                    // relay_file_step. Publish this file now instead of
-                    // waiting for the final file in the folder.
-                    service.commit_ready_files(id).await?;
                     break;
                 }
                 match relay_file_step(service, &plan, &cache_root, id, file, entry.size, done)
@@ -215,9 +210,6 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
                     Some(next) => {
                         done = next;
                         progressed = true;
-                        if done >= entry.size {
-                            service.commit_ready_files(id).await?;
-                        }
                     }
                     None => break, // 所需块未到，先处理下一个文件，下一轮再回来
                 }
@@ -244,6 +236,26 @@ async fn relay_file_step(
     size: u64,
     done: u64,
 ) -> AppResult<Option<u64>> {
+    let destination = Path::new(
+        plan.targets
+            .get(file)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| AppError::NotFound("缓存文件目标路径不存在".into()))?,
+    );
+    let root = service.record(id)?.destination.ok_or_else(|| AppError::NotFound("接收目录不存在".into()))?;
+    paths::ensure_under(Path::new(&root), destination)?;
+    if done >= size {
+        let metadata = tokio::fs::metadata(destination).await?;
+        if metadata.len() == size {
+            service.set_relayed(id, file, size)?;
+            let assembled = paths::cache_file(cache_root, id, file);
+            let _ = std::fs::remove_file(assembled);
+            for segment in 0..size.div_ceil(SEG_BYTES) {
+                let _ = std::fs::remove_file(paths::cache_segment(cache_root, id, file, segment));
+            }
+            return Ok(Some(size));
+        }
+    }
     let seg_end = ((done / SEG_BYTES + 1) * SEG_BYTES).min(size);
     let chunk_size = plan.chunk_size;
     let base = plan.bases[file];
@@ -252,9 +264,9 @@ async fn relay_file_step(
     if !service.is_completed(id, first) {
         return Ok(None);
     }
-    let part = service.stage_dir(id)?.join(format!("{file}.part"));
-    paths::ensure_plain(&part)?;
-    if let Some(parent) = part.parent() {
+    let assembled = paths::cache_file(cache_root, id, file);
+    paths::ensure_plain(&assembled)?;
+    if let Some(parent) = assembled.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut handle = tokio::fs::OpenOptions::new()
@@ -262,8 +274,27 @@ async fn relay_file_step(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&part)
+        .open(&assembled)
         .await?;
+    // A pause/restart can leave the destination staging file from the older
+    // relay implementation while the cache-side assembled file is absent.
+    // Seed the cache file from that durable prefix so resume does not attempt
+    // to read a deleted segment from offset zero.
+    if done > 0 && handle.metadata().await?.len() < done {
+        if let Ok(source) = tokio::fs::File::open(destination).await {
+            let available = source.metadata().await?.len().min(done);
+            if available > 0 {
+                let mut seeded = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(&assembled)
+                    .await?;
+                seeded.set_len(0).await?;
+                tokio::io::copy(&mut source.take(available), &mut seeded).await?;
+                seeded.sync_data().await?;
+            }
+        }
+    }
     // 崩溃后目标文件可能比已记录的进度更长（写入成功但进度未保存）：
     // 回退到已 sync 的进度点，保证「达到初始长度」与「内容正确」一致。
     if handle.metadata().await?.len() > done {
@@ -277,30 +308,57 @@ async fn relay_file_step(
         }
         let len = chunk_size.min(size - offset) as usize;
         let seg_path = paths::cache_segment(cache_root, id, file, offset / SEG_BYTES);
-        let data = read_segment(&seg_path, offset % SEG_BYTES, len).await?;
+        let data = match read_segment(&seg_path, offset % SEG_BYTES, len).await {
+            Ok(data) => data,
+            Err(error) if matches!(&error, AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) => {
+                // The final destination file is a durable fallback for files
+                // interrupted during a relay upgrade or pause/resume cycle.
+                let Ok(mut source) = tokio::fs::File::open(destination).await else {
+                    tracing::debug!(task = %id, file, offset, path = %seg_path.display(), "缓存分段尚未可读，稍后重试");
+                    return Ok(None);
+                };
+                source.seek(std::io::SeekFrom::Start(offset)).await?;
+                let mut data = vec![0u8; len];
+                tokio::io::AsyncReadExt::read_exact(&mut source, &mut data).await?;
+                data
+            }
+            Err(error) => return Err(error),
+        };
         handle.seek(std::io::SeekFrom::Start(offset)).await?;
         handle.write_all(&data).await?;
         offset += len as u64;
     }
     handle.sync_data().await?;
     drop(handle);
-    // sync 成功后记录转写进度：这是崩溃后唯一可信的回退点（增量写 `task_relay`）。
+    if offset >= size {
+        // Cache mode publishes directly to the final target. The cache-side
+        // relay cursor is the recovery record; no destination `.part` or
+        // per-chunk target marker is involved.
+        paths::ensure_plain(destination)?;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let output = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(destination)
+            .await?;
+        let input = tokio::fs::File::open(&assembled).await?;
+        let mut input = BufReader::with_capacity(1024 * 1024, input);
+        let mut output = BufWriter::with_capacity(1024 * 1024, output);
+        tokio::io::copy(&mut input, &mut output).await?;
+        output.flush().await?;
+        drop(output);
+        let _ = std::fs::remove_file(&assembled);
+        for segment in 0..size.div_ceil(SEG_BYTES) {
+            let _ = std::fs::remove_file(paths::cache_segment(cache_root, id, file, segment));
+        }
+    }
+    // The progress marker is written only after the cache file and, for a
+    // complete file, the destination staging copy are durable.
     service.set_relayed(id, file, offset)?;
-    // 释放已转写的缓存分段（Windows 上靠分段才能回收已写过的前缀）。
-    for segment in fully_consumed(done, size)..fully_consumed(offset, size) {
-        let _ = std::fs::remove_file(paths::cache_segment(cache_root, id, file, segment));
-    }
     Ok(Some(offset))
-}
-
-/// 已完全转写（可删除）的缓存分段数量。
-fn fully_consumed(offset: u64, size: u64) -> u64 {
-    let whole = offset / SEG_BYTES;
-    if offset >= size && size % SEG_BYTES != 0 {
-        whole + 1
-    } else {
-        whole
-    }
 }
 
 /// 从缓存分段文件的指定偏移读取一块数据。

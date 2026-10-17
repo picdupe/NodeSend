@@ -229,6 +229,13 @@ pub fn cache_segment(cache_root: &Path, task_id: &str, file: usize, segment: u64
     cache_task(cache_root, task_id).join(format!("{file}.{segment}.seg"))
 }
 
+/// Completed file assembled on the cache volume before it is copied to the
+/// destination volume. Keeping this separate from the destination `.part`
+/// prevents the mechanical disk from seeing network-sized writes.
+pub fn cache_file(cache_root: &Path, task_id: &str, file: usize) -> PathBuf {
+    cache_task(cache_root, task_id).join(format!("{file}.file"))
+}
+
 /// 两个路径是否位于同一卷（同卷说明缓存与目标共用一块盘，中转只会加倍 I/O，
 /// 调用方据此回退为直写）。
 pub fn same_volume(a: &Path, b: &Path) -> bool {

@@ -45,7 +45,7 @@ impl TransferService {
                 existing_status = "accepted".into();
             }
             if !received {
-                if ["accepted", "transferring", "paused", "interrupted"].contains(&existing_status.as_str()) {
+                if ["accepted", "transferring", "paused", "remote_paused", "interrupted"].contains(&existing_status.as_str()) {
                     let recovered_count = existing.manifest.entries.len();
                     if recovered_count != existing.file_count {
                         self.update_scan_progress(
@@ -117,6 +117,10 @@ impl TransferService {
             relay_target_bytes: 0,
             skipped_bytes: 0,
             skipped_paths: vec![],
+            cache_files: std::collections::BTreeSet::new(),
+            resume_requested: false,
+            state_revision: 0,
+            remote_state_revision: 0,
             digest: summary.digest,
             top_level_fingerprint: summary.top_level_fingerprint,
             scan_last_seq: 0,
@@ -199,7 +203,7 @@ impl TransferService {
     ) -> AppResult<Response> {
         let id = incoming_id(peer, wire);
         let initial_status = self.status_of(&id)?;
-        if !["waiting", "accepted", "transferring", "paused"].contains(&initial_status.as_str()) {
+        if !["waiting", "accepted", "transferring", "paused", "remote_paused"].contains(&initial_status.as_str()) {
             return self.remote_state(&id);
         }
         let task = self.record(&id)?;
@@ -207,21 +211,33 @@ impl TransferService {
         let actual_total_size = task.manifest.total();
         let actual_digest = task.manifest.digest();
         if file_count != actual_file_count || total_size != actual_total_size {
-            return Err(AppError::Conflict("清单最终计数与实际条目不一致".into()));
+            // Streaming senders may finish the scan while the durable sender
+            // snapshot still contains the top-level summary. The received
+            // entries are already persisted and their digest is checked below,
+            // so use those authoritative values instead of aborting cache
+            // planning on a stale count/size frame.
+            tracing::warn!(
+                task = %id,
+                announced_files = file_count,
+                actual_files = actual_file_count,
+                announced_bytes = total_size,
+                actual_bytes = actual_total_size,
+                "清单结束帧摘要落后于已接收清单，使用接收端实际值"
+            );
         }
         if digest != actual_digest || (!task.digest.is_empty() && task.digest != digest) {
             return Err(AppError::Conflict("文件清单校验失败（指纹不一致）".into()));
         }
         task.manifest.validate()?;
         self.edit(&id, |record| {
-            record.file_count = file_count;
+            record.file_count = actual_file_count;
             record.directory_count = record
                 .manifest
                 .entries
                 .iter()
                 .filter(|entry| entry.directory)
                 .count();
-            record.total_size = total_size;
+            record.total_size = actual_total_size;
             record.chunk_count = record.manifest.chunk_count();
             record.digest = digest.clone();
             record.scan_complete = true;
@@ -238,6 +254,11 @@ impl TransferService {
                 self.auto_accept_if_trusted(peer, &id).await;
             }
         }
+        // Trusted devices may be accepted as soon as the top-level entries
+        // arrive. Rebuild the file-level cache plan now that the complete
+        // manifest is available; otherwise only directory entries were seen
+        // and all payload files would fall back to direct writes.
+        self.refresh_cache_plan(&id)?;
         self.remote_state(&id)
     }
 }

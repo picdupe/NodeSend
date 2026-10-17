@@ -383,6 +383,7 @@ pub fn install_update(
     network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
     confirmed: bool,
 ) -> Result<(), String> {
+    tracing::info!(confirmed, "收到桌面更新安装请求");
     if !confirmed {
         return Err("需要用户确认后才能安装更新。".into());
     }
@@ -393,6 +394,7 @@ pub fn install_update(
         )
     });
     if active {
+        tracing::warn!("更新安装被阻止：仍有活动传输任务");
         return Err("当前仍有传输任务，请完成或暂停传输后再安装更新。".into());
     }
     let mut current = pending
@@ -408,9 +410,14 @@ pub fn install_update(
             .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
         return Err("更新尚未下载完成。".into());
     };
+    tracing::info!(bytes = bytes.len(), "已下载更新包，开始启动安装程序");
     match current.update.install(&bytes) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            tracing::info!("更新安装程序已启动");
+            Ok(())
+        }
         Err(error) => {
+            tracing::error!(%error, "启动更新安装程序失败");
             current.downloaded = Some(bytes);
             *pending
                 .0

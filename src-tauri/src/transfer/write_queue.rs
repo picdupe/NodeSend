@@ -97,7 +97,7 @@ pub(crate) fn writable(status: &str) -> bool {
 /// 「仍有未提交 Chunk」。暂停期间 `receive_chunk` 已拒绝新块，因此不会新增。
 /// 只有取消 / 拒绝 / 完成等终态才放弃这些块。
 fn abandon(status: &str) -> bool {
-    ["cancelled", "rejected", "completed"].contains(&status)
+    ["cancelling", "cancelled", "rejected", "completed"].contains(&status)
 }
 
 /// 取已登记的共享文件句柄（复用任务运行期资源里的句柄，避免重复 open）。

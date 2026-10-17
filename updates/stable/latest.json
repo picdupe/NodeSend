@@ -1,22 +1,13 @@
 {
-  "version": "0.1.2-build.110",
-  "platforms": {
-    "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0wzMkJBMDNSVS9HTytnWUszeDZIT1ZhMnlnOXhCUTFMRlpEODBoSnIrUitBdDNOeXh6WWIzY2Y1Z1ZNbUdZWlBLNWhZSVJIN1BkaW1QVHpueGVrMFFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjQ3MjEwCWZpbGU6Tm9kZVNlbmRfMC4xLjItYnVpbGQuMTEwX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuMi1idWlsZC4xMTAKVEc5eWFWK2VGajRTd2Q2TVpqck9BK1g4Y0d1WW1mWEtpNFRFM0FMWDlYR1MzNG95cWlrRlVtMlQrTENJYzYyN0tyYzI2R0UwKzd4dmZINU11eCtaQUE9PQo=",
-      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_0.1.2.110_x64-setup.exe",
-      "fallback_urls": [
-        "https://github.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_0.1.2.110_x64-setup.exe"
-      ]
-    }
-  },
-  "release_page_url": "https://gitcode.com/picdupe/NodeSend/releases",
-  "android": {
-    "version": "0.1.2.110",
-    "versionCode": 1020110,
-    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_v0.1.2.110-arm64-v8a-release.apk",
-    "fallbackUrls": [
-      "https://github.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_v0.1.2.110-arm64-v8a-release.apk"
-    ],
-    "sha256": "387541ef497ba341a9c38fefaa6d8c8292e897d9e7f6e041cae3bfdc78cde322"
-  }
+    "version":  "0.1.2-build.111",
+    "platforms":  {
+                      "windows-x86_64":  {
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0ViMTM3NlRBSC9adzV2VTRNVVZoc3dEakY2eUp0WTNYQndTZHJJWGovK0QrNWlxSGZxTGZWaDFzTDFOZVB0ZUFwZ3lTNGk1RW1DYUZNU2MybjhhNkFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjUxMTk5CWZpbGU6Tm9kZVNlbmRfMC4xLjItYnVpbGQuMTExX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuMi1idWlsZC4xMTEKdDBETEdSc0hHV1didVJxaFB0VDN4RGdXQ2pTY1RScnUyUGxkS3I3SkU3SFV5SUZmT0Y4Q1RnUkJWRG9rL2Rmb3djY0lMQ09QS0lpVEoyaXZFbEhqQ3c9PQo=",
+                                             "url":  "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_0.1.2.111_x64-setup.exe",
+                                             "fallback_urls":  [
+                                                                   "https://github.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_0.1.2.111_x64-setup.exe"
+                                                               ]
+                                         }
+                  },
+    "release_page_url":  "https://gitcode.com/picdupe/NodeSend/releases"
 }

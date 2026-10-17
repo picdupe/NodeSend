@@ -65,7 +65,7 @@ impl TransferService {
                         self.edit(&id, |task| {
                             task.status = "accepted".into();
                             task.error = None;
-                            task.event("发送方已自动重连，接收任务已自动恢复");
+                            task.event("发送方已重连，接收任务已自动恢复");
                         })?;
                     }
                     self.remote_state(&id)
@@ -89,6 +89,18 @@ impl TransferService {
             Request::Commit { id } => self.commit(&incoming_id(peer, &id)).await,
             Request::Cancel { id } => {
                 self.action(&incoming_id(peer, &id), "cancel").await?;
+                Ok(Response::Ack)
+            }
+            Request::Pause { id } => {
+                self.action(&incoming_id(peer, &id), "remote_pause").await?;
+                Ok(Response::Ack)
+            }
+            Request::Resume { id } => {
+                self.action(&incoming_id(peer, &id), "resume").await?;
+                self.remote_state(&incoming_id(peer, &id))
+            }
+            Request::TaskState { id, revision, status } => {
+                self.apply_remote_state(peer, &id, revision, &status).await?;
                 Ok(Response::Ack)
             }
             _ => Err(AppError::BadRequest("错误的会话消息顺序".into())),

@@ -598,8 +598,8 @@ async fn serve_tcp_session(state: SessionState, stream: TcpStream, remote: Socke
     };
     finish_session(
         &mut channel,
-        &state.transfers,
-        &state.peers,
+        state.transfers.clone(),
+        state.peers.clone(),
         remote,
         state.ports.0,
         state.ports.1,
@@ -639,8 +639,8 @@ async fn serve_quic_session(state: SessionState, incoming: quinn::Incoming, remo
     };
     finish_session(
         &mut channel,
-        &state.transfers,
-        &state.peers,
+        state.transfers.clone(),
+        state.peers.clone(),
         remote,
         state.ports.0,
         state.ports.1,
@@ -649,8 +649,8 @@ async fn serve_quic_session(state: SessionState, incoming: quinn::Incoming, remo
 }
 async fn finish_session(
     channel: &mut Channel,
-    transfers: &TransferService,
-    peers: &PeerStore,
+    transfers: std::sync::Arc<TransferService>,
+    peers: std::sync::Arc<PeerStore>,
     remote: SocketAddr,
     tcp_port: u16,
     quic_port: u16,
@@ -669,8 +669,8 @@ async fn finish_session(
 
 async fn session(
     channel: &mut Channel,
-    transfers: &TransferService,
-    _peers: &PeerStore,
+    transfers: std::sync::Arc<TransferService>,
+    peers: std::sync::Arc<PeerStore>,
     _remote: SocketAddr,
     tcp_port: u16,
     quic_port: u16,
@@ -865,6 +865,11 @@ async fn session(
             _ => {}
         }
         let request_label = request_label(&request);
+        let restart_send = matches!(&request, Request::TaskState { status, .. } if status == "resumed");
+        let request_id = match &request {
+            Request::TaskState { id, .. } => transfers.task_id_for_peer_wire(&channel.peer_id, id).ok(),
+            _ => None,
+        };
         let result = match request {
             Request::Chunk {
                 id,
@@ -913,6 +918,23 @@ async fn session(
             }
         };
         protocol::write_frame(&mut *channel.writer, &response).await?;
+        if restart_send {
+            if let Some(id) = request_id {
+                let service = transfers.clone();
+                let peer_store = peers.clone();
+                tokio::spawn(async move {
+                    while service.is_active(&id) {
+                        tokio::select! {
+                            _ = service.shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                        }
+                    }
+                    if service.record(&id).is_ok_and(|task| task.direction == "send" && task.status == "queued") {
+                        service.start_task(peer_store, id);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -930,6 +952,9 @@ fn request_label(request: &Request) -> &'static str {
         Request::Chunk { .. } => "Chunk",
         Request::Commit { .. } => "Commit",
         Request::Cancel { .. } => "Cancel",
+        Request::Pause { .. } => "Pause",
+        Request::Resume { .. } => "Resume",
+        Request::TaskState { .. } => "TaskState",
         Request::Browse { .. } => "Browse",
         Request::Fetch { .. } => "Fetch",
         Request::Put { .. } => "Put",

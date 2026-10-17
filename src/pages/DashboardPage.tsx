@@ -49,7 +49,7 @@ export function DashboardPage({ network, onSaved }: { network: NetworkStatus | n
   const [updateError, setUpdateError] = useState('');
   const policyOptions = [{ value: 'ask', label: '每次询问', detail: '收到文件前确认一次' }, { value: 'trusted', label: '仅自动接收已信任设备', detail: '信任设备可直接保存' }, { value: 'reject', label: '自动拒绝', detail: '所有接收请求都拒绝' }] as const;
   const selectedPolicy = policyOptions.find(option => option.value === policy) ?? policyOptions[0];
-  const hasActiveTransfers = network?.tasks.some(task => ['queued', 'connecting', 'waiting', 'accepted', 'transferring', 'interrupted'].includes(task.status)) ?? false;
+  const hasActiveTransfers = network?.tasks.some(task => ['queued', 'connecting', 'waiting', 'accepted', 'transferring'].includes(task.status)) ?? false;
   useEffect(() => {
     getNodeInfo().then(setInfo).catch(e => setError(errorText(e)));
     getVersion().then(setAppVersion).catch(() => setAppVersion(''));

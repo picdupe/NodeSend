@@ -524,6 +524,18 @@ pub struct TaskRecord {
     /// 因源文件变化被跳过的条目路径（有上限，仅用于界面提示，避免标量无界增长）。
     #[serde(default)]
     pub skipped_paths: Vec<String>,
+    /// 接受任务时选择使用 SSD 缓存的文件索引；未包含的文件直接写目标盘。
+    #[serde(default)]
+    pub cache_files: BTreeSet<usize>,
+    /// Sender explicitly requested resume; consumed by the next connected send run.
+    #[serde(default)]
+    pub resume_requested: bool,
+    /// Monotonic local/remote control-plane revisions prevent delayed retries
+    /// from rolling a task back to an older state.
+    #[serde(default)]
+    pub state_revision: u64,
+    #[serde(default)]
+    pub remote_state_revision: u64,
     /// 清单内容指纹（`Offer` 摘要携带）：用于重复请求的内容一致性与收完后校验。
     #[serde(default)]
     pub digest: String,

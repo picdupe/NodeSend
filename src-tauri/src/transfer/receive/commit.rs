@@ -4,6 +4,23 @@ use super::super::{model::TaskRecord, paths, TransferService};
 use crate::error::{AppError, AppResult};
 use std::path::Path;
 
+fn remove_published_file(path: &Path) -> AppResult<()> {
+    let mut last_error = None;
+    for attempt in 0..6 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(40 * (attempt + 1)));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("remove_file attempted at least once").into())
+}
+
 impl TransferService {
     /// Commit staged files using synchronous filesystem calls.
     /// The caller must run this on Tokio's blocking pool.
@@ -46,6 +63,17 @@ impl TransferService {
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        // Cache-mode relay publishes directly to the final destination and
+        // records progress on the cache side. There is intentionally no
+        // destination `.part` file for these entries.
+        if task.cache_files.contains(&i) {
+            if let Ok(metadata) = std::fs::metadata(target) {
+                if metadata.is_file() && metadata.len() == entry.size {
+                    return Ok(());
+                }
+            }
+            return Err(AppError::Conflict("缓存文件尚未转移到目标路径".into()));
         }
         let part = stage.join(format!("{i}.part"));
         let done = stage.join(format!("{i}.committed"));
@@ -121,8 +149,25 @@ impl TransferService {
             let target = Path::new(raw_target);
             paths::ensure_under(root, target)?;
             if entry.directory {
-                // Keep directories: some may have existed before the transfer,
-                // and an empty directory is safer than deleting user data.
+                // Remove only empty directories under the selected destination.
+                // Non-empty or user-populated directories are left untouched.
+                if target.is_dir() {
+                    match std::fs::remove_dir(target) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                continue;
+            }
+            if task.cache_files.contains(&i) {
+                if task.relayed.get(i).copied().unwrap_or(0) >= entry.size
+                    && target.is_file()
+                    && std::fs::metadata(target).map(|m| m.len() == entry.size).unwrap_or(false)
+                {
+                    remove_published_file(target)?;
+                }
                 continue;
             }
             let marker = stage.join(format!("{i}.committed"));
@@ -144,6 +189,12 @@ impl TransferService {
                         std::fs::rename(&backup, &recovery)?;
                         tracing::warn!(path = %recovery.display(), "缺少提交标记，覆盖前的文件已另存为恢复文件");
                     }
+                } else if target.exists() && Self::looks_fully_received(task, i, target, entry) {
+                    // A cancellation can race the final rename and marker write.
+                    // With no backup, only remove a target when every chunk for
+                    // this file was durably acknowledged and its size matches;
+                    // skipped/pre-existing files do not satisfy this condition.
+                    remove_published_file(target)?;
                 }
                 continue;
             }
@@ -159,25 +210,20 @@ impl TransferService {
             } else if let Some(expected) = marker_value.strip_prefix("owned|") {
                 let mut fields = expected.split('|');
                 let expected_len = fields.next().and_then(|v| v.parse::<u64>().ok());
-                let expected_modified = fields.next().and_then(|v| v.parse::<u128>().ok());
-                match (std::fs::metadata(target), expected_len, expected_modified) {
-                    (Ok(metadata), Some(len), Some(modified)) => {
-                        let actual_modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|duration| duration.as_nanos())
-                            .unwrap_or(0);
-                        metadata.is_file() && metadata.len() == len && actual_modified == modified
-                    }
-                    _ => false,
-                }
+                // Explorer opening/previewing a file can change timestamp
+                // precision without changing its content. The destination
+                // path and size are the durable publication identity here;
+                // do not treat a mere read/open as a user replacement.
+                let _ = fields.next();
+                std::fs::metadata(target)
+                    .map(|metadata| metadata.is_file() && expected_len == Some(metadata.len()))
+                    .unwrap_or(false)
             } else {
                 false
             };
             if backup.exists() {
                 if target.exists() && owned {
-                    std::fs::remove_file(target)?;
+                    remove_published_file(target)?;
                 }
                 if !target.exists() {
                     std::fs::rename(&backup, target)?;
@@ -205,9 +251,43 @@ impl TransferService {
                     tracing::warn!(path = %recovery.display(), "目标文件在取消前发生变化，原文件已另存为恢复文件");
                 }
             } else if owned && target.exists() {
-                std::fs::remove_file(target)?;
+                remove_published_file(target)?;
+            }
+        }
+        // A directory can remain when its child file was published before the
+        // directory entry was committed. Sweep manifest directories once more
+        // in reverse depth order, removing only empty paths under this task's
+        // receive root.
+        for (i, entry) in task.manifest.entries.iter().enumerate().rev() {
+            if !entry.directory {
+                continue;
+            }
+            let Some(raw_target) = task.targets.get(i).and_then(Option::as_ref) else {
+                continue;
+            };
+            let target = Path::new(raw_target);
+            paths::ensure_under(root, target)?;
+            if target.is_dir() {
+                let _ = std::fs::remove_dir(target);
             }
         }
         Ok(())
+    }
+
+    fn looks_fully_received(
+        task: &TaskRecord,
+        file: usize,
+        target: &Path,
+        entry: &super::super::model::FileEntry,
+    ) -> bool {
+        let Ok(metadata) = std::fs::metadata(target) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.len() != entry.size {
+            return false;
+        }
+        let count = entry.size.div_ceil(task.chunk_size) as usize;
+        let first = task.manifest.file_base(file);
+        (first..first.saturating_add(count)).all(|index| task.completed.contains(&index))
     }
 }
