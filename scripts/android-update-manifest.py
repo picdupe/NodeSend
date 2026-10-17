@@ -16,10 +16,13 @@ def main() -> None:
     parser.add_argument("--channel", choices=("stable", "test"), required=True)
     parser.add_argument("--apk", type=Path, required=True, help="Path to the signed APK produced by this build")
     parser.add_argument("--url", required=True, help="Public HTTPS URL where this APK will be published")
+    parser.add_argument("--fallback-url", action="append", default=[], help="Fallback HTTPS URL; may be repeated")
     args = parser.parse_args()
 
     if not args.url.startswith("https://"):
         raise SystemExit("APK URL must use HTTPS.")
+    if any(not url.startswith("https://") for url in args.fallback_url):
+        raise SystemExit("All APK fallback URLs must use HTTPS.")
     apk = args.apk.resolve()
     if not apk.is_file() or apk.suffix.lower() != ".apk":
         raise SystemExit("--apk must point to an existing .apk file.")
@@ -64,8 +67,10 @@ def main() -> None:
         "version": f"{version}.{build}",
         "versionCode": version_code,
         "url": args.url,
+        "fallbackUrls": args.fallback_url,
         "sha256": digest.hexdigest(),
     }
+    manifest["release_page_url"] = "https://gitcode.com/picdupe/NodeSend/releases"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Updated {manifest_path.relative_to(ROOT)}")

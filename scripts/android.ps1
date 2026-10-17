@@ -231,7 +231,7 @@ try {
         $downloadBase = if ($env:NODESEND_UPDATE_DOWNLOAD_BASE_URL -and $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim()) {
             $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim().TrimEnd('/')
         } else {
-            "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)"
+            "https://gitcode.com/picdupe/NodeSend/releases/download/v$($versionData.version)"
         }
         $downloadUri = $null
         $arm64Name = Split-Path -Leaf $builtApks['arm64-v8a']
@@ -240,7 +240,7 @@ try {
         }
         $python = Get-Command python -ErrorAction SilentlyContinue
         if (-not $python) { throw 'Python 3 is required to generate Android update metadata.' }
-        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel stable --apk $builtApks['arm64-v8a'] --url $downloadUri.AbsoluteUri
+        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel stable --apk $builtApks['arm64-v8a'] --url $downloadUri.AbsoluteUri --fallback-url "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)/$arm64Name"
         if ($LASTEXITCODE -ne 0) { throw 'Could not merge Android APK metadata into updates/stable/latest.json.' }
         Write-Output "Android updater download URL: $($downloadUri.AbsoluteUri)"
     }

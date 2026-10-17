@@ -65,13 +65,14 @@ if [[ "$PROFILE" == "release" ]]; then
       mv -f -- "$UPDATER_ARCHIVE" "$APPIMAGE_DIR/$ARCHIVE_NAME"
       mv -f -- "$UPDATER_SIGNATURE" "$APPIMAGE_DIR/$ARCHIVE_NAME.sig"
     fi
-    DOWNLOAD_BASE="${NODESEND_UPDATE_DOWNLOAD_BASE_URL:-https://github.com/picdupe/NodeSend/releases/download/v${VERSION}}"
+    DOWNLOAD_BASE="${NODESEND_UPDATE_DOWNLOAD_BASE_URL:-https://gitcode.com/picdupe/NodeSend/releases/download/v${VERSION}}"
     DOWNLOAD_BASE="${DOWNLOAD_BASE%/}"
     export NODESEND_MANIFEST_VERSION="$INTERNAL_VERSION"
     export NODESEND_MANIFEST_PUBLIC_VERSION="$PUBLIC_VERSION"
     export NODESEND_MANIFEST_PLATFORM="linux-x86_64"
     export NODESEND_MANIFEST_SIGNATURE="$(cat "$APPIMAGE_DIR/$ARCHIVE_NAME.sig")"
     export NODESEND_MANIFEST_URL="${DOWNLOAD_BASE}/${ARCHIVE_NAME}"
+    export NODESEND_MANIFEST_FALLBACK_URL="${NODESEND_GITHUB_UPDATE_DOWNLOAD_BASE_URL:-https://github.com/picdupe/NodeSend/releases/download/v${VERSION}}/${ARCHIVE_NAME}"
     export NODESEND_MANIFEST_PATH="$ROOT/updates/stable/latest.json"
     python3 - <<'PY'
 import json
@@ -96,12 +97,16 @@ if path.exists():
         manifest["platforms"].update(platforms)
         if "android" in existing:
             manifest["android"] = existing["android"]
+        if "release_page_url" in existing:
+            manifest["release_page_url"] = existing["release_page_url"]
         print(f"Merging updater manifest for existing version/build: {version}")
 
 manifest["platforms"][platform] = {
     "signature": os.environ["NODESEND_MANIFEST_SIGNATURE"],
     "url": os.environ["NODESEND_MANIFEST_URL"],
+    "fallback_urls": [os.environ["NODESEND_MANIFEST_FALLBACK_URL"]],
 }
+manifest["release_page_url"] = "https://gitcode.com/picdupe/NodeSend/releases"
 path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 print(f"Updater manifest generated: {path}")
 print(f"Linux updater download URL: {os.environ['NODESEND_MANIFEST_URL']}")

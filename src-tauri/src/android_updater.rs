@@ -13,7 +13,7 @@ struct CheckArgs { channel: String }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DownloadArgs { url: String, sha256: String }
+struct DownloadArgs { url: String, sha256: String, #[serde(rename = "fallbackUrls")] fallback_urls: Vec<String> }
 
 #[derive(Deserialize)]
 struct DownloadResult { path: String }
@@ -39,8 +39,8 @@ pub async fn check_android_update<R: Runtime>(app: AppHandle<R>, channel: String
 }
 
 #[tauri::command]
-pub async fn download_android_update<R: Runtime>(app: AppHandle<R>, url: String, sha256: String) -> Result<String, String> {
-    app.state::<AndroidUpdater<R>>().0.run_mobile_plugin_async::<DownloadResult>("downloadUpdate", DownloadArgs { url, sha256 })
+pub async fn download_android_update<R: Runtime>(app: AppHandle<R>, url: String, sha256: String, fallback_urls: Vec<String>) -> Result<String, String> {
+    app.state::<AndroidUpdater<R>>().0.run_mobile_plugin_async::<DownloadResult>("downloadUpdate", DownloadArgs { url, sha256, fallback_urls })
         .await.map(|result| result.path).map_err(|e| e.to_string())
 }
 

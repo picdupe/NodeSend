@@ -10,8 +10,10 @@ now performs this automatically. It renames the signed release APK to a
 versioned filename, calculates SHA-256 from that exact local APK, and merges
 the Android entry into `updates/stable/latest.json`. The download URL follows
 the same `NODESEND_UPDATE_DOWNLOAD_BASE_URL` setting as the other platform
-builds, or defaults to the GitHub release for the product version. Upload the
-APK under the printed filename to that URL before publishing the manifest.
+builds, or defaults to the GitCode release for the product version
+(`https://gitcode.com/picdupe/NodeSend/releases/download/v<version>`). Upload
+the APK under the printed filename to that URL before publishing the manifest.
+The release page points to GitCode Releases.
 
 The helper can also be run manually when repairing release metadata:
 

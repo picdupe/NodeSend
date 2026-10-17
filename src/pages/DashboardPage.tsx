@@ -104,7 +104,7 @@ export function DashboardPage({ network, onSaved }: { network: NetworkStatus | n
     try {
       if (android) {
         if (!updateInfo?.sha256) throw new Error('Android 更新清单缺少 SHA-256。');
-        const path = await downloadAndroidUpdate(updateInfo.downloadUrl, updateInfo.sha256);
+        const path = await downloadAndroidUpdate(updateInfo.downloadUrl, updateInfo.sha256, updateInfo.fallbackUrls);
         setDownloadedAndroidPath(path); setDownloadedUpdate(true);
         setUpdateMessage('APK 下载完成，SHA-256 校验通过。确认后将交由 Android 系统安装器安装。');
         return;

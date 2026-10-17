@@ -5,6 +5,10 @@
     "stable": {
       "sources": [
         {
+          "id": "gitcode-raw-stable",
+          "manifest_url": "https://raw.gitcode.com/picdupe/NodeSend/raw/main/updates/stable/latest.json"
+        },
+        {
           "id": "github-raw-stable",
           "manifest_url": "https://raw.githubusercontent.com/picdupe/NodeSend/main/updates/stable/latest.json"
         }
@@ -12,6 +16,10 @@
     },
     "test": {
       "sources": [
+        {
+          "id": "gitcode-raw-test",
+          "manifest_url": "https://raw.gitcode.com/picdupe/NodeSend/raw/main/updates/test/latest.json"
+        },
         {
           "id": "github-raw-test",
           "manifest_url": "https://raw.githubusercontent.com/picdupe/NodeSend/main/updates/test/latest.json"

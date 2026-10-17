@@ -24,7 +24,7 @@ import java.util.concurrent.Executors
 class UpdateChannelArgs { var channel: String = "stable" }
 
 @InvokeArg
-class DownloadUpdateArgs { lateinit var url: String; lateinit var sha256: String }
+class DownloadUpdateArgs { lateinit var url: String; lateinit var sha256: String; var fallbackUrls: List<String> = emptyList() }
 
 @InvokeArg
 class InstallUpdateArgs { lateinit var path: String }
@@ -64,7 +64,9 @@ class NodeSendUpdaterPlugin(private val activity: android.app.Activity) : Plugin
                 } else {
                     invoke.resolve(JSObject().put("updateAvailable", true).put("version", version).put("versionCode", versionCode)
                         .put("currentVersion", packageInfo.versionName ?: "").put("currentVersionCode", currentCode)
-                        .put("notes", payload.optString("notes", "")).put("downloadUrl", downloadUrl).put("sha256", sha256))
+                        .put("notes", payload.optString("notes", "")).put("downloadUrl", downloadUrl)
+                        .put("fallbackUrls", androidUpdate.optJSONArray("fallbackUrls") ?: org.json.JSONArray())
+                        .put("sha256", sha256))
                 }
             } catch (e: Exception) { invoke.reject(e.message ?: "检查 Android 更新失败。") }
         }
@@ -79,7 +81,29 @@ class NodeSendUpdaterPlugin(private val activity: android.app.Activity) : Plugin
         worker.execute {
             val temp = File(activity.cacheDir, "nodesend-update.apk.part")
             try {
-                val connection = URL(args.url).openConnection() as HttpURLConnection
+                val urls = arrayListOf(args.url)
+                val fallback = args.fallbackUrls
+                urls.addAll(fallback.filter { it.startsWith("https://") && it !in urls })
+                var lastError: Exception? = null
+                for (address in urls) try {
+                    downloadOne(address, args.sha256, temp)
+                    lastError = null
+                    break
+                } catch (error: Exception) {
+                    lastError = error
+                    temp.delete()
+                }
+                lastError?.let { throw it }
+                val apk = File(activity.cacheDir, "nodesend-update.apk")
+                if (apk.exists() && !apk.delete()) throw IllegalStateException("无法替换缓存中的旧更新包。")
+                if (!temp.renameTo(apk)) throw IllegalStateException("无法保存下载完成的 APK。")
+                invoke.resolve(JSObject().put("path", apk.absolutePath))
+            } catch (e: Exception) { temp.delete(); invoke.reject(e.message ?: "下载 Android 更新失败。") }
+        }
+    }
+
+    private fun downloadOne(address: String, expectedSha256: String, temp: File) {
+                val connection = URL(address).openConnection() as HttpURLConnection
                 connection.connectTimeout = 15000
                 connection.readTimeout = 30000
                 connection.instanceFollowRedirects = true
@@ -102,13 +126,7 @@ class NodeSendUpdaterPlugin(private val activity: android.app.Activity) : Plugin
                     while (true) { val count = input.read(buffer); if (count < 0) break; messageDigest.update(buffer, 0, count) }
                 }
                 val digest = messageDigest.digest().joinToString("") { "%02x".format(it) }
-                if (!digest.equals(args.sha256, ignoreCase = true)) throw IllegalStateException("APK SHA-256 校验失败，已拒绝安装。")
-                val apk = File(activity.cacheDir, "nodesend-update.apk")
-                if (apk.exists() && !apk.delete()) throw IllegalStateException("无法替换缓存中的旧更新包。")
-                if (!temp.renameTo(apk)) throw IllegalStateException("无法保存下载完成的 APK。")
-                invoke.resolve(JSObject().put("path", apk.absolutePath))
-            } catch (e: Exception) { temp.delete(); invoke.reject(e.message ?: "下载 Android 更新失败。") }
-        }
+                if (!digest.equals(expectedSha256, ignoreCase = true)) throw IllegalStateException("APK SHA-256 校验失败，已拒绝安装。")
     }
 
     @Command

@@ -1,9 +1,13 @@
 {
-    "version":  "0.1.1-build.104",
+    "version":  "0.1.2-build.109",
     "platforms":  {
                       "windows-x86_64":  {
-                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0JlaEYwWi90UjZ0Sk5nRDVWOTc1R0NTYVBzTXVQbi9LWHlTT0F3TWF1VCthZEczdWxFVnlWZmpwdzJKaWpYVkNzSmF1WXA1QldTdVFZZDk3SDJuT1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMTUwOTMxCWZpbGU6Tm9kZVNlbmRfMC4xLjEtYnVpbGQuMTA0X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuMS1idWlsZC4xMDQKZWpURGd5d1JwZ2hmaWlFVXJTY3IxOHVPZlZ1dGxhNnYyY2dsYy9PWkNNWEtIM1N0djdkcXA4SWN3OW1udElZckdVZmlLOGdZVmlVR3ltYW1YSjI5Q3c9PQo=",
-                                             "url":  "https://github.com/picdupe/NodeSend/releases/download/v0.1.1/NodeSend_0.1.1.104_x64-setup.exe"
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR05JZDRmeG14RXRISEVKNGh0MDJWdFl3a0pHaWdlNTcvWmQxSnhSN2hpdTk3RWVteDdhU1IrblBWQWdod2hYK3dtcHRaNFAvT0FpZ2EwVWIwbDF1ZFFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMjQxNDU2CWZpbGU6Tm9kZVNlbmRfMC4xLjItYnVpbGQuMTA5X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuMi1idWlsZC4xMDkKeDNMNXZGZ21HSjRDYW9qS2FRbks3N0o5aTUvb1JQbVVFUFROMmcwbG1Cb1RUSnI3eHR3ZXJ1RjFGbGVIM2MxdlZjdE5JSXhVV1FtSHR5a1oyNStIQVE9PQo=",
+                                             "url":  "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_0.1.2.109_x64-setup.exe",
+                                             "fallback_urls":  [
+                                                                   "https://github.com/picdupe/NodeSend/releases/download/v0.1.2/NodeSend_0.1.2.109_x64-setup.exe"
+                                                               ]
                                          }
-                  }
+                  },
+    "release_page_url":  "https://gitcode.com/picdupe/NodeSend/releases"
 }

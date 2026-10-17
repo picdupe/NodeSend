@@ -157,8 +157,8 @@ Write-Output 'Windows bundles:'
 $artifacts | Select-Object FullName, Length, LastWriteTime
 
 # Generate the stable updater manifest from the signed NSIS installer. The
-# manifest URL itself is served from GitHub raw (see update-sources.json),
-# while the installer is downloaded from the GitHub Release by default.
+# manifest is served from GitCode raw first (see update-sources.json), and the
+# installer is published to GitCode Releases by default.
 # Override the download host with -UpdateDownloadBaseUrl or
 # NODESEND_UPDATE_DOWNLOAD_BASE_URL for an intranet/CDN mirror.
 if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
@@ -177,6 +177,11 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
             $UpdateDownloadBaseUrl.Trim().TrimEnd('/')
         } elseif ($env:NODESEND_UPDATE_DOWNLOAD_BASE_URL -and $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim()) {
             $env:NODESEND_UPDATE_DOWNLOAD_BASE_URL.Trim().TrimEnd('/')
+        } else {
+            "https://gitcode.com/picdupe/NodeSend/releases/download/v$($versionData.version)"
+        }
+        $githubDownloadBase = if ($env:NODESEND_GITHUB_UPDATE_DOWNLOAD_BASE_URL -and $env:NODESEND_GITHUB_UPDATE_DOWNLOAD_BASE_URL.Trim()) {
+            $env:NODESEND_GITHUB_UPDATE_DOWNLOAD_BASE_URL.Trim().TrimEnd('/')
         } else {
             "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)"
         }
@@ -211,10 +216,12 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         $platforms['windows-x86_64'] = [ordered]@{
             signature = $signatureText
             url = $downloadUri.AbsoluteUri
+            fallback_urls = @("$githubDownloadBase/$($installer.Name)")
         }
         $manifest = [ordered]@{
             version = $internalVersion
             platforms = $platforms
+            release_page_url = "https://gitcode.com/picdupe/NodeSend/releases"
         }
         if ($null -ne $androidUpdate) { $manifest.android = $androidUpdate }
         # ConvertTo-Json is supported by both Windows PowerShell 5.1 and

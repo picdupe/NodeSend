@@ -21,6 +21,7 @@ struct PendingUpdate {
     update: Update,
     downloaded: Option<Vec<u8>>,
     fallback_endpoints: Vec<String>,
+    fallback_download_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,6 +228,24 @@ pub async fn check_update(
         let Some(update) = update else {
             return Ok(None);
         };
+        let fallback_download_urls = update
+            .raw_json
+            .get("platforms")
+            .and_then(Value::as_object)
+            .and_then(|platforms| {
+                platforms.values().find(|platform| {
+                    platform.get("url").and_then(Value::as_str)
+                        == Some(update.download_url.as_str())
+                })
+            })
+            .and_then(|platform| platform.get("fallback_urls"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|url| validate_endpoint(url).is_ok())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let release_page_url = update
             .raw_json
             .get("release_page_url")
@@ -251,6 +270,7 @@ pub async fn check_update(
             update,
             downloaded: None,
             fallback_endpoints: ordered.iter().skip(index + 1).cloned().collect(),
+            fallback_download_urls,
         });
         return Ok(Some(info));
     }
@@ -299,6 +319,22 @@ pub async fn download_update(
                     .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
                 return Err(format!("更新包签名或版本验证失败：{original_error}"));
             }
+            let original_url = current.update.download_url.clone();
+            for fallback_url in current.fallback_download_urls.clone() {
+                let Ok(fallback_url) = validate_endpoint(&fallback_url) else {
+                    continue;
+                };
+                current.update.download_url = fallback_url;
+                if let Ok(bytes) = download_verified(&current.update, &on_progress).await {
+                    current.downloaded = Some(bytes);
+                    *pending
+                        .0
+                        .lock()
+                        .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                    return Ok(());
+                }
+            }
+            current.update.download_url = original_url;
             let expected_version = current.update.version.clone();
             for raw_endpoint in current.fallback_endpoints.clone() {
                 let Ok(endpoint) = validate_endpoint(&raw_endpoint) else {
