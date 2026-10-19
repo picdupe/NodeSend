@@ -229,6 +229,11 @@ impl TransferService {
             return Err(AppError::Conflict("文件清单校验失败（指纹不一致）".into()));
         }
         task.manifest.validate()?;
+        // Build the final per-file cache route before publishing scan_complete.
+        // The writer uses scan_complete to stop its temporary cache fallback;
+        // flipping it first creates a race where new files open destination
+        // .part files while refresh_cache_plan is still pending.
+        self.refresh_cache_plan(&id)?;
         self.edit(&id, |record| {
             record.file_count = actual_file_count;
             record.directory_count = record
@@ -254,11 +259,6 @@ impl TransferService {
                 self.auto_accept_if_trusted(peer, &id).await;
             }
         }
-        // Trusted devices may be accepted as soon as the top-level entries
-        // arrive. Rebuild the file-level cache plan now that the complete
-        // manifest is available; otherwise only directory entries were seen
-        // and all payload files would fall back to direct writes.
-        self.refresh_cache_plan(&id)?;
         self.remote_state(&id)
     }
 }

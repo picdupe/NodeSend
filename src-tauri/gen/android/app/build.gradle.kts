@@ -1,4 +1,4 @@
-import java.util.Properties
+import groovy.json.JsonSlurper
 
 plugins {
     id("com.android.application")
@@ -6,12 +6,17 @@ plugins {
     id("rust")
 }
 
-val tauriProperties = Properties().apply {
-    val propFile = file("tauri.properties")
-    if (propFile.exists()) {
-        propFile.inputStream().use { load(it) }
-    }
-}
+// Tauri rewrites tauri.properties before Gradle runs. Use the release source
+// directly so both versionName and upgrade ordering include the build number.
+val releaseVersion = JsonSlurper().parse(file("../../../../version.json")) as Map<*, *>
+val productVersion = releaseVersion["version"] as String
+val releaseBuild = (releaseVersion["build"] as Number).toInt()
+val versionParts = productVersion.split(".").map { it.toInt() }
+require(versionParts.size == 3 && versionParts[0] in 0..20 &&
+    versionParts[1] in 0..99 && versionParts[2] in 0..99 && releaseBuild in 1..999)
+val androidVersionName = "$productVersion.$releaseBuild"
+val androidVersionCode = versionParts[0] * 100_000_000 +
+    versionParts[1] * 1_000_000 + versionParts[2] * 10_000 + releaseBuild
 
 android {
     compileSdk = 36
@@ -21,8 +26,8 @@ android {
         applicationId = "com.picdupe.nodesend"
         minSdk = 24
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        versionCode = androidVersionCode
+        versionName = androidVersionName
     }
     signingConfigs {
         create("release") {

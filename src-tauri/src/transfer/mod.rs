@@ -147,7 +147,7 @@ impl TransferService {
     pub(crate) fn refresh_cache_plan(&self, id: &str) -> AppResult<()> {
         let task = self.record(id)?;
         if task.destination.is_none() { return Ok(()) }
-        let Some(cache) = self.current_cache_root() else { return Ok(()) };
+        let Some(cache) = self.cache_root_for_task(id) else { return Ok(()) };
         let available = fs2::available_space(&cache).unwrap_or(0);
         let mut remaining = available.min(32 * 1024 * 1024 * 1024);
         remaining = remaining.saturating_sub(2 * 1024 * 1024 * 1024u64);
@@ -1162,13 +1162,10 @@ impl TransferService {
                 break;
             }
         }
-        // Trusted peers may start sending while the recursive manifest is
-        // still streaming. Until the final manifest arrives, keep payloads on
-        // the configured cache volume; otherwise early chunks fall back to
-        // destination `.part` files before the file-level cache plan exists.
-        let cache_pending = !task.scan_complete
-            && locks::lock(&self.task_cache_roots).contains_key(id);
-        let use_cache = task.cache_files.contains(&file) || cache_pending;
+        // Every manifest page extends the file-level plan before its ack is
+        // sent. Use only that durable decision so an oversized file cannot
+        // start in cache and switch to destination staging when scanning ends.
+        let use_cache = task.cache_files.contains(&file);
         Ok((next_offset, entry.size, use_cache))
     }
     pub(crate) fn chunk_at(&self, id: &str, index: usize) -> AppResult<Option<Chunk>> {

@@ -209,6 +209,17 @@ try {
         }
 
         $versionData = Get-Content -LiteralPath (Join-Path $projectRoot 'version.json') -Raw | ConvertFrom-Json
+        # Verify the packaged manifest, not the generated Tauri properties.
+        $expectedVersionName = "$($versionData.version).$($versionData.build)"
+        $versionParts = $versionData.version.Split('.')
+        $expectedVersionCode = [int]$versionParts[0] * 100000000 + [int]$versionParts[1] * 1000000 + [int]$versionParts[2] * 10000 + [int]$versionData.build
+        $badging = & (Join-Path $sdkRoot 'build-tools/35.0.0/aapt2.exe') dump badging $candidates[0].FullName
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect APK version metadata.' }
+        $packageLine = $badging | Where-Object { $_ -match '^package:' } | Select-Object -First 1
+        if ($packageLine -notmatch "versionName='$([regex]::Escape($expectedVersionName))'" -or $packageLine -notmatch "versionCode='$expectedVersionCode'") {
+            throw "APK version mismatch. Expected $expectedVersionName ($expectedVersionCode); actual: $packageLine"
+        }
+        Write-Output "Verified APK version: $expectedVersionName ($expectedVersionCode)"
         $publicVersion = "v$($versionData.version).$($versionData.build)"
         $suffix = switch ($architectureName) {
             'arm64-v8a' { '-arm64-v8a' }

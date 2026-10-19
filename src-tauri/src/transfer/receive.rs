@@ -21,7 +21,7 @@ impl TransferService {
         if task.direction != "receive"
             || task.destination.is_none()
             || !["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
-            || task.use_cache
+            || task.cache_files.contains(&file)
         {
             return Ok(());
         }
