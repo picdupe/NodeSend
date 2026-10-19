@@ -92,6 +92,7 @@ impl TransferService {
             peer_id: peer.into(),
             peer_name: name.into(),
             peer_device_type: device_type.into(),
+            preferred_address: None,
             direction: "receive".into(),
             status: "waiting".into(),
             sources: vec![],

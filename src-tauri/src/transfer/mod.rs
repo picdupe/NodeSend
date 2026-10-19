@@ -35,6 +35,10 @@ pub(crate) const CHUNK_SIZE: u64 = crate::tuning::CHUNK_SIZE;
 /// 发送端同时保留的读句柄上限。见 [`crate::tuning::SEND_HANDLES_LIMIT`]。
 pub(crate) const SEND_HANDLES_LIMIT: usize = crate::tuning::SEND_HANDLES_LIMIT;
 
+/// 单文件缓存上限。缓存盘是流式中转区，累计数据由 relay 持续释放，
+/// 因此不应按整个任务大小筛掉后续文件；只有超过该上限的单文件直写目标盘。
+const CACHE_FILE_LIMIT: u64 = 30 * 1024 * 1024 * 1024;
+
 /// 缓存中转的只读标量视图：供转写调度与 `commit` 判定使用，**不加载清单明细**。
 /// 全部字段来自 `TaskRecord` 的持久化标量，因此构造与使用都是 O(1)。
 pub(crate) struct RelayState {
@@ -105,22 +109,12 @@ pub struct TransferService {
 }
 impl TransferService {
     pub(crate) fn extend_cache_plan(&self, id: &str, first: usize) -> AppResult<()> {
-        let Some(cache_root) = self.cache_root_for_task(id) else { return Ok(()) };
+        let Some(_) = self.cache_root_for_task(id) else { return Ok(()) };
         let mut map = locks::lock(&self.tasks);
         let task = map.get_mut(id).ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
         if task.scan_complete || task.destination.is_none() {
             return Ok(());
         }
-        let mut reserved: u64 = task.cache_files.iter()
-            .filter_map(|index| task.manifest.entries.get(*index))
-            .map(|entry| entry.size)
-            .sum();
-        let free = fs2::available_space(&cache_root).unwrap_or(0);
-        let mut budget = free.min(32 * 1024 * 1024 * 1024)
-            .saturating_sub(2 * 1024 * 1024 * 1024u64);
-        // The current filesystem free space already reflects bytes written by
-        // this task. Add only the still-unwritten reservation conservatively.
-        budget = budget.max(reserved);
         let mut added = 0u64;
         for index in first..task.manifest.entries.len() {
             let Some(entry) = task.manifest.entries.get(index) else { continue };
@@ -130,9 +124,8 @@ impl TransferService {
             {
                 continue;
             }
-            if entry.size <= budget.saturating_sub(reserved) {
+            if entry.size <= CACHE_FILE_LIMIT {
                 task.cache_files.insert(index);
-                reserved = reserved.saturating_add(entry.size);
                 added = added.saturating_add(entry.size);
             }
         }
@@ -140,6 +133,9 @@ impl TransferService {
             task.use_cache = true;
             task.relay_target_bytes = task.relay_target_bytes.saturating_add(added);
             task.updated_at = chrono::Utc::now().to_rfc3339();
+            task.event(format!(
+                "扫描中：新增 {added} 个文件使用缓存中转（单文件不超过 30 GiB）"
+            ));
             self.persist(task)?;
         }
         Ok(())
@@ -148,21 +144,12 @@ impl TransferService {
         let task = self.record(id)?;
         if task.destination.is_none() { return Ok(()) }
         let Some(cache) = self.cache_root_for_task(id) else { return Ok(()) };
-        let available = fs2::available_space(&cache).unwrap_or(0);
-        let mut remaining = available.min(32 * 1024 * 1024 * 1024);
-        remaining = remaining.saturating_sub(2 * 1024 * 1024 * 1024u64);
         let mut selected = task.cache_files.clone();
-        let reserved: u64 = selected.iter()
-            .filter_map(|index| task.manifest.entries.get(*index))
-            .map(|entry| entry.size)
-            .sum();
-        remaining = remaining.saturating_sub(reserved);
         for (index, entry) in task.manifest.entries.iter().enumerate() {
             if entry.directory || entry.size == 0 || task.targets.get(index).and_then(Option::as_ref).is_none() {
                 continue;
             }
-            if !selected.contains(&index) && entry.size <= remaining {
-                remaining -= entry.size;
+            if !selected.contains(&index) && entry.size <= CACHE_FILE_LIMIT {
                 selected.insert(index);
             }
         }
@@ -1118,14 +1105,6 @@ impl TransferService {
             .map(|t| t.skipped_files.contains(&file))
             .unwrap_or(false)
     }
-    /// 是否启用缓存盘中转（不加载明细）。
-    pub(crate) fn use_cache_of(&self, id: &str) -> AppResult<bool> {
-        self.tasks
-            .lock_or_recover()
-            .get(id)
-            .map(|t| t.use_cache)
-            .ok_or_else(|| AppError::NotFound("任务不存在".into()))
-    }
     /// 是否开启 Chunk 校验（不加载明细）。
     pub(crate) fn verify_hash_of(&self, id: &str) -> AppResult<bool> {
         self.tasks
@@ -1165,7 +1144,10 @@ impl TransferService {
         // Every manifest page extends the file-level plan before its ack is
         // sent. Use only that durable decision so an oversized file cannot
         // start in cache and switch to destination staging when scanning ends.
-        let use_cache = task.cache_files.contains(&file);
+        let use_cache = task.cache_files.contains(&file)
+            || (!task.scan_complete
+                && entry.size <= CACHE_FILE_LIMIT
+                && self.cache_root_for_task(id).is_some());
         Ok((next_offset, entry.size, use_cache))
     }
     pub(crate) fn chunk_at(&self, id: &str, index: usize) -> AppResult<Option<Chunk>> {
@@ -1296,6 +1278,7 @@ impl TransferService {
         paths: Vec<String>,
         verify_hash: bool,
         allow_public: bool,
+        preferred_address: Option<String>,
     ) -> AppResult<String> {
         // 真正的发送马上就会流式扫描同一批目录：结束后台预览扫描，
         // 避免两条扫描在同一块磁盘上互相抢 I/O（发送进度由任务列表展示）。
@@ -1321,6 +1304,7 @@ impl TransferService {
             peer_id,
             peer_name,
             peer_device_type: String::new(),
+            preferred_address,
             direction: "send".into(),
             status: "queued".into(),
             sources,
@@ -1463,20 +1447,15 @@ impl TransferService {
         self.refresh_cache_root_from_settings();
         let current_cache_root = self.current_cache_root();
         let cache_files = match current_cache_root.clone() {
-            Some(cache) => {
-                let available = fs2::available_space(&cache).unwrap_or(0);
-                let mut remaining = available.min(32 * 1024 * 1024 * 1024);
-                let safety = 2 * 1024 * 1024 * 1024u64;
-                remaining = remaining.saturating_sub(safety);
+            Some(_) => {
                 let mut selected = BTreeSet::new();
                 for (index, entry) in task.manifest.entries.iter().enumerate() {
                     if entry.directory || entry.size == 0 || targets.get(index).and_then(Option::as_ref).is_none() {
                         continue;
                     }
-                    // A file that cannot fit in the current cache window is
-                    // deliberately sent directly to the destination disk.
-                    if entry.size <= remaining {
-                        remaining -= entry.size;
+                    // The cache is a streaming relay window. Its limit is
+                    // per file; relay frees space while the task continues.
+                    if entry.size <= CACHE_FILE_LIMIT {
                         selected.insert(index);
                     }
                 }
@@ -1519,10 +1498,12 @@ impl TransferService {
             t.use_cache = use_cache;
             t.relayed = vec![0; t.manifest.entries.len()];
             t.relayed_total = 0;
-            t.event(if use_cache {
+            t.event(if !t.scan_complete && current_cache_root.is_some() {
+                "正在扫描清单，缓存计划会按文件大小逐步确定（单文件不超过 30 GiB 使用缓存）".to_string()
+            } else if use_cache {
                 format!("接收方已确认保存位置和冲突策略（缓存盘中转已启用，{} 个文件，路径：{}）", cache_files.len(), current_cache_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default())
             } else {
-                "接收方已确认保存位置和冲突策略（本任务没有文件满足缓存条件，使用目标盘直写）".to_string()
+                "接收方已确认保存位置和冲突策略（未配置缓存目录，使用目标盘直写）".to_string()
             });
         })?;
         if let Some(cache_root) = current_cache_root {

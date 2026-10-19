@@ -374,24 +374,18 @@ impl TransferService {
         hash: Option<String>,
         transport: &str,
     ) -> AppResult<Response> {
-        // 缓存盘中转的背压等待必须在任务锁之外：缓存盘写满时可能等很久，
-        // 占着任务锁会把同一任务的所有会话一起拖住（见下方入队处注释）。
-        if self.use_cache_of(id)? {
-            relay::await_cache_space(self, id).await?;
-            let status = self.status_of(id)?;
-            if !["accepted", "transferring"].contains(&status.as_str()) {
-                return self.remote_state(id);
-            }
-        }
+        let chunk = self
+            .chunk_at(id, index)?
+            .ok_or_else(|| AppError::BadRequest("Chunk 编号越界".into()))?;
+        // Routing is based only on the fixed per-file threshold. The relay
+        // publishes completed files as it goes, so cache capacity is not used
+        // to reclassify later files or block oversized direct writes.
         let gate = self.gate(id);
         let lock = gate.lock().await;
         let status = self.status_of(id)?;
         if !["accepted", "transferring"].contains(&status.as_str()) {
             return self.remote_state(id);
         }
-        let chunk = self
-            .chunk_at(id, index)?
-            .ok_or_else(|| AppError::BadRequest("Chunk 编号越界".into()))?;
         if self.is_skipped(id, chunk.file) {
             return Ok(Response::Ack);
         }

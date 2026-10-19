@@ -468,6 +468,8 @@ pub struct TaskRecord {
     pub peer_name: String,
     #[serde(default)]
     pub peer_device_type: String,
+    #[serde(default)]
+    pub preferred_address: Option<String>,
     pub direction: String,
     pub status: String,
     /// 顶层来源映射（名称 → 规范化绝对路径）。条目路径在读取时按其顶层名拼接，

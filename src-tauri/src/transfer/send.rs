@@ -310,8 +310,18 @@ impl TransferService {
         peers: &PeerStore,
         task: &TaskRecord,
         cooldown: &AtomicI64,
+        prefer_requested_address: bool,
     ) -> AppResult<Channel> {
-        let peer = peers.get(&task.peer_id)?;
+        let mut peer = peers.get(&task.peer_id)?;
+        if prefer_requested_address {
+            if let Some(address) = task.preferred_address.as_deref() {
+            peer.endpoints.sort_by_key(|endpoint| {
+                !(endpoint.address == address
+                    || address.starts_with(&format!("{}:", endpoint.address))
+                    || address.starts_with(&format!("[{}]", endpoint.address)))
+            });
+            }
+        }
         let mut last = "没有可用 Endpoint".to_string();
         for endpoint in &peer.endpoints {
             match transport::connect(
@@ -692,7 +702,7 @@ impl TransferService {
             self.append_entries(&task.id, 0, &task.manifest.entries)?;
             stale_wire = Some(old_wire);
         }
-        let mut control = self.channel(&peers, &task, &cooldown).await?;
+        let mut control = self.channel(&peers, &task, &cooldown, true).await?;
         if let Some(old_wire) = stale_wire {
             let _ = control.request(&Request::Cancel { id: old_wire }).await;
         }
@@ -1021,7 +1031,7 @@ impl TransferService {
             let cooldown = cooldown.clone();
             let queue = queue.clone();
             workers.spawn(async move {
-                let mut channel = service.channel(&peers, &task, &cooldown).await?;
+                let mut channel = service.channel(&peers, &task, &cooldown, false).await?;
                 loop {
                     if service.stopped(&task.id)? {
                         return Ok::<_, AppError>(());
@@ -1109,7 +1119,7 @@ impl TransferService {
                 return Err(err);
             }
         }
-        let mut control = self.channel(&peers, &task, &cooldown).await?;
+        let mut control = self.channel(&peers, &task, &cooldown, true).await?;
         if self.stopped(id)? {
             if self.status_of(id)?.as_str() == "paused" {
                 let _ = control.request(&Request::Pause { id: task.wire_id.clone() }).await;

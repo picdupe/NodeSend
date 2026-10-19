@@ -225,10 +225,12 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         }
         if ($null -ne $androidUpdate) { $manifest.android = $androidUpdate }
         # ConvertTo-Json is supported by both Windows PowerShell 5.1 and
-        # PowerShell 7; avoid System.Text.Json types that may not be loaded
-        # in the PowerShell host running this build script.
+        # PowerShell 7. Normalize its output with Python so Windows and Android
+        # builds always serialize the shared manifest with identical formatting.
         $manifestJson = $manifest | ConvertTo-Json -Depth 8
         [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
+        & $python.Source -c "import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); data=json.loads(p.read_text(encoding='utf-8-sig')); p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')" $manifestPath
+        if ($LASTEXITCODE -ne 0) { throw "Could not normalize or validate updater manifest JSON: $manifestPath" }
         Write-Output "Updater manifest generated: $manifestPath"
         Write-Output "Installer download URL: $($downloadUri.AbsoluteUri)"
     } else {

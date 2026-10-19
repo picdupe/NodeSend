@@ -32,9 +32,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}
 /// 缓存分段大小。见 [`crate::tuning::RELAY_SEGMENT_BYTES`]。
 pub(crate) const SEG_BYTES: u64 = crate::tuning::RELAY_SEGMENT_BYTES;
 
-/// 缓存盘可用空间低于该值时阻塞接收，等待转写释放空间；绝不报错、绝不丢数据。
-pub(crate) const CACHE_FREE_FLOOR: u64 = crate::tuning::CACHE_FREE_FLOOR;
-
 /// 巡检间隔（触发转写任务、等待缺口）。
 const TICK: Duration = crate::tuning::WRITE_TICK;
 
@@ -70,23 +67,6 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// 缓存盘可用空间不足时阻塞，等待转写任务腾出空间。
-/// 用于接收路径：把「缓存盘写满」转化为对接收的**背压**，而不是错误。
-pub(crate) async fn await_cache_space(service: &TransferService, task_id: &str) -> AppResult<()> {
-    let Some(cache_root) = service.cache_root_for_task(task_id) else {
-        return Ok(());
-    };
-    loop {
-        if !writable(&service.status_of(task_id)?) {
-            return Ok(());
-        }
-        if fs2::available_space(&cache_root).unwrap_or(u64::MAX) >= CACHE_FREE_FLOOR {
-            return Ok(());
-        }
-        tokio::time::sleep(TICK).await;
-    }
 }
 
 /// 启动转写调度器。随 `TransferService::shutdown` 一起结束。

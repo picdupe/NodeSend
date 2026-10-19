@@ -11,7 +11,7 @@ export const previewTransfer = (paths: string[]) => invoke<PreviewStatus>('previ
 export const previewStatus = () => invoke<PreviewStatus | null>('preview_status');
 export const previewCancel = () => invoke<void>('preview_cancel');
 export const listTaskEntries = (id: string, offset: number, limit: number) => invoke<TaskEntriesPage>('list_task_entries', { id, offset, limit });
-export const sendFiles = (peerId: string, paths: string[], verifyHash: boolean, allowPublic: boolean) => invoke<string>('send_files', { peerId, paths, verifyHash, allowPublic });
+export const sendFiles = (peerId: string, paths: string[], verifyHash: boolean, allowPublic: boolean, preferredAddress?: string) => invoke<string>('send_files', { peerId, paths, verifyHash, allowPublic, preferredAddress });
 export const cancelSendPreflight = (peerId: string) => invoke<void>('cancel_send_preflight', { peerId });
 export const addEndpoint = (address: string, expectedNodeId: string | null, allowPublic: boolean) => invoke<Peer>('add_endpoint', { address, expectedNodeId, allowPublic });
 export const removePeer = (nodeId: string) => invoke<void>('remove_peer', { nodeId });

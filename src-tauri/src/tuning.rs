@@ -99,7 +99,6 @@ pub(crate) const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// 缓存转写的分段大小，以及触发转写的起始缓存量。
 pub(crate) const RELAY_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// 缓存盘保留的最小可用空间：低于此值阻塞接收，等待转写释放。
-pub(crate) const CACHE_FREE_FLOOR: u64 = 256 * 1024 * 1024;
 
 // --- 发现与巡检 ---
 

@@ -64,9 +64,10 @@ pub async fn send_files(
     paths: Vec<String>,
     verify_hash: bool,
     allow_public: bool,
+    preferred_address: Option<String>,
 ) -> AppResult<String> {
     network
-        .send(peer_id, paths, verify_hash, allow_public)
+        .send(peer_id, paths, verify_hash, allow_public, preferred_address)
         .await
 }
 #[tauri::command]

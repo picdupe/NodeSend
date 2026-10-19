@@ -6,7 +6,7 @@ import { TaskList } from '../components/transfer/TaskList';
 import { Icon } from '../components/Icon';
 import { SidebarToggle } from '../components/AppLayout';
 import { PublicPathPrompt, publicPathRejected, publicPathAddress } from '../components/PublicPathPrompt';
-import { addEndpoint, errorText } from '../api/network';
+import { addEndpoint, errorText, sendFiles } from '../api/network';
 import { useRef, useState, type FormEvent } from 'react';
 import { useDialogEnter } from '../components/useDialogEnter';
 import { useDeviceFavorites } from '../hooks/useDeviceFavorites';
@@ -35,7 +35,7 @@ export function NetworkPage({ mode, status, error, refresh, onNavigate, selectio
     {status?.discovery.warnings.map(warning => <div className="notice" key={warning}>{warning}；可尝试手动连接设备。</div>)}
     {!status && !error && <div className="surface empty-state generous">正在连接本机服务…</div>}
     {status && <>{mode === 'send' && <div className="send-shell"><SendPanel status={status} selection={selection} favoritesOpen={favoritesOpen} onCloseFavorites={() => setFavoritesOpen(false)} onRemoveFavorite={removeFavorite} favorites={favorites} favoriteError={favoriteError} onToggleFavorite={toggleFavorite} refresh={refresh} onSent={() => onNavigate('transfers')} /></div>}{mode === 'receive' && <ReceivePanel status={status} refresh={refresh} />}{mode === 'transfers' && <TaskList tasks={status.tasks} refresh={refresh} />}</>}
-    {manualOpen && <ManualDiscoveryDialog onClose={() => setManualOpen(false)} onAdded={async () => { setManualOpen(false); await refresh(); }} />}
+    {manualOpen && <ManualDiscoveryDialog selection={selection} onClose={() => setManualOpen(false)} onAdded={async () => { setManualOpen(false); await refresh(); }} onSent={() => { setManualOpen(false); void refresh(); onNavigate('transfers'); }} />}
     {infoOpen && status && <DeviceInfoDialog status={status} onClose={() => setInfoOpen(false)} />}
 
   </div>;
@@ -46,13 +46,23 @@ function DeviceInfoDialog({ status, onClose }: { status: NetworkStatus; onClose:
   return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="modal surface" role="dialog" aria-modal="true" aria-labelledby="device-info-title"><div className="modal-heading"><div><span className="eyebrow">LOCAL NODE</span><h2 id="device-info-title">设备信息</h2></div><button type="button" className="icon-button" onClick={onClose} title="关闭"><Icon name="close" /></button></div><dl className="detail-list"><dt>设备名称</dt><dd>{status.display_name}</dd><dt>IP 地址</dt><dd className="device-info-addresses">{addresses.length ? addresses.map((address, index) => <span className="device-info-address" key={`${address}-${index}`}>{address}</span>) : '暂无地址'}</dd><dt>端口</dt><dd>TCP {status.tcp_port} · QUIC {status.quic_port}</dd></dl><div className="modal-actions"><button type="button" className="primary" onClick={onClose}>关闭</button></div></section></div>;
 }
 
-function ManualDiscoveryDialog({ onClose, onAdded }: { onClose: () => void; onAdded: () => Promise<void> }) {
+function ManualDiscoveryDialog({ selection, onClose, onAdded, onSent }: { selection: SendSelectionState; onClose: () => void; onAdded: () => Promise<void>; onSent: () => void }) {
   const [publicAddress, setPublicAddress] = useState('');
   const [address, setAddress] = useState(''); const [expected, setExpected] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
-  const [publicPrompt, setPublicPrompt] = useState(false); const [publicError, setPublicError] = useState('');
+  const [publicPrompt, setPublicPrompt] = useState(false); const [publicSend, setPublicSend] = useState(false); const [publicError, setPublicError] = useState('');
   const formRef = useRef<HTMLFormElement>(null);
   useDialogEnter(!publicPrompt, () => { if (!busy) formRef.current?.requestSubmit(); });
-  async function connect(allowPublic: boolean) { await addEndpoint(address.trim(), expected.trim() || null, allowPublic); await onAdded(); }
+  async function connect(allowPublic: boolean, send = false) {
+    const peer = await addEndpoint(address.trim(), expected.trim() || null, allowPublic);
+    if (send) {
+      if (!selection.paths.length) throw new Error('请先选择要发送的文件。');
+      await sendFiles(peer.node_id, selection.paths, selection.verifyHash, allowPublic, address.trim());
+      selection.setPaths([]);
+      onSent();
+      return;
+    }
+    await onAdded();
+  }
   async function submit(event: FormEvent) {
     event.preventDefault(); if (busy || publicPrompt || !address.trim()) return; setBusy(true); setError('');
     try { await connect(false); }
@@ -61,9 +71,17 @@ function ManualDiscoveryDialog({ onClose, onAdded }: { onClose: () => void; onAd
   }
   async function allowPublicPath() {
     setBusy(true); setPublicError('');
-    try { await connect(true); }
+    try { await connect(true, publicSend); }
     catch (err) { setPublicPrompt(false); setError(errorText(err)); }
     finally { setBusy(false); }
   }
-  return <><div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }}><form ref={formRef} className="modal surface" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">DISCOVER NODE</span><h2>手动发现设备</h2></div><button type="button" className="icon-button" onClick={onClose} title="关闭"><Icon name="close" /></button></div><label>地址<input autoFocus value={address} onChange={event => setAddress(event.target.value)} placeholder="192.168.1.20 或设备主机名（可选 :端口）" required /></label><label>预期 Node ID（可选）<input value={expected} onChange={event => setExpected(event.target.value)} placeholder="用于核对接收方身份" /></label><p className="hint">私有 IP 可直接连接；连接公网地址前会请求确认。</p>{error && <div className="notice error" role="alert">{error}</div>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" disabled={busy || !address.trim()}>验证并添加设备</button></div></form></div>{publicPrompt && <PublicPathPrompt address={publicAddress} busy={busy} error={publicError} onCancel={() => setPublicPrompt(false)} onConfirm={allowPublicPath} />}</>;
+  async function sendToAddress() {
+    if (!selection.paths.length) { setError('请先选择要发送的文件。'); return; }
+    if (busy || publicPrompt || !address.trim()) return;
+    setBusy(true); setError('');
+    try { await connect(false, true); }
+    catch (err) { if (publicPathRejected(err)) { setPublicAddress(publicPathAddress(err)); setPublicError(''); setPublicSend(true); setPublicPrompt(true); } else setError(errorText(err)); }
+    finally { setBusy(false); }
+  }
+  return <><div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }}><form ref={formRef} className="modal surface" onSubmit={selection.paths.length ? event => { event.preventDefault(); void sendToAddress(); } : submit}><div className="modal-heading"><div><span className="eyebrow">DISCOVER NODE</span><h2>手动发现设备</h2></div><button type="button" className="icon-button" onClick={onClose} title="关闭"><Icon name="close" /></button></div><label>地址<input autoFocus value={address} onChange={event => setAddress(event.target.value)} placeholder="192.168.1.20 或设备主机名（可选 :端口）" required /></label><label>预期 Node ID（可选）<input value={expected} onChange={event => setExpected(event.target.value)} placeholder="用于核对接收方身份" /></label><p className="hint">私有 IP 可直接连接；连接公网地址前会请求确认。</p>{error && <div className="notice error" role="alert">{error}</div>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button>{selection.paths.length ? <button type="submit" className="primary" disabled={busy || !address.trim()}>验证并发送</button> : <button type="submit" className="primary" disabled={busy || !address.trim()}>验证并添加设备</button>}</div></form></div>{publicPrompt && <PublicPathPrompt address={publicAddress} busy={busy} error={publicError} onCancel={() => setPublicPrompt(false)} onConfirm={allowPublicPath} />}</>;
 }

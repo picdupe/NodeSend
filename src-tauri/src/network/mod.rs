@@ -263,6 +263,7 @@ impl NetworkManager {
         paths: Vec<String>,
         verify_hash: bool,
         allow_public: bool,
+        preferred_address: Option<String>,
     ) -> AppResult<String> {
         let cancellation = CancellationToken::new();
         self.preflights
@@ -274,6 +275,7 @@ impl NetworkManager {
                 paths,
                 verify_hash,
                 allow_public,
+                preferred_address,
                 cancellation,
             )
             .await;
@@ -293,9 +295,17 @@ impl NetworkManager {
         paths: Vec<String>,
         verify_hash: bool,
         allow_public: bool,
+        preferred_address: Option<String>,
         cancellation: CancellationToken,
     ) -> AppResult<String> {
-        let peer = self.peers.get(&peer_id)?;
+        let mut peer = self.peers.get(&peer_id)?;
+        if let Some(address) = preferred_address.as_deref() {
+            peer.endpoints.sort_by_key(|endpoint| {
+                !(endpoint.address == address
+                    || address.starts_with(&format!("{}:", endpoint.address))
+                    || address.starts_with(&format!("[{}]", endpoint.address)))
+            });
+        }
         let public_endpoint = peer.endpoints.iter().find(|ep| {
             ep.socket(false)
                 .is_ok_and(|addr| !transport::is_local(addr.ip()))
@@ -391,7 +401,7 @@ impl NetworkManager {
         let peer = self.peers.get(&peer_id)?;
         let id = self
             .transfers
-            .create_outgoing(peer_id, peer.display_name, paths, verify_hash, allow_public)
+            .create_outgoing(peer_id, peer.display_name, paths, verify_hash, allow_public, preferred_address)
             .await?;
         self.transfers.start_task(self.peers.clone(), id.clone());
         Ok(id)
