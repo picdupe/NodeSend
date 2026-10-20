@@ -5,6 +5,8 @@ param(
     [Alias('Target')]
     [ValidateSet('arm64-v8a', 'armeabi-v7a', 'x86_64', 'universal')]
     [string]$Architecture = '',
+    [ValidateSet('stable', 'test')]
+    [string]$Channel = 'stable',
     [string]$JavaHome = ''
 )
 
@@ -73,6 +75,7 @@ foreach ($component in @('source.properties', 'toolchains/llvm/prebuilt/windows-
 }
 Write-Output "Android SDK: $sdkRoot"
 Write-Output "Android API: 36; NDK: $ndkRoot; Java: $JavaHome"
+Write-Output "Update channel: $Channel"
 if ($missing.Count) {
     throw ("Missing build prerequisites in the selected SDK:`n - " + ($missing -join "`n - "))
 }
@@ -251,8 +254,8 @@ try {
         }
         $python = Get-Command python -ErrorAction SilentlyContinue
         if (-not $python) { throw 'Python 3 is required to generate Android update metadata.' }
-        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel stable --apk $builtApks['arm64-v8a'] --url $downloadUri.AbsoluteUri --fallback-url "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)/$arm64Name"
-        if ($LASTEXITCODE -ne 0) { throw 'Could not merge Android APK metadata into updates/stable/latest.json.' }
+        & $python.Source (Join-Path $PSScriptRoot 'android-update-manifest.py') --channel $Channel --apk $builtApks['arm64-v8a'] --url $downloadUri.AbsoluteUri --fallback-url "https://github.com/picdupe/NodeSend/releases/download/v$($versionData.version)/$arm64Name"
+        if ($LASTEXITCODE -ne 0) { throw "Could not merge Android APK metadata into updates/$Channel/latest.json." }
         Write-Output "Android updater download URL: $($downloadUri.AbsoluteUri)"
     }
 } finally {

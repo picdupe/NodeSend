@@ -4,6 +4,8 @@ param(
     [switch]$Fast,
     [ValidateSet('all', 'nsis', 'msi')]
     [string]$Bundle = 'all',
+    [ValidateSet('stable', 'test')]
+    [string]$Channel = 'stable',
     [string]$WindowsSdk = '',
     [string]$UpdateDownloadBaseUrl = ''
 )
@@ -51,6 +53,7 @@ if ($missing.Count) { throw ("Missing Windows build prerequisites:`n - " + ($mis
 Write-Output "Visual Studio: $vsInstall"
 Write-Output "Windows SDK rc.exe: $rc"
 Write-Output "Bundle: $Bundle"
+Write-Output "Update channel: $Channel"
 if ($Check) {
     Write-Output 'Windows build prerequisites found.'
     exit 0
@@ -156,7 +159,7 @@ foreach ($artifact in $artifacts) {
 Write-Output 'Windows bundles:'
 $artifacts | Select-Object FullName, Length, LastWriteTime
 
-# Generate the stable updater manifest from the signed NSIS installer. The
+# Generate the selected updater manifest from the signed NSIS installer. The
 # manifest is served from GitCode raw first (see update-sources.json), and the
 # installer is published to GitCode Releases by default.
 # Override the download host with -UpdateDownloadBaseUrl or
@@ -190,7 +193,7 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
             throw 'Updater download URL must be a valid HTTP or HTTPS URL. Set -UpdateDownloadBaseUrl or NODESEND_UPDATE_DOWNLOAD_BASE_URL.'
         }
 
-        $manifestPath = Join-Path $projectRoot 'updates/stable/latest.json'
+        $manifestPath = Join-Path $projectRoot "updates/$Channel/latest.json"
         $manifestDirectory = Split-Path -Parent $manifestPath
         New-Item -ItemType Directory -Path $manifestDirectory -Force | Out-Null
 
@@ -231,7 +234,7 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         [System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.UTF8Encoding]::new($false))
         & $python.Source -c "import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); data=json.loads(p.read_text(encoding='utf-8-sig')); p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')" $manifestPath
         if ($LASTEXITCODE -ne 0) { throw "Could not normalize or validate updater manifest JSON: $manifestPath" }
-        Write-Output "Updater manifest generated: $manifestPath"
+        Write-Output "Updater manifest generated ($Channel): $manifestPath"
         Write-Output "Installer download URL: $($downloadUri.AbsoluteUri)"
     } else {
         Write-Output 'Updater manifest skipped: no renamed NSIS installer was found.'

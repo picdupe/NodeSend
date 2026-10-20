@@ -93,20 +93,10 @@ FunctionEnd
     Call NodeSendDefaultDirectory
   ${EndIf}
 
-  ; Read the previous uninstall entry from both registry views. The selected
-  ; directory above remains the new target even when the old install was C:.
-  ReadRegStr $4 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend" "InstallLocation"
-  ${If} $4 == ""
-    ReadRegStr $4 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend" "InstallLocation"
-  ${EndIf}
-  ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend" "UninstallString"
-  ${If} $0 == ""
-    ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend" "UninstallString"
-  ${EndIf}
-  ${If} $0 != ""
-    ExecWait '$0 /S'
-  ${EndIf}
-  ; Recreate the directory after the old uninstaller, before File instructions.
+  ; Never run the old uninstaller from inside an update install. It removes the
+  ; current application payload and can leave the install directory empty if
+  ; the new installer is interrupted. NSIS overwrites the existing files in
+  ; place and refreshes its uninstall registration as part of the normal install.
   SetOutPath "$INSTDIR"
   DetailPrint "Final INSTDIR: $INSTDIR"
   DetailPrint "Current OUTDIR: $OUTDIR"

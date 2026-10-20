@@ -2,9 +2,20 @@
 set -euo pipefail
 
 # Build both the GUI AppImage and the native CLI on a Linux builder.
-# Usage: ./scripts/linux.sh [debug]
+# Usage: ./scripts/linux.sh [debug] [stable|test]
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+PROFILE_ARG="release"
+CHANNEL="stable"
+for arg in "$@"; do
+  case "$arg" in
+    debug) PROFILE_ARG="debug" ;;
+    stable|test) CHANNEL="$arg" ;;
+    *) echo "Unknown argument: $arg. Usage: ./scripts/linux.sh [debug] [stable|test]" >&2; exit 2 ;;
+  esac
+done
+echo "Update channel: $CHANNEL"
 
 PYTHON="$(command -v python3 || true)"
 if [[ -z "$PYTHON" ]]; then
@@ -20,7 +31,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 127
 fi
 
-if [[ "${1:-}" != "debug" ]]; then
+if [[ "$PROFILE_ARG" != "debug" ]]; then
   : "${TAURI_SIGNING_PRIVATE_KEY:?Set TAURI_SIGNING_PRIVATE_KEY to the updater signing key (keep it outside the repository) before a release build.}"
   NODESEND_UPDATER_PUBLIC_KEY="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json", encoding="utf-8"))["plugins"]["updater"]["pubkey"])')"
   export NODESEND_UPDATER_PUBLIC_KEY
@@ -29,7 +40,7 @@ fi
 
 npm run build
 # 先打包 GUI：nodesend-cli 属于 cli feature，不应进入 AppImage。
-if [[ "${1:-}" == "debug" ]]; then
+if [[ "$PROFILE_ARG" == "debug" ]]; then
   PROFILE=debug
   CLI_FLAGS=()
   npm exec -- tauri build --bundles appimage --debug --config src-tauri/tauri.linux.fast.json
@@ -73,7 +84,7 @@ if [[ "$PROFILE" == "release" ]]; then
     export NODESEND_MANIFEST_SIGNATURE="$(cat "$APPIMAGE_DIR/$ARCHIVE_NAME.sig")"
     export NODESEND_MANIFEST_URL="${DOWNLOAD_BASE}/${ARCHIVE_NAME}"
     export NODESEND_MANIFEST_FALLBACK_URL="${NODESEND_GITHUB_UPDATE_DOWNLOAD_BASE_URL:-https://github.com/picdupe/NodeSend/releases/download/v${VERSION}}/${ARCHIVE_NAME}"
-    export NODESEND_MANIFEST_PATH="$ROOT/updates/stable/latest.json"
+    export NODESEND_MANIFEST_PATH="$ROOT/updates/$CHANNEL/latest.json"
     python3 - <<'PY'
 import json
 import os
