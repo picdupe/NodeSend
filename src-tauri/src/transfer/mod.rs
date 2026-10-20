@@ -115,7 +115,8 @@ impl TransferService {
         if task.scan_complete || task.destination.is_none() {
             return Ok(());
         }
-        let mut added = 0u64;
+        let mut added_files = 0usize;
+        let mut added_bytes = 0u64;
         for index in first..task.manifest.entries.len() {
             let Some(entry) = task.manifest.entries.get(index) else { continue };
             if entry.directory || entry.size == 0
@@ -126,16 +127,14 @@ impl TransferService {
             }
             if entry.size <= CACHE_FILE_LIMIT {
                 task.cache_files.insert(index);
-                added = added.saturating_add(entry.size);
+                added_files = added_files.saturating_add(1);
+                added_bytes = added_bytes.saturating_add(entry.size);
             }
         }
-        if added > 0 {
+        if added_files > 0 {
             task.use_cache = true;
-            task.relay_target_bytes = task.relay_target_bytes.saturating_add(added);
+            task.relay_target_bytes = task.relay_target_bytes.saturating_add(added_bytes);
             task.updated_at = chrono::Utc::now().to_rfc3339();
-            task.event(format!(
-                "扫描中：新增 {added} 个文件使用缓存中转（单文件不超过 30 GiB）"
-            ));
             self.persist(task)?;
         }
         Ok(())
@@ -161,7 +160,6 @@ impl TransferService {
             if record.relayed.len() < record.manifest.entries.len() {
                 record.relayed.resize(record.manifest.entries.len(), 0);
             }
-            record.event(format!("完整清单已到齐，缓存计划已更新：{} 个文件，路径：{}", selected.len(), cache.display()));
         })?;
         locks::lock(&self.task_cache_roots).insert(id.to_string(), cache);
         Ok(())
@@ -1499,7 +1497,7 @@ impl TransferService {
             t.relayed = vec![0; t.manifest.entries.len()];
             t.relayed_total = 0;
             t.event(if !t.scan_complete && current_cache_root.is_some() {
-                "正在扫描清单，缓存计划会按文件大小逐步确定（单文件不超过 30 GiB 使用缓存）".to_string()
+                "正在扫描清单，请稍候".to_string()
             } else if use_cache {
                 format!("接收方已确认保存位置和冲突策略（缓存盘中转已启用，{} 个文件，路径：{}）", cache_files.len(), current_cache_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default())
             } else {

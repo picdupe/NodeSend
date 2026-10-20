@@ -4,6 +4,24 @@ import { transferAction, errorText } from '../../api/network';
 import type { TransferTask } from '../../types/network';
 import { Icon } from '../Icon';
 import { formatBytes, statusLabels, terminal } from './format';
+
+function formatLocalTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).replace(/-/g, '/');
+}
+
+function formatTaskEvent(value: string): string {
+  const match = value.match(/^(\d{4}-\d{2}-\d{2}T\S+?)(\s+)(.*)$/);
+  if (!match) return value;
+  const date = new Date(match[1]);
+  if (Number.isNaN(date.getTime())) return value;
+  return `${formatLocalTime(match[1])} ${match[3]}`;
+}
+
 export function TaskList({ tasks, refresh }: { tasks: TransferTask[]; refresh: () => Promise<void> }) {
   const [filter, setFilter] = useState('all'); const [search, setSearch] = useState(''); const [error, setError] = useState('');
   const [busy, setBusy] = useState<string[]>([]);
@@ -19,7 +37,7 @@ export function TaskList({ tasks, refresh }: { tasks: TransferTask[]; refresh: (
       <div className="task-meta"><span>{formatBytes(task.completed_bytes)} / {known ? formatBytes(task.total_bytes) : '--'} · <span className="transfer-speed">{formatBytes(task.bytes_per_second ?? 0)}/s</span>{known ? ` · ${percent.toFixed(2)}%` : ''}{task.scan_complete ? '' : ' · 正在扫描'}</span><span>{task.transport?.toUpperCase() ?? '等待连接'}{task.transport ? ' · TLS 1.3' : ''}{task.verify_hash ? ' · SHA-256' : ''}</span></div>
       {task.error && <div className="notice error">{task.error}</div>}
       {!!task.warnings?.length && <div className="notice" role="status"><strong>{task.status === 'completed' ? '传输已结束，部分文件因源文件变化未发送：' : '以下文件已变化，其余文件继续传输：'}</strong>{task.warnings.map((warning, i) => <div key={i}>{warning}</div>)}</div>}
-      <div className="task-bottom"><details><summary>传输详情</summary><div className="task-details"><p className="mono">Node ID：{task.peer_id}</p>{task.destination && <p>保存位置：<ReceiveDirectoryLabel path={task.destination} /></p>}<p>{new Date(task.created_at).toLocaleString()}</p>{task.events.map((event, i) => <p key={i}>{event}</p>)}</div></details><div className="button-row">{!terminal(task.status) && <>{['paused', 'remote_paused', 'failed'].includes(task.status) ? <button disabled={busy.includes(task.id)} onClick={() => action(task.id, task.status === 'failed' ? 'retry' : 'resume')}><Icon name="play" size={15} />{task.status === 'failed' ? '重试' : '恢复'}</button> : task.status !== 'waiting' && <button disabled={busy.includes(task.id)} onClick={() => action(task.id, 'pause')}><Icon name="pause" size={15} />暂停</button>}<button disabled={busy.includes(task.id)} className="text-button danger" onClick={() => action(task.id, 'cancel')}>取消</button></>}</div></div>
+      <div className="task-bottom"><details><summary>传输详情</summary><div className="task-details"><p className="mono">Node ID：{task.peer_id}</p>{task.destination && <p>保存位置：<ReceiveDirectoryLabel path={task.destination} /></p>}<p>{formatLocalTime(task.created_at)}</p>{task.events.map((event, i) => <p key={i}>{formatTaskEvent(event)}</p>)}</div></details><div className="button-row">{!terminal(task.status) && <>{['paused', 'remote_paused', 'failed'].includes(task.status) ? <button disabled={busy.includes(task.id)} onClick={() => action(task.id, task.status === 'failed' ? 'retry' : 'resume')}><Icon name="play" size={15} />{task.status === 'failed' ? '重试' : '恢复'}</button> : task.status !== 'waiting' && <button disabled={busy.includes(task.id)} onClick={() => action(task.id, 'pause')}><Icon name="pause" size={15} />暂停</button>}<button disabled={busy.includes(task.id)} className="text-button danger" onClick={() => action(task.id, 'cancel')}>取消</button></>}</div></div>
     </article>; })}
   </>;
 }

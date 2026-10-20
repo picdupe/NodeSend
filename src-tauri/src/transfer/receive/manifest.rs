@@ -247,6 +247,12 @@ impl TransferService {
             record.chunk_count = record.manifest.chunk_count();
             record.digest = digest.clone();
             record.scan_complete = true;
+            if record.use_cache {
+                record.event(format!(
+                    "清单扫描完成：共 {} 个文件使用缓存中转",
+                    record.cache_files.len()
+                ));
+            }
         })?;
         if initial_status == "waiting" {
             let policy = self

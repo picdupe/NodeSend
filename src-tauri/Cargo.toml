@@ -7,7 +7,7 @@
 
 [package]
 name = "nodesend"
-version = "0.1.2-build.116"
+version = "0.1.2-build.117"
 default-run = "nodesend"
 description = "NodeSend 跨平台文件传输与共享 Service"
 authors = ["NodeSend"]
@@ -99,7 +99,7 @@ rcgen = "0.13"
 
 # --- 日志 ---
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 aes-gcm = "0.10"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]

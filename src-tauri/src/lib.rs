@@ -195,13 +195,17 @@ pub fn run() {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
+    // Use the machine's local timezone and a compact, human-readable timestamp.
+    // The default formatter emits UTC RFC3339 timestamps ending in `Z`.
+    let timer = || fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string());
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
 
     // Keep live output in the console window when running a debug build.
     #[cfg(debug_assertions)]
     {
-        let _ = fmt().with_env_filter(filter).try_init();
+        let _ = fmt().with_timer(timer()).with_env_filter(filter).try_init();
         return;
     }
 
@@ -219,6 +223,7 @@ fn init_tracing() {
                     .open(&log_path)
                 {
                     let _ = fmt()
+                        .with_timer(timer())
                         .with_env_filter(filter)
                         .with_ansi(false)
                         .with_writer(move || file.try_clone().expect("克隆 NodeSend 日志文件句柄失败"))
@@ -231,6 +236,9 @@ fn init_tracing() {
         // 日志目录不可用时保留控制台输出，避免日志初始化失败导致应用无法启动。
         let fallback_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
-        let _ = fmt().with_env_filter(fallback_filter).try_init();
+        let _ = fmt()
+            .with_timer(timer())
+            .with_env_filter(fallback_filter)
+            .try_init();
     }
 }
