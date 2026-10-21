@@ -26,7 +26,7 @@ pub fn init(app: &App) -> tauri::Result<()> {
     let mut builder = TrayIconBuilder::with_id("nodesend-tray")
         .menu(&menu)
         .tooltip("NodeSend · 近在身边")
-        // 左键用于显示/隐藏主窗口，菜单只在右键弹出。
+        // 左键只负责显示主窗口，窗口关闭按钮负责隐藏到托盘。
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             MENU_SHOW => show_main(app),
@@ -40,7 +40,7 @@ pub fn init(app: &App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                toggle_main(tray.app_handle());
+                show_main(tray.app_handle());
             }
         });
     // 复用应用图标（tauri.conf.json 的 bundle.icon），不额外打包图片资源。
@@ -51,7 +51,7 @@ pub fn init(app: &App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 拦截窗口关闭：隐藏窗口但不结束进程，让托盘继续驻留。
+/// Hide the window on close while keeping the native service and tray alive.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if let WindowEvent::CloseRequested { api, .. } = event {
         api.prevent_close();
@@ -68,13 +68,3 @@ pub fn show_main(app: &AppHandle) {
     }
 }
 
-/// 左键单击托盘：主窗口可见时隐藏，不可见时显示。
-fn toggle_main(app: &AppHandle) {
-    match app.get_webview_window(MAIN_WINDOW) {
-        Some(window) if window.is_visible().unwrap_or(false) => {
-            let _ = window.hide();
-        }
-        Some(_) => show_main(app),
-        None => {}
-    }
-}

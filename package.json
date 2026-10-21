@@ -1,7 +1,7 @@
 {
   "name": "nodesend",
   "private": true,
-  "version": "0.1.3-build.119",
+  "version": "0.1.3-build.120",
   "type": "module",
   "description": "NodeSend - 跨平台去中心化 Node ↔ Node 文件传输与共享工具",
   "scripts": {

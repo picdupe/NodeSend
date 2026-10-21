@@ -23,6 +23,8 @@ pub(crate) mod locks;
 pub mod network;
 pub mod registry;
 pub mod service;
+#[cfg(target_os = "windows")]
+pub mod single_instance;
 pub mod share;
 pub mod transfer;
 #[cfg(desktop)]
@@ -89,6 +91,8 @@ pub fn run() {
             tauri::async_runtime::block_on(protocol_manager.restore(service.clone()))?;
             let network_manager =
                 tauri::async_runtime::block_on(network::NetworkManager::start(service.clone()))?;
+            #[cfg(target_os = "windows")]
+            single_instance::start_listener(app.handle().clone());
             tracing::info!(
                 build = BUILD_TAG,
                 node_id = %service.identity.node_id,

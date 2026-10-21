@@ -7,5 +7,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if !nodesend_lib::single_instance::acquire() {
+        return;
+    }
     nodesend_lib::run();
 }
