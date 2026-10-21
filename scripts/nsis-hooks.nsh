@@ -6,10 +6,16 @@
     StrCpy $5 $5 -1 1
   ${EndIf}
   ${If} $5 != ""
-    IfFileExists "$5\nodesend.exe" 0 +4
-      StrCpy $INSTDIR $5
-      SetRegView 64
-      Return
+    ; Never trust a registry value that points at a drive root. NSIS cleanup
+    ; operates relative to $INSTDIR, so accepting D:\ here could affect the
+    ; entire volume during an upgrade or uninstall.
+    StrCpy $7 $5 3
+    ${If} $5 != $7
+      IfFileExists "$5\nodesend.exe" 0 +4
+        StrCpy $INSTDIR $5
+        SetRegView 64
+        Return
+    ${EndIf}
   ${EndIf}
 !macroend
 
@@ -43,6 +49,19 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ; Never allow uninstall cleanup to target a drive root or the ProgramFiles
+  ; directory itself. A valid installation must be in a child directory.
+  StrCpy $7 $INSTDIR 3
+  ${If} $INSTDIR == $7
+    MessageBox MB_OK|MB_ICONSTOP "检测到安装目录是磁盘根目录，已停止卸载以保护其他文件。" /SD IDOK
+    Abort
+  ${EndIf}
+  ReadRegStr $8 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion" "ProgramFilesDir"
+  ${If} $8 != ""
+    StrCmp $INSTDIR $8 0 +3
+      MessageBox MB_OK|MB_ICONSTOP "检测到安装目录是 Program Files 根目录，已停止卸载以保护其他文件。" /SD IDOK
+      Abort
+  ${EndIf}
   DetailPrint "正在清理 NodeSend 防火墙规则…"
   nsExec::Exec '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="NodeSend TCP" program="$INSTDIR\nodesend.exe"'
   Pop $0
@@ -88,6 +107,16 @@ Function NodeSendDefaultDirectory
   ; it after selecting the final directory so payload files follow $INSTDIR.
 FunctionEnd
 
+Function NodeSendValidateDirectory
+  ; Refuse a drive root as the installation directory. This is checked after
+  ; all registry/default path logic and immediately before payload extraction.
+  StrCpy $7 $INSTDIR 3
+  ${If} $INSTDIR == $7
+    MessageBox MB_OK|MB_ICONSTOP "不能将 NodeSend 安装到磁盘根目录，请选择 NodeSend 子目录。" /SD IDOK
+    Abort
+  ${EndIf}
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
   ${If} ${Silent}
     Call NodeSendDefaultDirectory
@@ -97,6 +126,7 @@ FunctionEnd
   ; current application payload and can leave the install directory empty if
   ; the new installer is interrupted. NSIS overwrites the existing files in
   ; place and refreshes its uninstall registration as part of the normal install.
+  Call NodeSendValidateDirectory
   SetOutPath "$INSTDIR"
   DetailPrint "Final INSTDIR: $INSTDIR"
   DetailPrint "Current OUTDIR: $OUTDIR"

@@ -117,6 +117,16 @@ impl NetworkManager {
         Ok(manager)
     }
     pub fn status(&self) -> NetworkStatus {
+        let mut discovery = self
+            .discovery
+            .as_ref()
+            .map(|d| crate::locks::lock(&d.status).clone())
+            .unwrap_or_default();
+        if let Some(warning) = crate::transfer::relay::installation_warning() {
+            if !discovery.warnings.contains(&warning) {
+                discovery.warnings.push(warning);
+            }
+        }
         NetworkStatus {
             node_id: self.app.identity.node_id.clone(),
             display_name: transport::display_name(&self.app),
@@ -128,11 +138,7 @@ impl NetworkManager {
                 .filter(|i| !i.is_loopback())
                 .map(|i| i.ip().to_string())
                 .collect(),
-            discovery: self
-                .discovery
-                .as_ref()
-                .map(|d| crate::locks::lock(&d.status).clone())
-                .unwrap_or_default(),
+            discovery,
             peers: self.peers.list(),
             tasks: self.transfers.snapshots(),
             receive_directory: self.transfers.default_destination(),

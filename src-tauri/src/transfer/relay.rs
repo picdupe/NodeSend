@@ -61,10 +61,47 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
         candidates.push(app.paths.data_dir.join("Cache"));
     }
     for candidate in candidates {
+        if is_filesystem_root(&candidate) {
+            tracing::error!(dir = %candidate.display(), "拒绝将磁盘根目录作为 NodeSend 缓存目录");
+            continue;
+        }
         match std::fs::create_dir_all(&candidate) {
             Ok(()) => return Some(candidate),
             Err(err) => tracing::warn!(dir = %candidate.display(), "缓存目录不可用：{err}"),
         }
+    }
+    None
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    normalized.len() == 3
+        && normalized.as_bytes().get(1) == Some(&b':')
+        && normalized.ends_with('\\')
+}
+
+pub(crate) fn is_protected_cleanup_root(path: &Path) -> bool {
+    if is_filesystem_root(path) {
+        return true;
+    }
+    #[cfg(windows)]
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        let normalize = |value: &Path| {
+            value
+                .to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_ascii_lowercase()
+        };
+        return normalize(path) == normalize(Path::new(&program_files));
+    }
+    false
+}
+
+pub(crate) fn installation_warning() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    let install_dir = executable.parent()?;
+    if is_protected_cleanup_root(install_dir) {
+        return Some("安装目录异常：软件位于磁盘根目录或 Program Files 根目录。为保护其他文件，已禁用缓存清理；请重新安装到 NodeSend 子目录。".into());
     }
     None
 }
@@ -365,6 +402,10 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
     let Some(cache_root) = service.current_cache_root() else {
         return;
     };
+    if is_protected_cleanup_root(&cache_root) {
+        tracing::error!(dir = %cache_root.display(), "缓存清理已跳过：目录是磁盘根目录或 Program Files 根目录");
+        return;
+    }
     retry_pending_cleanup(service);
     let protected: HashSet<String> = service
         .receive_ids()
@@ -391,7 +432,7 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
         else {
             continue;
         };
-        if !path.is_dir() || protected.contains(&name) {
+        if !path.is_dir() || protected.contains(&name) || !name.starts_with("in-") {
             continue;
         }
         if let Err(err) = std::fs::remove_dir_all(&path) {
@@ -431,6 +472,10 @@ fn retry_pending_cleanup(service: &TransferService) {
     let mut remaining = Vec::new();
     for value in list {
         let path = PathBuf::from(&value);
+        if is_protected_cleanup_root(&path) {
+            tracing::error!(dir = %path.display(), "跳过危险的磁盘根目录清理记录");
+            continue;
+        }
         if !path.exists() {
             continue;
         }

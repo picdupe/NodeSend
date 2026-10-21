@@ -2,7 +2,7 @@
 pub mod model;
 pub mod paths;
 mod receive;
-mod relay;
+pub(crate) mod relay;
 mod send;
 pub mod source;
 mod write_queue;
