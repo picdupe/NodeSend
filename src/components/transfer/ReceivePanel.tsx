@@ -1,12 +1,13 @@
 import { useReceiveDirectoryLabel } from '../../hooks/useReceiveDirectoryLabel';
 import { useEffect, useRef, useState } from 'react';
 import type { ConflictPolicy, FileEntry, NetworkStatus, TransferTask } from '../../types/network';
-import { chooseReceiveDirectory, decideIncoming, errorText, listTaskEntries } from '../../api/network';
+import { chooseReceiveDirectory, errorText, listTaskEntries } from '../../api/network';
+import { useReceiveDecision } from '../../hooks/useReceiveDecision';
 import { Icon } from '../Icon';
 import { formatBytes } from './format';
 /** 清单分页大小：清单可能达百万条，必须按需分页加载，不能一次传入前端。 */
 const PAGE_SIZE = 200;
-function RequestCard({ task, directory, refresh }: { task: TransferTask; directory: string; refresh: () => Promise<void> }) {
+function RequestCard({ task, directory, decideReceive, busy, decisionError }: { task: TransferTask; directory: string; decideReceive: ReturnType<typeof useReceiveDecision>['decide']; busy: boolean; decisionError: string }) {
   const [destination, setDestination] = useState(directory);
   const manuallySelected = useRef(false);
   useEffect(() => { if (!manuallySelected.current) setDestination(directory); }, [directory]);
@@ -19,7 +20,6 @@ function RequestCard({ task, directory, refresh }: { task: TransferTask; directo
   const [total, setTotal] = useState(task.file_count);
   const [loading, setLoading] = useState(false);
   const [trustDevice, setTrustDevice] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function choose() { try { const path = await chooseReceiveDirectory(); if (path) { manuallySelected.current = true; setDestination(path); } } catch (e) { setError(errorText(e)); } }
   /** 追加加载一页清单明细（首次加载 offset=0）。 */
@@ -31,7 +31,7 @@ function RequestCard({ task, directory, refresh }: { task: TransferTask; directo
       setEntries(old => [...old, ...page.entries]);
     } catch (e) { setError(errorText(e)); } finally { setLoading(false); }
   }
-  async function decide(accepted: boolean) { setBusy(true); try { await decideIncoming(task.id, accepted, destination, policy, all ? null : selected, accepted && trustDevice); await refresh(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
+  async function decide(accepted: boolean) { try { await decideReceive(task.id, accepted, destination, policy, all ? null : selected, accepted && trustDevice); } catch (e) { setError(errorText(e)); } }
   const files = Math.max(0, task.file_count - task.directory_count);
   const rootsReady = task.top_level_count === 0 || task.file_count >= task.top_level_count;
   return <article className="surface request-card">
@@ -49,18 +49,19 @@ function RequestCard({ task, directory, refresh }: { task: TransferTask; directo
     <div className="receive-options"><div><label>保存到</label><button className="folder-button" onClick={choose} title={destinationLabel}><Icon name="folder" size={16} /><span>{destinationLabel}</span><span>更改</span></button></div><label>同名文件<select value={policy} onChange={e => setPolicy(e.target.value as ConflictPolicy)}><option value="rename">保留两份（重命名）</option><option value="skip">跳过已有文件</option><option value="overwrite">覆盖同路径文件</option></select></label></div>
     {policy === 'overwrite' && <p className="caption">确认接收将覆盖所选目录中的同路径文件。</p>}
     <label className="check-label"><input type="checkbox" checked={trustDevice} disabled={busy} onChange={event => setTrustDevice(event.target.checked)} /><span className="check-mark" aria-hidden="true"><Icon name="check" size={14} /></span><span>信任此设备，以后自动接收（自动拒绝策略除外）</span></label>
-    {error && <div className="notice error" role="alert">{error}</div>}
+    {(error || decisionError) && <div className="notice error" role="alert">{error || decisionError}</div>}
     {!rootsReady && <p className="caption">正在读取所选文件和目录，收到全部顶层项目后即可确认。</p>}
     <div className="request-actions"><button className="danger" disabled={busy} onClick={() => decide(false)}>拒绝</button><button className="primary" disabled={busy || !rootsReady || (!all && !selected.length)} onClick={() => decide(true)}><Icon name="check" size={17} />确认接收</button></div>
   </article>;
 }
 export function ReceivePanel({ status, refresh }: { status: NetworkStatus; refresh: () => Promise<void> }) {
+  const decision = useReceiveDecision(refresh);
   const requests = status.tasks.filter(t => t.direction === 'receive' && t.status === 'waiting');
   const [copied, setCopied] = useState(false);
   return <>
     <section className="receive-identity surface"><div className="identity-mark"><Icon name="device" size={34} /></div><div><span className="eyebrow">这台设备</span><h2>{status.display_name}</h2><p>告诉发送方选择这个名称</p><span className="badge success"><span className="status-dot online" />等待来自其他 Node 的请求</span></div><button className="copy-node-id" onClick={async () => { try { await navigator.clipboard.writeText(status.node_id); setCopied(true); } catch { setCopied(false); } }}>{copied ? '已复制 Node ID' : '复制 Node ID'}</button></section>
     <div className="section-heading"><h2>接收请求 <span className="count-tag">{requests.length}</span></h2><span>由你决定接收内容和保存位置</span></div>
     {!requests.length && <section className="surface empty-state generous"><Icon name="receive" size={38} /><h3>准备好接收了</h3><p>让另一台设备选择文件并发送给你。<br />收到请求后，会在这里等待你的确认。</p><span className="caption">默认每次询问</span></section>}
-    {requests.map(task => <RequestCard key={task.id} task={task} directory={status.receive_directory} refresh={refresh} />)}
+    {requests.map(task => <RequestCard key={task.id} task={task} directory={status.receive_directory} decideReceive={decision.decide} busy={decision.busy} decisionError={decision.error} />)}
   </>;
 }

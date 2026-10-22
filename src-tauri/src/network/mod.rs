@@ -420,6 +420,8 @@ impl NetworkManager {
         conflict: ConflictPolicy,
         selected: Option<Vec<String>>,
     ) -> AppResult<()> {
+        let destination = destination.filter(|value| !value.trim().is_empty())
+            .or_else(|| Some(self.transfers.default_destination()));
         if accepted
             && destination.as_deref() == Some(self.transfers.default_destination().as_str())
             && !std::path::Path::new(destination.as_ref().unwrap()).exists()

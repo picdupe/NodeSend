@@ -634,6 +634,18 @@ impl TaskRecord {
         } else {
             (self.file_count, self.directory_count)
         };
+        let file_name = self
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| entry.path.split('/').next())
+            .fold(Vec::<String>::new(), |mut names, name| {
+                if !names.iter().any(|value| value == name) && names.len() < 32 {
+                    names.push(name.to_string());
+                }
+                names
+            })
+            .join("、");
         TaskSnapshot {
             warnings: self
                 .skipped_paths
@@ -642,6 +654,7 @@ impl TaskRecord {
                 .collect(),
             id: self.id.clone(),
             peer_id: self.peer_id.clone(),
+            file_name,
             peer_name: self.peer_name.clone(),
             peer_device_type: self.peer_device_type.clone(),
             direction: self.direction.clone(),
@@ -666,6 +679,7 @@ pub struct TaskSnapshot {
     pub warnings: Vec<String>,
     pub id: String,
     pub peer_id: String,
+    pub file_name: String,
     pub peer_name: String,
     pub peer_device_type: String,
     pub direction: String,

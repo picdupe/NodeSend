@@ -104,7 +104,7 @@ export default function App() {
       .catch(() => {});
     return () => dispose?.();
   }, [navigate, sendSelection.setPaths]);
-  return <AppLayout current={page} onNavigate={navigate} status={network.status}>
+  return <AppLayout current={page} onNavigate={navigate} status={network.status} refresh={network.refresh}>
     {page === 'send' && exitHint && <div className="back-exit-hint" role="status">再按一次返回退出</div>}
     {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} onNavigate={navigate} selection={sendSelection} />}
     {page === 'dashboard' && <DashboardPage network={network.status} onSaved={network.refresh} />}
