@@ -1,22 +1,22 @@
 {
-  "version": "0.1.3-build.121",
+  "version": "0.1.3-build.122",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR1BIWUxpdXNPeFR1OW9mdGt0N0djVFFYVnV0QVpXU0FrWHB2ZXJVT1VLV0V0UHR4K0RhTEpaVXgySzhtUi9PV1cvT1FPT0hIZXpycFFrc1pMdmhxclFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNjU0NDk1CWZpbGU6Tm9kZVNlbmRfMC4xLjMtYnVpbGQuMTIxX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuMy1idWlsZC4xMjEKblJ0cmdVR2lkVlpIb1p0clN5MHRCNTBLTTlEZzdubC9jZ3lQRjNlQ0RKdEpXc0JUSWJZWlE0a2VBNmU4bkN4U05xcVRySjdFYXYwSVJFNWd5d3lNQ2c9PQo=",
-      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_0.1.3.121_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR095RUtHM1RVb29hZ1dBMXhtVi9OeXU1VjFVbFhBS2ZMQWdUOU5zU29ZeHpQQVl6WWJNZE9wMlFkenVxaGJDTkNqeFRsWXB3bDZzS09aNitkQ1RXR1F3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNjgxMjQ3CWZpbGU6Tm9kZVNlbmRfMC4xLjMtYnVpbGQuMTIyX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuMy1idWlsZC4xMjIKTFJWR1REa0l5NlZLQ3lEcmNyR2NEWlNSaUVwaWl0MEhub21keGd3VXpuSWo1Y21waVB2THdEVkE2THZEYzNKVktpakh1S2Z5NzVEN0l4b0ZKOHl3QUE9PQo=",
+      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_0.1.3.122_x64-setup.exe",
       "fallback_urls": [
-        "https://github.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_0.1.3.121_x64-setup.exe"
+        "https://github.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_0.1.3.122_x64-setup.exe"
       ]
     }
   },
   "release_page_url": "https://gitcode.com/picdupe/NodeSend/releases",
   "android": {
-    "version": "0.1.3.121",
-    "versionCode": 1030121,
-    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_v0.1.3.121-arm64-v8a-release.apk",
+    "version": "0.1.3.122",
+    "versionCode": 1030122,
+    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_v0.1.3.122-arm64-v8a-release.apk",
     "fallbackUrls": [
-      "https://github.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_v0.1.3.121-arm64-v8a-release.apk"
+      "https://github.com/picdupe/NodeSend/releases/download/v0.1.3/NodeSend_v0.1.3.122-arm64-v8a-release.apk"
     ],
-    "sha256": "0dd6776a8a3412005a6ca992c59b4df1ff24840f1b20c8996d5c106a7a759855"
+    "sha256": "df7d7985ad3e74c34f386baea2bdb5acd8258cc0b0d42ad56ba5569bf4ee71aa"
   }
 }

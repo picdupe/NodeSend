@@ -13,6 +13,7 @@ import { useSendSelection } from './hooks/useSendSelection';
 import { frontendPreview } from './api/runtime';
 export default function App() {
   const [page, setPage] = useState<PageKey>('send');
+  const [sendTaskId, setSendTaskId] = useState<string | null>(null);
   const [exitHint, setExitHint] = useState(false);
   const network = useNetwork();
   const sendSelection = useSendSelection();
@@ -106,7 +107,7 @@ export default function App() {
   }, [navigate, sendSelection.setPaths]);
   return <AppLayout current={page} onNavigate={navigate} status={network.status} refresh={network.refresh}>
     {page === 'send' && exitHint && <div className="back-exit-hint" role="status">再按一次返回退出</div>}
-    {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} onNavigate={navigate} selection={sendSelection} />}
+    {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} selection={sendSelection} sendTaskId={sendTaskId} onSendTaskChange={setSendTaskId} />}
     {page === 'dashboard' && <DashboardPage network={network.status} onSaved={network.refresh} />}
     {page === 'shares' && <ShareCenterPage />}
     {page === 'trusted' && <TrustedPage />}

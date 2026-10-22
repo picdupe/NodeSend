@@ -1,12 +1,13 @@
 import { addressPriority } from '../utils/address';
 import type { NetworkStatus } from '../types/network';
 import { SendPanel } from '../components/transfer/SendPanel';
+import { SendSession } from '../components/transfer/SendSession';
 import { ReceivePanel } from '../components/transfer/ReceivePanel';
 import { TaskList } from '../components/transfer/TaskList';
 import { Icon } from '../components/Icon';
 import { SidebarToggle } from '../components/AppLayout';
 import { PublicPathPrompt, publicPathRejected, publicPathAddress } from '../components/PublicPathPrompt';
-import { addEndpoint, errorText, sendFiles } from '../api/network';
+import { addEndpoint, errorText, sendFiles, transferAction } from '../api/network';
 import { useRef, useState, type FormEvent } from 'react';
 import { useDialogEnter } from '../components/useDialogEnter';
 import { useDeviceFavorites } from '../hooks/useDeviceFavorites';
@@ -14,12 +15,18 @@ import type { SendSelectionState } from '../hooks/useSendSelection';
 
 export type TransferPage = 'send' | 'receive' | 'transfers';
 const copy: Record<TransferPage, [string, string]> = { send: ['传递，就在身边', '把文件送到另一台设备，简单、直接。'], receive: ['接收，尽在掌握', '每一次传递，都由你确认。'], transfers: ['每一次传递', '查看进度、继续任务，或回顾已经送达的文件。'] };
-export function NetworkPage({ mode, status, error, refresh, onNavigate, selection }: { mode: TransferPage; status: NetworkStatus | null; error: string; refresh: () => Promise<void>; onNavigate: (page: TransferPage) => void; selection: SendSelectionState }) {
+export function NetworkPage({ mode, status, error, refresh, selection, sendTaskId, onSendTaskChange }: { mode: TransferPage; status: NetworkStatus | null; error: string; refresh: () => Promise<void>; selection: SendSelectionState; sendTaskId: string | null; onSendTaskChange: (id: string | null) => void }) {
   const [manualOpen, setManualOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [favoritesOpen, setFavoritesOpen] = useState(false);
   const { favorites, favoriteError, toggleFavorite, removeFavorite } = useDeviceFavorites();
   const [refreshing, setRefreshing] = useState(false);
+  const [cancelError, setCancelError] = useState('');
+  function cancelSend(id: string) {
+    onSendTaskChange(null);
+    setCancelError('');
+    void transferAction(id, 'cancel').then(refresh).catch(e => setCancelError(errorText(e)));
+  }
   async function runRefresh() {
     if (refreshing) return;
     setRefreshing(true);
@@ -30,12 +37,14 @@ export function NetworkPage({ mode, status, error, refresh, onNavigate, selectio
       setRefreshing(false);
     }
   }
+  if (mode === 'send' && sendTaskId && status) return <SendSession taskId={sendTaskId} status={status} onCancel={cancelSend} onClose={() => onSendTaskChange(null)} />;
   return <div className={'page transfer-page ' + (mode === 'send' ? 'send-page' : '')}><header className="page-heading"><div><span className="eyebrow">NODESEND / {mode === 'send' ? 'SEND' : mode === 'receive' ? 'RECEIVE' : 'ACTIVITY'}</span><h1>{copy[mode][0]}</h1><p>{copy[mode][1]}</p></div><div className="page-heading-actions">{mode === 'send' && <><button type="button" className="icon-button device-info-button" aria-label="查看本机信息" onClick={() => setInfoOpen(true)}><Icon name="info" /></button><button type="button" className="icon-button device-info-button favorites-button" aria-label="查看收藏设备" disabled={!status} onClick={() => setFavoritesOpen(true)}><Icon name="heart" /></button><button type="button" className="icon-button manual-discovery-button" aria-label="手动发现设备" onClick={() => setManualOpen(true)}><Icon name="discover" /><span>手动发现设备</span></button></>}<button type="button" className={'icon-button refresh-button' + (refreshing ? ' refreshing' : '')} aria-label="刷新设备与任务" aria-busy={refreshing} onClick={runRefresh}><Icon name="refresh" /></button><SidebarToggle /></div></header>
     {error && <div className="notice error" role="alert">{status ? error : '尚未连接到 NodeSend 本机服务。请通过桌面应用打开。'}<details><summary>查看原因</summary>{error}</details></div>}
+    {cancelError && <div className="notice error" role="alert">取消请求失败：{cancelError}</div>}
     {status?.discovery.warnings.map(warning => <div className="notice" key={warning}>{warning}；可尝试手动连接设备。</div>)}
     {!status && !error && <div className="surface empty-state generous">正在连接本机服务…</div>}
-    {status && <>{mode === 'send' && <div className="send-shell"><SendPanel status={status} selection={selection} favoritesOpen={favoritesOpen} onCloseFavorites={() => setFavoritesOpen(false)} onRemoveFavorite={removeFavorite} favorites={favorites} favoriteError={favoriteError} onToggleFavorite={toggleFavorite} refresh={refresh} onSent={() => onNavigate('transfers')} /></div>}{mode === 'receive' && <ReceivePanel status={status} refresh={refresh} />}{mode === 'transfers' && <TaskList tasks={status.tasks} refresh={refresh} />}</>}
-    {manualOpen && <ManualDiscoveryDialog selection={selection} onClose={() => setManualOpen(false)} onAdded={async () => { setManualOpen(false); await refresh(); }} onSent={() => { setManualOpen(false); void refresh(); onNavigate('transfers'); }} />}
+    {status && <>{mode === 'send' && <div className="send-shell"><SendPanel status={status} selection={selection} favoritesOpen={favoritesOpen} onCloseFavorites={() => setFavoritesOpen(false)} onRemoveFavorite={removeFavorite} favorites={favorites} favoriteError={favoriteError} onToggleFavorite={toggleFavorite} refresh={refresh} onSent={onSendTaskChange} /></div>}{mode === 'receive' && <ReceivePanel status={status} refresh={refresh} />}{mode === 'transfers' && <TaskList tasks={status.tasks} refresh={refresh} />}</>}
+    {manualOpen && <ManualDiscoveryDialog selection={selection} onClose={() => setManualOpen(false)} onAdded={async () => { setManualOpen(false); await refresh(); }} onSent={id => { setManualOpen(false); void refresh(); onSendTaskChange(id); }} />}
     {infoOpen && status && <DeviceInfoDialog status={status} onClose={() => setInfoOpen(false)} />}
 
   </div>;
@@ -46,7 +55,7 @@ function DeviceInfoDialog({ status, onClose }: { status: NetworkStatus; onClose:
   return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="modal surface" role="dialog" aria-modal="true" aria-labelledby="device-info-title"><div className="modal-heading"><div><span className="eyebrow">LOCAL NODE</span><h2 id="device-info-title">设备信息</h2></div><button type="button" className="icon-button" onClick={onClose} title="关闭"><Icon name="close" /></button></div><dl className="detail-list"><dt>设备名称</dt><dd>{status.display_name}</dd><dt>IP 地址</dt><dd className="device-info-addresses">{addresses.length ? addresses.map((address, index) => <span className="device-info-address" key={`${address}-${index}`}>{address}</span>) : '暂无地址'}</dd><dt>端口</dt><dd>TCP {status.tcp_port} · QUIC {status.quic_port}</dd></dl><div className="modal-actions"><button type="button" className="primary" onClick={onClose}>关闭</button></div></section></div>;
 }
 
-function ManualDiscoveryDialog({ selection, onClose, onAdded, onSent }: { selection: SendSelectionState; onClose: () => void; onAdded: () => Promise<void>; onSent: () => void }) {
+function ManualDiscoveryDialog({ selection, onClose, onAdded, onSent }: { selection: SendSelectionState; onClose: () => void; onAdded: () => Promise<void>; onSent: (id: string) => void }) {
   const [publicAddress, setPublicAddress] = useState('');
   const [address, setAddress] = useState(''); const [expected, setExpected] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [publicPrompt, setPublicPrompt] = useState(false); const [publicSend, setPublicSend] = useState(false); const [publicError, setPublicError] = useState('');
@@ -56,9 +65,9 @@ function ManualDiscoveryDialog({ selection, onClose, onAdded, onSent }: { select
     const peer = await addEndpoint(address.trim(), expected.trim() || null, allowPublic);
     if (send) {
       if (!selection.paths.length) throw new Error('请先选择要发送的文件。');
-      await sendFiles(peer.node_id, selection.paths, selection.verifyHash, allowPublic, address.trim());
+      const id = await sendFiles(peer.node_id, selection.paths, selection.verifyHash, allowPublic, address.trim());
       selection.setPaths([]);
-      onSent();
+      onSent(id);
       return;
     }
     await onAdded();

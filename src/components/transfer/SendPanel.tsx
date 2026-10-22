@@ -11,7 +11,7 @@ import { Icon } from '../Icon';
 import { PublicPathPrompt, publicPathRejected, publicPathAddress } from '../PublicPathPrompt';
 import { formatBytes } from './format';
 
-export function SendPanel({ status, refresh, onSent, favorites, favoriteError, onToggleFavorite, favoritesOpen, onCloseFavorites, onRemoveFavorite, selection }: { status: NetworkStatus; refresh: () => Promise<void>; onSent: () => void; favorites: FavoriteDevice[]; favoriteError: string; onToggleFavorite: (peer: Peer) => void; favoritesOpen: boolean; onCloseFavorites: () => void; onRemoveFavorite: (nodeId: string) => void; selection: SendSelectionState }) {
+export function SendPanel({ status, refresh, onSent, favorites, favoriteError, onToggleFavorite, favoritesOpen, onCloseFavorites, onRemoveFavorite, selection }: { status: NetworkStatus; refresh: () => Promise<void>; onSent: (id: string) => void; favorites: FavoriteDevice[]; favoriteError: string; onToggleFavorite: (peer: Peer) => void; favoritesOpen: boolean; onCloseFavorites: () => void; onRemoveFavorite: (nodeId: string) => void; selection: SendSelectionState }) {
   const { paths, setPaths, manifest, scanError, peerId, setPeerId, verifyHash, setVerifyHash } = selection;
   const [busy, setBusy] = useState(false);
   const [preflighting, setPreflighting] = useState(false);
@@ -103,7 +103,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
     const selectedPeer = status.peers.find(peer => peer.node_id === peerId);
     if (!selectedPeer) { setError('未找到接收设备，请刷新设备列表后重试。'); return; }
     setPreflighting(true); setPreflightPeerId(peerId); setError('');
-    try { await sendFiles(peerId, paths, verifyHash, allowPublic); setPaths([]); await refresh(); onSent(); }
+    try { const id = await sendFiles(peerId, paths, verifyHash, allowPublic); setPaths([]); await refresh(); onSent(id); }
     catch (e) { if (!allowPublic && publicPathRejected(e)) { setPublicAddress(publicPathAddress(e)); setPublicPrompt(true); } else { setPublicPrompt(false); setError(errorText(e)); } }
     finally { setPreflighting(false); setPreflightPeerId(null); setCancellingPreflight(false); }
   }

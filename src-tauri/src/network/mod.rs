@@ -319,6 +319,7 @@ impl NetworkManager {
         // Discovery freshness is only a UI hint. Verify the stable Node ID on
         // a live connection before creating any task, and refresh metadata.
         let mut reachable = false;
+        let mut peer_device_type = String::new();
         let mut last_error = String::from("没有可用地址");
         for endpoint in &peer.endpoints {
             if !allow_public
@@ -337,7 +338,8 @@ impl NetworkManager {
                 } => result,
             };
             match result {
-                Ok(((name, _device_type, tcp_port, quic_port), channel)) => {
+                Ok(((name, device_type, tcp_port, quic_port), channel)) => {
+                    peer_device_type = device_type;
                     // 对方证书里的 Node ID 与本机相同：两台设备共用了一份身份
                     // （复制过 %APPDATA%\NodeSend 或指向同一应用数据目录）。
                     // 这种情况必须立刻报错，否则界面会一直停在"连接检测"。
@@ -407,7 +409,7 @@ impl NetworkManager {
         let peer = self.peers.get(&peer_id)?;
         let id = self
             .transfers
-            .create_outgoing(peer_id, peer.display_name, paths, verify_hash, allow_public, preferred_address)
+            .create_outgoing(peer_id, peer.display_name, peer_device_type, paths, verify_hash, allow_public, preferred_address)
             .await?;
         self.transfers.start_task(self.peers.clone(), id.clone());
         Ok(id)
