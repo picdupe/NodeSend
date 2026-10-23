@@ -8,7 +8,7 @@ import { Icon } from '../components/Icon';
 import { SidebarToggle } from '../components/AppLayout';
 import { PublicPathPrompt, publicPathRejected, publicPathAddress } from '../components/PublicPathPrompt';
 import { addEndpoint, errorText, sendFiles, transferAction } from '../api/network';
-import { useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useDialogEnter } from '../components/useDialogEnter';
 import { useDeviceFavorites } from '../hooks/useDeviceFavorites';
 import type { SendSelectionState } from '../hooks/useSendSelection';
@@ -37,7 +37,13 @@ export function NetworkPage({ mode, status, error, refresh, selection, sendTaskI
       setRefreshing(false);
     }
   }
-  if (mode === 'send' && sendTaskId && status) return <SendSession taskId={sendTaskId} status={status} onCancel={cancelSend} onClose={() => onSendTaskChange(null)} />;
+  const sendTask = sendTaskId && status ? status.tasks.find(task => task.id === sendTaskId) : null;
+  useEffect(() => {
+    if (sendTaskId && sendTask && ['accepted', 'transferring', 'paused', 'remote_paused', 'completed'].includes(sendTask.status)) onSendTaskChange(null);
+  }, [mode, sendTaskId, sendTask?.status, onSendTaskChange]);
+  // Only a receiver-confirmed pending decision opens this view. Connecting
+  // and queued tasks do not imply that the receiver needs user confirmation.
+  if (mode === 'send' && sendTaskId && status && sendTask && ['waiting', 'rejected', 'cancelled', 'failed', 'incompatible'].includes(sendTask.status)) return <SendSession taskId={sendTaskId} status={status} onCancel={cancelSend} onClose={() => onSendTaskChange(null)} />;
   return <div className={'page transfer-page ' + (mode === 'send' ? 'send-page' : '')}><header className="page-heading"><div><span className="eyebrow">NODESEND / {mode === 'send' ? 'SEND' : mode === 'receive' ? 'RECEIVE' : 'ACTIVITY'}</span><h1>{copy[mode][0]}</h1><p>{copy[mode][1]}</p></div><div className="page-heading-actions">{mode === 'send' && <><button type="button" className="icon-button device-info-button" aria-label="查看本机信息" onClick={() => setInfoOpen(true)}><Icon name="info" /></button><button type="button" className="icon-button device-info-button favorites-button" aria-label="查看收藏设备" disabled={!status} onClick={() => setFavoritesOpen(true)}><Icon name="heart" /></button><button type="button" className="icon-button manual-discovery-button" aria-label="手动发现设备" onClick={() => setManualOpen(true)}><Icon name="discover" /><span>手动发现设备</span></button></>}<button type="button" className={'icon-button refresh-button' + (refreshing ? ' refreshing' : '')} aria-label="刷新设备与任务" aria-busy={refreshing} onClick={runRefresh}><Icon name="refresh" /></button><SidebarToggle /></div></header>
     {error && <div className="notice error" role="alert">{status ? error : '尚未连接到 NodeSend 本机服务。请通过桌面应用打开。'}<details><summary>查看原因</summary>{error}</details></div>}
     {cancelError && <div className="notice error" role="alert">取消请求失败：{cancelError}</div>}

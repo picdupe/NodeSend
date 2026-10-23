@@ -497,6 +497,15 @@ impl TransferService {
             Response::State { status, completed } => (status, completed),
             _ => return Err(AppError::Other("接收方未返回清单扫描状态".into())),
         };
+        // Publish the receiver's actual decision during scanning as well as
+        // after it. Auto-accepted tasks never enter the sender's waiting UI.
+        if ["waiting", "accepted", "transferring"].contains(&status.as_str()) {
+            self.edit(&task.id, |record| {
+                if ["queued", "connecting", "waiting", "accepted", "transferring"].contains(&record.status.as_str()) {
+                    record.status = status.clone();
+                }
+            })?;
+        }
         if !["accepted", "transferring"].contains(&status.as_str()) {
             if ["cancelled", "rejected"].contains(&status.as_str()) {
                 self.edit(&task.id, |record| record.status = status)?;

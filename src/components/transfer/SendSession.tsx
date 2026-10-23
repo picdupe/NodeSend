@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import type { NetworkStatus } from '../../types/network';
 import { Icon } from '../Icon';
 import { formatBytes, statusLabels } from './format';
@@ -5,6 +6,12 @@ import { formatBytes, statusLabels } from './format';
 export function SendSession({ taskId, status, onCancel, onClose }: { taskId: string; status: NetworkStatus; onCancel: (id: string) => void; onClose: () => void }) {
   const task = status.tasks.find(item => item.id === taskId);
   const finished = !!task && ['completed', 'cancelled', 'rejected', 'incompatible'].includes(task.status);
+  const awaitingDecision = !!task && ['queued', 'connecting', 'waiting'].includes(task.status);
+  useEffect(() => {
+    // Once the receiver accepts, the send page is free for a new task. The
+    // task continues in the transfer history while the sender view closes.
+    if (task && ['accepted', 'transferring', 'paused', 'remote_paused', 'completed'].includes(task.status)) onClose();
+  }, [task?.id, task?.status, onClose]);
   function cancel() {
     if (!task || finished) { onClose(); return; }
     onCancel(taskId);
@@ -24,7 +31,7 @@ export function SendSession({ taskId, status, onCancel, onClose }: { taskId: str
       <progress max={100} value={Number(percent.toFixed(2))} />
       <div className="task-meta"><span>{formatBytes(task.completed_bytes)} / {total ? formatBytes(total) : '--'} · {percent.toFixed(2)}%</span><span>{task.transport?.toUpperCase() ?? '等待连接'}</span></div>
       {task.error && <div className="notice error">{task.error}</div>}
-      <div className="send-session-actions"><button onClick={cancel}><Icon name="close" size={16} />{finished ? '关闭' : '取消'}</button></div>
+      <div className="send-session-actions">{awaitingDecision ? <button onClick={cancel}><Icon name="close" size={16} />取消</button> : <button onClick={onClose}><Icon name="close" size={16} />关闭</button>}</div>
     </div>
   </section>;
 }
