@@ -3,10 +3,10 @@ import type { BrowserConnection, BrowserListing } from '../types/browser';
 
 const remote = 'b'.repeat(64);
 const entries = [{ path: '设计稿.pdf', size: 2400000, modified_ms: 0, directory: false }, { path: '封面.png', size: 850000, modified_ms: 0, directory: false }];
-const task: TransferTask = { id: 'preview-incoming', peer_id: remote, peer_name: '示例笔记本', direction: 'receive', status: 'waiting', scan_complete: true, top_level_count: entries.length, file_count: entries.length, directory_count: 0, total_bytes: 3250000, completed_bytes: 0, transport: 'quic', error: null, destination: null, events: ['示例接收请求'], created_at: new Date().toISOString(), verify_hash: false };
+const task: TransferTask = { id: 'preview-incoming', peer_id: remote, peer_name: '示例笔记本', direction: 'receive', status: 'waiting', scan_complete: true, top_level_count: entries.length, file_count: entries.length, directory_count: 0, total_bytes: 3250000, completed_bytes: 0, transport: 'quic', error: null, destination: null, events: ['示例接收请求'], created_at: new Date().toISOString(), verify_hash: false, android_media_library: false, receive_directories: [] };
 const state: NetworkStatus = {
   node_id: 'a'.repeat(64), display_name: '界面预览', tcp_port: 58082, quic_port: 58082,
-  addresses: ['192.0.2.1'], receive_directory: 'Downloads/NodeSend', cache_directory: 'D:/ProgramData/NodeSend/Cache', receive_policy: 'ask',
+  addresses: ['192.0.2.1'], receive_directory: 'Downloads/NodeSend', cache_directory: '', receive_policy: 'ask', media_library_enabled: false,
   discovery: { mdns: false, udp: false, warnings: [] },
   peers: ['示例笔记本', '示例手机', '示例离线设备'].map((display_name, i) => ({ node_id: [remote, 'c'.repeat(64), 'd'.repeat(64)][i], display_name, endpoints: [{ address: `192.0.2.${i + 2}`, tcp_port: 58082, quic_port: 58082, source: 'preview', last_seen: Date.now() / 1000, error: null }], online: i < 2, trusted: i === 0, verified: true })),
   tasks: [task, { ...task, id: 'preview-history', direction: 'send', status: 'completed', completed_bytes: 3250000, events: ['示例传输记录'] }],
@@ -27,6 +27,8 @@ export async function previewInvoke(command: string, args: Record<string, unknow
     case 'choose_receive_directory': return 'Downloads/NodeSend';
     case 'set_network_settings':
       state.display_name = String(args.name); state.receive_directory = String(args.directory); state.cache_directory = String(args.cacheDirectory ?? ''); state.receive_policy = args.policy as NetworkStatus['receive_policy']; return;
+    case 'set_android_media_library_enabled': state.media_library_enabled = Boolean(args.enabled); return;
+    case 'request_media_library_permission': return true;
     case 'remove_peer': state.peers = state.peers.filter(p => p.node_id !== args.nodeId); return;
     case 'send_files': {
       const id = `preview-${Date.now()}`;

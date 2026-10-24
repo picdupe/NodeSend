@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let verify_hash = !args.any(|arg| arg == "--no-hash");
             let peer = network.add_endpoint(address, None, false).await?;
             let id = network
-                .send(peer.node_id.clone(), vec![path], verify_hash, false)
+                .send(peer.node_id.clone(), vec![path], verify_hash, false, None)
                 .await?;
             println!("任务已创建: {id}");
             loop {

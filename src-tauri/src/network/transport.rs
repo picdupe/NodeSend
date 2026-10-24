@@ -951,7 +951,6 @@ fn request_label(request: &Request) -> &'static str {
         Request::Poll { .. } => "Poll",
         Request::Chunk { .. } => "Chunk",
         Request::Commit { .. } => "Commit",
-        Request::Cancel { .. } => "Cancel",
         Request::Pause { .. } => "Pause",
         Request::Resume { .. } => "Resume",
         Request::TaskState { .. } => "TaskState",

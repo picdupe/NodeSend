@@ -16,6 +16,35 @@ pub fn validate_relative(raw: &str) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+pub fn android_media_directory(path: &str) -> &'static str {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "avif"
+            | "dng" | "tif" | "tiff"
+    ) {
+        "Pictures/NodeSend"
+    } else if matches!(
+        extension.as_str(),
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" | "3gp" | "ts" | "m2ts"
+    ) {
+        "Movies/NodeSend"
+    } else if matches!(
+        extension.as_str(),
+        "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "opus" | "wma" | "amr"
+            | "mid" | "midi"
+    ) {
+        "Music/NodeSend"
+    } else {
+        "Download/NodeSend"
+    }
+}
+
 /// 校验单个文件名组件，避免遍历目录时对每个条目反复扫描整个相对路径。
 pub fn validate_component(part: &str) -> AppResult<()> {
     let stem = part.split('.').next().unwrap_or("");

@@ -22,6 +22,8 @@ import androidx.documentfile.provider.DocumentFile
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
+import app.tauri.annotation.Permission
+import app.tauri.annotation.PermissionCallback
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
@@ -46,6 +48,7 @@ class EventHandlerArgs {
 
 @InvokeArg
 class ExportReceivedArgs {
+    var downloads: Boolean = false
     var root: String = ""
     var taskId: String = ""
     var targets: Array<String?> = emptyArray()
@@ -53,9 +56,29 @@ class ExportReceivedArgs {
 }
 
 @InvokeArg
+class OpenDownloadArgs {
+    var taskId: String = ""
+    var fileIndex: Int = -1
+    var relativePath: String = ""
+    var expectedSize: Long = 0
+    var conflict: String = "rename"
+    var saveToGallery: Boolean = false
+}
+
+@InvokeArg
+class DiscardDownloadArgs { var taskId: String = "" }
+
+@InvokeArg
 class NotificationArgs { var payload: String = "[]" }
 
-@TauriPlugin
+@TauriPlugin(
+    permissions = [
+        Permission(strings = [android.Manifest.permission.READ_MEDIA_IMAGES], alias = "media_images"),
+        Permission(strings = [android.Manifest.permission.READ_MEDIA_VIDEO], alias = "media_video"),
+        Permission(strings = [android.Manifest.permission.READ_MEDIA_AUDIO], alias = "media_audio"),
+        Permission(strings = [android.Manifest.permission.READ_EXTERNAL_STORAGE], alias = "media_storage"),
+    ],
+)
 class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
     private val pending = mutableListOf<String>()
     private var eventHandler: Channel? = null
@@ -68,6 +91,11 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun resolvePaths(invoke: Invoke, paths: List<String>) {
         invoke.resolve(JSObject().apply { put("paths", JSArray(paths)) })
+    }
+
+    @Command
+    fun getAndroidApiLevel(invoke: Invoke) {
+        invoke.resolve(JSObject().apply { put("apiLevel", android.os.Build.VERSION.SDK_INT) })
     }
 
     private fun importPaths(invoke: Invoke, work: () -> List<String>) {
@@ -96,6 +124,48 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
                 }
             }.onFailure { invoke.reject("无法读取剪贴板：${it.message ?: "请重新复制后再试"}") }
         }
+    }
+
+    @Command
+    fun requestMediaPermissions(invoke: Invoke) {
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            invoke.reject("保存到相册需要 Android 10 或更高版本")
+            return
+        }
+        val requested = mediaPermissionRequests()
+        val missing = requested.filter {
+            activity.checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            invoke.resolve(JSObject().apply { put("granted", true) })
+            return
+        }
+        val aliases = requested.map { permission ->
+            when (permission) {
+                android.Manifest.permission.READ_MEDIA_IMAGES -> "media_images"
+                android.Manifest.permission.READ_MEDIA_VIDEO -> "media_video"
+                android.Manifest.permission.READ_MEDIA_AUDIO -> "media_audio"
+                else -> "media_storage"
+            }
+        }
+        requestPermissionForAliases(aliases.toTypedArray(), invoke, "onMediaPermissionsResult")
+    }
+
+    private fun mediaPermissionRequests(): Array<String> = when {
+        android.os.Build.VERSION.SDK_INT >= 33 -> arrayOf(
+            android.Manifest.permission.READ_MEDIA_IMAGES,
+            android.Manifest.permission.READ_MEDIA_VIDEO,
+            android.Manifest.permission.READ_MEDIA_AUDIO,
+        )
+        else -> arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
+
+    @PermissionCallback
+    private fun onMediaPermissionsResult(invoke: Invoke) {
+        val granted = mediaPermissionRequests().all {
+            activity.checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        invoke.resolve(JSObject().apply { put("granted", granted) })
     }
 
     override fun load(webView: android.webkit.WebView) {
@@ -401,7 +471,7 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
             val root = File(args.root).canonicalFile
             val raw = receiveTreeUri(root)
             val label = if (raw == null) {
-                if (root.path.contains("/receive-directories/")) "目录授权已丢失，请重新选择" else "应用内存储（请选择公共接收目录）"
+                if (root.path.contains("/receive-directories/")) "目录授权已丢失，请重新选择" else if (args.downloads && android.os.Build.VERSION.SDK_INT >= 29) "下载 / NodeSend" else "应用内存储（请选择公共接收目录）"
             } else {
                 val uri = Uri.parse(raw)
                 if (uri.authority == "com.android.externalstorage.documents") {
@@ -412,6 +482,282 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
             }
             invoke.resolve(JSObject().apply { put("label", label) })
         }.onFailure { invoke.reject("无法读取接收目录：${it.message}") }
+    }
+
+    private data class DownloadLocation(
+        val collection: Uri,
+        val relativePath: String,
+        val name: String,
+        val folder: String,
+    )
+
+    private fun downloadLocation(relative: String, saveToGallery: Boolean): DownloadLocation {
+        val clean = relative.replace('\\', '/').trim('/')
+        check(clean.isNotEmpty() && clean.split('/').none { it.isEmpty() || it == "." || it == ".." }) { "接收文件名非法" }
+        val folder = clean.substringBeforeLast('/', "")
+        val name = clean.substringAfterLast('/')
+        val extension = File(name).extension.lowercase()
+        val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+        val images = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif", "dng", "tif", "tiff")
+        val videos = setOf("mp4", "mkv", "mov", "avi", "webm", "m4v", "3gp", "ts", "m2ts")
+        val audio = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "amr", "mid", "midi")
+        val (collection, root) = when {
+            saveToGallery && (mime?.startsWith("image/") == true || extension in images) ->
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI to android.os.Environment.DIRECTORY_PICTURES
+            saveToGallery && (mime?.startsWith("video/") == true || extension in videos) ->
+                android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI to android.os.Environment.DIRECTORY_MOVIES
+            saveToGallery && (mime?.startsWith("audio/") == true || extension in audio) ->
+                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI to android.os.Environment.DIRECTORY_MUSIC
+            else -> android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI to android.os.Environment.DIRECTORY_DOWNLOADS
+        }
+        val relativePath = root + "/NodeSend/" + if (folder.isEmpty()) "" else "$folder/"
+        return DownloadLocation(collection, relativePath, name, folder)
+    }
+
+    private fun findDownload(
+        collection: Uri,
+        resolver: android.content.ContentResolver,
+        relativePath: String,
+        name: String,
+        excluded: Uri? = null,
+    ): Uri? = resolver.query(
+        collection,
+        arrayOf(android.provider.MediaStore.MediaColumns._ID, android.provider.MediaStore.MediaColumns.IS_PENDING),
+        "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${android.provider.MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+        arrayOf(relativePath, name),
+        null,
+    )?.use { cursor ->
+        while (cursor.moveToNext()) {
+            val uri = android.content.ContentUris.withAppendedId(collection, cursor.getLong(0))
+            if (uri != excluded) return@use uri
+        }
+        null
+    }
+
+    private fun numberedDownloadName(name: String, number: Int): String {
+        val dot = name.lastIndexOf('.')
+        val lower = name.lowercase()
+        val suffix = listOf(".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst")
+            .firstOrNull(lower::endsWith) ?: if (dot > 0) name.substring(dot) else ""
+        return name.dropLast(suffix.length) + " ($number)" + suffix
+    }
+
+    @Command
+    fun openDownloadTarget(invoke: Invoke) {
+        val args = invoke.parseArgs(OpenDownloadArgs::class.java)
+        importWorker.execute {
+            runCatching {
+                check(android.os.Build.VERSION.SDK_INT >= 29) { "此 Android 版本不支持直接写入下载目录" }
+                val resolver = activity.contentResolver
+                val location = downloadLocation(args.relativePath, args.saveToGallery)
+                val collection = location.collection
+                val receipts = activity.getSharedPreferences("receive-exports", Context.MODE_PRIVATE)
+                val pendingKey = "media-pending:${args.taskId}:${args.fileIndex}"
+                val finalKey = "media-final:${args.taskId}:${args.fileIndex}"
+                val relativeKey = "media-relative:${args.taskId}:${args.fileIndex}"
+                val final = receipts.getString(finalKey, null)?.let(Uri::parse)?.takeIf {
+                    resolver.query(it, arrayOf(android.provider.MediaStore.MediaColumns._ID), null, null, null)?.use { cursor -> cursor.moveToFirst() } == true
+                }
+                val pending = receipts.getString(pendingKey, null)?.let(Uri::parse)?.takeIf {
+                    resolver.query(it, arrayOf(android.provider.MediaStore.MediaColumns._ID), null, null, null)?.use { cursor -> cursor.moveToFirst() } == true
+                }
+                val existing = findDownload(collection, resolver, location.relativePath, location.name)
+                if (pending == null && final == null && existing != null && args.conflict == "skip") {
+                    invoke.resolve(JSObject().apply { put("fd", -1); put("skipped", true) })
+                    return@runCatching
+                }
+                val output = pending ?: final ?: run {
+                    val mime = android.webkit.MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(File(location.name).extension.lowercase())
+                        ?: "application/octet-stream"
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, ".nodesend-${args.taskId}-${args.fileIndex}")
+                        put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime)
+                        put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, location.relativePath)
+                        put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    resolver.insert(collection, values) ?: error("无法创建下载目标")
+                }
+                try {
+                    check(receipts.edit().putString(pendingKey, output.toString()).commit()) { "无法保存下载目标状态" }
+                    val descriptor = resolver.openFileDescriptor(output, "rw") ?: error("无法打开下载目标")
+                    val fd = descriptor.detachFd()
+                    check(receipts.edit().putString(relativeKey, location.relativePath).commit()) { "无法保存下载目录状态" }
+                    invoke.resolve(JSObject().apply { put("fd", fd); put("skipped", false) })
+                } catch (error: Exception) {
+                    if (pending == null && final == null) runCatching { resolver.delete(output, null, null) }
+                    receipts.edit().remove(pendingKey).commit()
+                    throw error
+                }
+            }.onFailure { invoke.reject("无法直写下载目录：${it.message}") }
+        }
+    }
+
+    @Command
+    fun publishDownloadTarget(invoke: Invoke) {
+        val args = invoke.parseArgs(OpenDownloadArgs::class.java)
+        importWorker.execute {
+            runCatching {
+                val resolver = activity.contentResolver
+                val receipts = activity.getSharedPreferences("receive-exports", Context.MODE_PRIVATE)
+                val pendingKey = "media-pending:${args.taskId}:${args.fileIndex}"
+                val finalKey = "media-final:${args.taskId}:${args.fileIndex}"
+                val relativeKey = "media-relative:${args.taskId}:${args.fileIndex}"
+                val pending = receipts.getString(pendingKey, null)?.let(Uri::parse)
+                val final = receipts.getString(finalKey, null)?.let(Uri::parse)
+                if (pending == null && final != null) {
+                    invoke.resolve()
+                    return@runCatching
+                }
+                // Zero-byte files have no chunks, so the write queue never
+                // opens a MediaStore descriptor for them. Create their pending
+                // row here before the normal conflict-resolution/publication path.
+                val publishable = pending ?: run {
+                    val location = downloadLocation(args.relativePath, args.saveToGallery)
+                    val mime = android.webkit.MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(File(location.name).extension.lowercase())
+                        ?: "application/octet-stream"
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, ".nodesend-${args.taskId}-${args.fileIndex}")
+                        put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime)
+                        put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, location.relativePath)
+                        put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val created = resolver.insert(location.collection, values) ?: error("无法创建空文件下载目标")
+                    check(receipts.edit()
+                        .putString(pendingKey, created.toString())
+                        .putString(relativeKey, location.relativePath)
+                        .commit()) { "无法保存空文件下载目标状态" }
+                    created
+                }
+                val storedRelative = receipts.getString(relativeKey, null)
+                val location = if (storedRelative != null) {
+                    val collection = when {
+                        storedRelative.startsWith(android.os.Environment.DIRECTORY_PICTURES + "/") ->
+                            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                        storedRelative.startsWith(android.os.Environment.DIRECTORY_MOVIES + "/") ->
+                            android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                        storedRelative.startsWith(android.os.Environment.DIRECTORY_MUSIC + "/") ->
+                            android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                        else -> android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                    }
+                    DownloadLocation(
+                        collection,
+                        storedRelative,
+                        args.relativePath.substringAfterLast('/'),
+                        storedRelative.substringBeforeLast("NodeSend/", "").removeSuffix("/"),
+                    )
+                } else {
+                    downloadLocation(args.relativePath, args.saveToGallery)
+                }
+                val collection = location.collection
+                var existing = findDownload(collection, resolver, location.relativePath, location.name, publishable)
+                if (existing != null && args.conflict == "skip") {
+                    resolver.delete(publishable, null, null)
+                    receipts.edit().remove(pendingKey).commit()
+                    invoke.resolve()
+                    return@runCatching
+                }
+                var outputName = location.name
+                if (existing != null && args.conflict == "rename") {
+                    var number = 1
+                    do {
+                        outputName = numberedDownloadName(location.name, number++)
+                        existing = findDownload(collection, resolver, location.relativePath, outputName, publishable)
+                    } while (existing != null)
+                }
+                if (existing != null && args.conflict == "overwrite") {
+                    check(resolver.delete(existing, null, null) > 0) { "无法替换同名文件" }
+                }
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, outputName)
+                    put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                check(resolver.update(publishable, values, null, null) == 1) { "无法发布下载文件" }
+                check(receipts.edit().putString(finalKey, publishable.toString()).remove(pendingKey).commit()) { "无法保存下载完成状态" }
+                invoke.resolve()
+            }.onFailure { invoke.reject("无法发布下载文件：${it.message}") }
+        }
+    }
+
+    @Command
+    fun discardDownloadTargets(invoke: Invoke) {
+        val args = invoke.parseArgs(DiscardDownloadArgs::class.java)
+        importWorker.execute {
+            runCatching {
+                val resolver = activity.contentResolver
+                val receipts = activity.getSharedPreferences("receive-exports", Context.MODE_PRIVATE)
+                val filePrefixes = listOf("media-pending:${args.taskId}:", "media-final:${args.taskId}:")
+                val relativePrefix = "media-relative:${args.taskId}:"
+                val relativePaths = receipts.all
+                    .filterKeys { it.startsWith(relativePrefix) }
+                    .values
+                    .mapNotNull { it as? String }
+                    .toSet()
+                val editor = receipts.edit()
+                for ((key, value) in receipts.all) {
+                    if (!key.startsWith(relativePrefix) && filePrefixes.none { key.startsWith(it) }) continue
+                    if (key.startsWith(relativePrefix)) {
+                        editor.remove(key)
+                        continue
+                    }
+                    val uri = (value as? String)?.let(Uri::parse)
+                    if (uri != null) {
+                        runCatching { resolver.delete(uri, null, null) }
+                    }
+                    editor.remove(key)
+                }
+                val collection = android.provider.MediaStore.Files.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL)
+                val folders = relativePaths
+                    .flatMap { relative ->
+                        val segments = relative.trim('/').split('/')
+                        if (segments.size < 3) emptyList() else (segments.lastIndex downTo 2).map { index ->
+                            val parent = segments.take(index).joinToString("/") + "/"
+                            parent to segments[index]
+                        }
+                    }
+                    .distinct()
+                for ((parent, name) in folders) {
+                    val childPath = parent + name + "/"
+                    for (attempt in 0 until 5) {
+                        val hasChildren = resolver.query(
+                            collection,
+                            arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                            "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                            arrayOf(childPath),
+                            null,
+                        )?.use { it.moveToFirst() } == true
+                        if (!hasChildren) {
+                            val directory = resolver.query(
+                                collection,
+                                arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                                "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${android.provider.MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+                                arrayOf(parent, name),
+                                null,
+                            )?.use { cursor ->
+                                if (cursor.moveToFirst()) android.content.ContentUris.withAppendedId(collection, cursor.getLong(0)) else null
+                            }
+                            if (directory != null && runCatching { resolver.delete(directory, null, null) }.getOrDefault(0) > 0) {
+                                break
+                            }
+                        }
+                        val physical = File(
+                            android.os.Environment.getExternalStorageDirectory(),
+                            childPath.trim('/'),
+                        )
+                        if (physical.isDirectory && physical.list()?.isEmpty() == true && physical.delete()) {
+                            runCatching {
+                                activity.sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(physical)))
+                            }
+                            break
+                        }
+                        if (attempt < 4) Thread.sleep(100)
+                    }
+                }
+                check(editor.commit()) { "无法清理下载任务状态" }
+                invoke.resolve()
+            }.onFailure { invoke.reject("无法清理下载文件：${it.message}") }
+        }
     }
 
     @Command

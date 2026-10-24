@@ -87,10 +87,6 @@ impl TransferService {
             }
             Request::Poll { id } => self.remote_state(&incoming_id(peer, &id)),
             Request::Commit { id } => self.commit(&incoming_id(peer, &id)).await,
-            Request::Cancel { id } => {
-                self.action(&incoming_id(peer, &id), "cancel").await?;
-                Ok(Response::Ack)
-            }
             Request::Pause { id } => {
                 self.action(&incoming_id(peer, &id), "remote_pause").await?;
                 Ok(Response::Ack)

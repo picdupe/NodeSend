@@ -107,6 +107,8 @@ impl TransferService {
             use_cache: false,
             chunk_size: summary.chunk_size,
             verify_hash: summary.verify_hash,
+            android_media_library: false,
+            receive_directories: BTreeSet::new(),
             file_count: summary.file_count,
             directory_count: summary.directory_count,
             total_size: summary.total_size,

@@ -4,7 +4,8 @@
 //! 且不把磁盘延迟带进 ACK 往返路径。
 //!
 //! 两种落盘模式（由 `TaskRecord::use_cache` 决定）：
-//! - 直写：目标盘与缓存盘同卷时回退，块直接写 `<目标>/.nodesend-partials/<task>/<file>.part`；
+//! - 直写：普通目标写 `<目标>/.nodesend-partials/<task>/<file>.part`；Android
+//!   默认下载目录写 MediaStore pending 文件描述符；
 //! - 缓存中转：写 `<缓存盘>/<task>/<file>.<seg>.seg`（随机写与 `sync_data` 全在缓存盘），
 //!   目标盘只由 [`super::relay`] 做连续顺序写。
 //!
@@ -30,6 +31,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "android")]
+use std::os::fd::FromRawFd;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
     sync::{mpsc, Mutex as AsyncMutex},
@@ -163,7 +166,10 @@ impl Writer {
         }
         let key = (chunk.task_id.clone(), chunk.file);
         if !self.files.contains_key(&key) {
-            let buffer = open_buffer(service, &chunk.task_id, chunk.file).await?;
+            let Some(buffer) = open_buffer(service, &chunk.task_id, chunk.file).await? else {
+                discard_one(service, &chunk.task_id, chunk.index);
+                return Ok(());
+            };
             self.files.insert(key.clone(), buffer);
         }
         self.files
@@ -395,16 +401,17 @@ async fn open_buffer(
     service: &Arc<TransferService>,
     id: &str,
     file: usize,
-) -> AppResult<FileBuffer> {
+) -> AppResult<Option<FileBuffer>> {
     // 只用 O(1) 访问器取「下一个待写偏移 / 文件大小 / 是否缓存模式」。
-    let (next_offset, expected_size, use_cache) = service.file_write_plan(id, file)?;
+    let (next_offset, expected_size, use_cache, _direct_download) =
+        service.file_write_plan(id, file)?;
     if use_cache {
         // 缓存模式：只为缓存盘建目录，绝不触碰目标盘。
         let cache_root = service
             .cache_root_for_task(id)
             .ok_or_else(|| AppError::Other("缓存目录不可用".into()))?;
         std::fs::create_dir_all(paths::cache_task(&cache_root, id))?;
-        return Ok(FileBuffer {
+        return Ok(Some(FileBuffer {
             ready: BTreeMap::new(),
             next_offset,
             gap_since: None,
@@ -412,7 +419,50 @@ async fn open_buffer(
             use_cache: true,
             dirty: Vec::new(),
             dirty_bytes: 0,
-        });
+        }));
+    }
+    #[cfg(target_os = "android")]
+    if _direct_download {
+        let task = service.record(id)?;
+        let request = service.android_download_request(&task, file)?;
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::android_import::open_download_file(request)
+        })
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .map_err(AppError::Other)?;
+        if opened.skipped {
+            service.mark_conflict_skipped(id, file)?;
+            return Ok(None);
+        }
+        let handle = match cached_handle(service, id, file) {
+            Some(handle) => handle,
+            None => {
+                // SAFETY: MediaStore detaches this descriptor into Rust
+                // ownership exactly once; tokio::fs::File closes it afterwards.
+                let raw = unsafe { std::fs::File::from_raw_fd(opened.fd) };
+                let opened = tokio::fs::File::from_std(raw);
+                let handle = Arc::new(AsyncMutex::new(opened));
+                crate::locks::lock(&service.runtime(id).receive_files)
+                    .insert(file, handle.clone());
+                handle
+            }
+        };
+        {
+            let opened = handle.lock().await;
+            if opened.metadata().await?.len() != expected_size {
+                opened.set_len(expected_size).await?;
+            }
+        }
+        return Ok(Some(FileBuffer {
+            ready: BTreeMap::new(),
+            next_offset,
+            gap_since: None,
+            handle: Some(handle),
+            use_cache: false,
+            dirty: Vec::new(),
+            dirty_bytes: 0,
+        }));
     }
     let stage = service.stage_dir(id)?;
     std::fs::create_dir_all(&stage)?;
@@ -440,7 +490,7 @@ async fn open_buffer(
             opened.set_len(expected_size).await?;
         }
     }
-    Ok(FileBuffer {
+    Ok(Some(FileBuffer {
         ready: BTreeMap::new(),
         next_offset,
         gap_since: None,
@@ -448,7 +498,7 @@ async fn open_buffer(
         use_cache: false,
         dirty: Vec::new(),
         dirty_bytes: 0,
-    })
+    }))
 }
 
 /// 从待写登记中移除一个块（丢弃或已落盘后调用）。

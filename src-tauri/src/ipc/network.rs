@@ -41,6 +41,20 @@ pub async fn describe_receive_directory(app: tauri::AppHandle, root: String) -> 
     }
 }
 #[tauri::command]
+pub async fn request_media_library_permission(app: tauri::AppHandle) -> AppResult<bool> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android_import::request_media_permissions(app)
+            .await
+            .map_err(crate::error::AppError::Other)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(false)
+    }
+}
+#[tauri::command]
 pub async fn get_network_status(
     network: State<'_, Arc<NetworkManager>>,
 ) -> AppResult<NetworkStatus> {
@@ -269,6 +283,13 @@ pub async fn set_network_settings(
     policy: String,
 ) -> AppResult<()> {
     network.settings(name, directory, cache_directory, policy)
+}
+#[tauri::command]
+pub fn set_android_media_library_enabled(
+    network: State<'_, Arc<NetworkManager>>,
+    enabled: bool,
+) -> AppResult<()> {
+    network.set_android_media_library_enabled(enabled)
 }
 #[tauri::command]
 pub async fn remove_peer(

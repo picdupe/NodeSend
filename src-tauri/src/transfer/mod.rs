@@ -13,6 +13,8 @@ use crate::{
     service::AppService,
 };
 use model::{random_id, Chunk, ConflictPolicy, FileEntry, Manifest, TaskRecord, TaskSnapshot};
+#[cfg(target_os = "android")]
+use std::path::Path;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
@@ -802,6 +804,13 @@ impl TransferService {
     }
     /// 标记文件被跳过（源文件变化）：内存 + `task_skipped`/`task_chunks`/`task_targets` 增量写入。
     pub(crate) fn mark_skipped(&self, id: &str, file: usize) -> AppResult<()> {
+        self.mark_skipped_with_reason(id, file, "源文件已变化")
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn mark_conflict_skipped(&self, id: &str, file: usize) -> AppResult<()> {
+        self.mark_skipped_with_reason(id, file, "接收目录中已有同名文件")
+    }
+    fn mark_skipped_with_reason(&self, id: &str, file: usize, reason: &str) -> AppResult<()> {
         self.ensure_bulk(id)?;
         let mut map = locks::lock(&self.tasks);
         self.load_bulk_locked(&mut map, id)?;
@@ -839,8 +848,23 @@ impl TransferService {
         }
         let newly = !was_skipped;
         task.note_skipped(file, entry.size, &entry.path);
+        #[cfg(target_os = "android")]
+        if task.android_media_library {
+            task.receive_directories = task
+                .manifest
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(index, entry)| {
+                    !entry.directory
+                        && task.targets.get(*index).and_then(Option::as_ref).is_some()
+                        && !task.skipped_files.contains(index)
+                })
+                .map(|(_, entry)| paths::android_media_directory(&entry.path).to_string())
+                .collect();
+        }
         if newly {
-            task.event(format!("源文件已变化，跳过：{}", entry.path));
+            task.event(format!("{reason}，跳过：{}", entry.path));
         }
         let json = serde_json::to_string(&*task)?;
         let persisted = self.app.db.with_transaction(|tx| {
@@ -1111,9 +1135,13 @@ impl TransferService {
             .map(|t| t.verify_hash)
             .ok_or_else(|| AppError::NotFound("任务不存在".into()))
     }
-    /// 该文件的写入计划：`(下一个待写偏移, 文件大小, 是否缓存模式)`。
+    /// 该文件的写入计划：`(下一个待写偏移, 文件大小, 是否缓存模式, 是否 MediaStore 直写)`。
     /// 取「该文件第一个未完成块」的偏移作为续写起点，供直写/缓存缓冲初始化复用。
-    pub(crate) fn file_write_plan(&self, id: &str, file: usize) -> AppResult<(u64, u64, bool)> {
+    pub(crate) fn file_write_plan(
+        &self,
+        id: &str,
+        file: usize,
+    ) -> AppResult<(u64, u64, bool, bool)> {
         // bulk 明细在锁外载入（见 ensure_bulk），避免读几十万行时占住任务锁。
         self.ensure_bulk(id)?;
         let mut map = locks::lock(&self.tasks);
@@ -1146,7 +1174,11 @@ impl TransferService {
             || (!task.scan_complete
                 && entry.size <= CACHE_FILE_LIMIT
                 && self.cache_root_for_task(id).is_some());
-        Ok((next_offset, entry.size, use_cache))
+        #[cfg(target_os = "android")]
+        let direct_download = self.is_android_direct_receive(task);
+        #[cfg(not(target_os = "android"))]
+        let direct_download = false;
+        Ok((next_offset, entry.size, use_cache, direct_download))
     }
     pub(crate) fn chunk_at(&self, id: &str, index: usize) -> AppResult<Option<Chunk>> {
         // bulk 明细在锁外载入（见 ensure_bulk），避免读几十万行时占住任务锁。
@@ -1318,6 +1350,8 @@ impl TransferService {
             use_cache: false,
             chunk_size: 0,
             verify_hash: false,
+            android_media_library: false,
+            receive_directories: BTreeSet::new(),
             file_count: 0,
             directory_count: 0,
             total_size: 0,
@@ -1391,6 +1425,22 @@ impl TransferService {
             })?;
             return Ok(());
         }
+        #[cfg(target_os = "android")]
+        if crate::android_import::api_level().is_some_and(|level| level < 29) {
+            let requested = destination.as_deref().unwrap_or_else(|| "");
+            let default = self.builtin_destination();
+            let uses_default = requested.is_empty()
+                || requested == default
+                || matches!(
+                    (Path::new(requested).canonicalize(), Path::new(&default).canonicalize()),
+                    (Ok(requested), Ok(default)) if requested == default
+                );
+            if uses_default {
+                return Err(AppError::BadRequest(
+                    "Android 9 及更早版本请先点击“更改”选择保存目录，再确认接收。".into(),
+                ));
+            }
+        }
         let folder = destination.unwrap_or_else(|| self.default_destination());
         // 目标路径解析是同步文件系统调用（网络盘上可能明显阻塞），放到阻塞线程池。
         let root = tokio::task::spawn_blocking(move || paths::destination(&folder))
@@ -1463,6 +1513,37 @@ impl TransferService {
             None => BTreeSet::new(),
         };
         let use_cache = !cache_files.is_empty();
+        #[cfg(target_os = "android")]
+        let media_direct = matches!(
+            (
+                root.canonicalize(),
+                std::path::Path::new(&self.builtin_destination()).canonicalize()
+            ),
+            (Ok(actual), Ok(expected)) if actual == expected
+        );
+        #[cfg(target_os = "android")]
+        // The media-library toggle is an explicit destination choice. Do not
+        // silently disable it just because the configured receive directory
+        // is not the app's built-in private directory; the MediaStore writer
+        // routes each file by type independently of that staging path.
+        let android_media_library = self.media_library_enabled()
+            && crate::android_import::api_level().is_some_and(|level| level >= 29);
+        #[cfg(not(target_os = "android"))]
+        let android_media_library = false;
+        #[cfg(target_os = "android")]
+        let receive_directories = if android_media_library {
+            task.manifest
+                .entries
+                .iter()
+                .zip(&targets)
+                .filter(|(entry, target)| !entry.directory && target.is_some())
+                .map(|(entry, _)| paths::android_media_directory(&entry.path).to_string())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        #[cfg(not(target_os = "android"))]
+        let receive_directories = BTreeSet::new();
         self.edit(id, |t| {
             t.targets = targets;
             t.destination = Some(root.to_string_lossy().into_owned());
@@ -1495,8 +1576,21 @@ impl TransferService {
             t.status = "accepted".into();
             t.state_revision = t.state_revision.wrapping_add(1);
             t.use_cache = use_cache;
+            t.android_media_library = android_media_library;
+            t.receive_directories = receive_directories.clone();
             t.relayed = vec![0; t.manifest.entries.len()];
             t.relayed_total = 0;
+            #[cfg(target_os = "android")]
+            t.event(if !t.scan_complete {
+                "正在扫描清单，请稍候".to_string()
+            } else if android_media_library {
+                "接收方已确认保存位置和冲突策略（MediaStore 媒体目录直写）".to_string()
+            } else if media_direct {
+                "接收方已确认保存位置和冲突策略（MediaStore 下载目录直写）".to_string()
+            } else {
+                "接收方已确认保存位置和冲突策略（使用应用内部暂存）".to_string()
+            });
+            #[cfg(not(target_os = "android"))]
             t.event(if !t.scan_complete && current_cache_root.is_some() {
                 "正在扫描清单，请稍候".to_string()
             } else if use_cache {
@@ -1636,7 +1730,11 @@ impl TransferService {
             t.status = next.into();
             t.error = None;
             t.resume_requested = t.direction == "send" && status == "resumed";
-            t.event(format!("已同步对端任务状态：{status}"));
+            t.event(match status {
+                "cancelled" => "接收方已取消任务".to_string(),
+                "rejected" => "接收方已拒绝任务".to_string(),
+                _ => format!("已同步对端任务状态：{status}"),
+            });
         })?;
         if status == "cancelled" && task.direction == "receive" {
             // Reload after applying the remote state so rollback sees the
@@ -1680,6 +1778,26 @@ impl TransferService {
         }
         // 关闭直写模式复用的目标盘句柄。
         self.release_files(&id);
+        #[cfg(target_os = "android")]
+        if self.is_android_direct_receive(task) {
+            loop {
+                let task_id = id.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::android_import::discard_download_files(task_id)
+                })
+                .await
+                {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error)) => {
+                        tracing::warn!(task = %id, %error, "取消时清理下载文件失败，将继续重试")
+                    }
+                    Err(error) => {
+                        tracing::warn!(task = %id, %error, "取消时下载文件清理线程失败，将继续重试")
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
         // 删缓存目录。
         if let Some(cache_root) = self.cache_root_for_task(&id) {
             let dir = paths::cache_task(&cache_root, &id);
@@ -1811,14 +1929,66 @@ impl TransferService {
             .get_setting("receive_directory")
             .ok()
             .flatten()
-            .unwrap_or_else(|| {
-                #[cfg(target_os = "android")]
-                let download = self.app.paths.data_dir.clone();
-                #[cfg(not(target_os = "android"))]
-                let download =
-                    dirs::download_dir().unwrap_or_else(|| self.app.paths.data_dir.clone());
-                download.join("NodeSend").to_string_lossy().into_owned()
-            })
+            .unwrap_or_else(|| self.builtin_destination())
+    }
+    /// Platform default used when receive_directory has never been overridden.
+    pub fn builtin_destination(&self) -> String {
+        #[cfg(target_os = "android")]
+        let download = self.app.paths.data_dir.clone();
+        #[cfg(not(target_os = "android"))]
+        let download = dirs::download_dir().unwrap_or_else(|| self.app.paths.data_dir.clone());
+        download.join("NodeSend").to_string_lossy().into_owned()
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn is_default_android_download(&self, task: &TaskRecord) -> bool {
+        let Some(destination) = task.destination.as_deref() else { return false; };
+        let expected = self.builtin_destination();
+        if destination == expected {
+            return true;
+        }
+        matches!(
+            (Path::new(destination).canonicalize(), Path::new(&expected).canonicalize()),
+            (Ok(destination), Ok(expected)) if destination == expected
+        )
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn media_library_enabled(&self) -> bool {
+        self.app
+            .get_setting("android_save_to_gallery")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true")
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn is_android_direct_receive(&self, task: &TaskRecord) -> bool {
+        crate::android_import::api_level().is_some_and(|level| level >= 29)
+            && (task.android_media_library || self.is_default_android_download(task))
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn android_download_request(
+        &self,
+        task: &TaskRecord,
+        file: usize,
+    ) -> AppResult<crate::android_import::OpenDownloadRequest> {
+        let entry = task
+            .manifest
+            .entries
+            .get(file)
+            .ok_or_else(|| AppError::BadRequest("文件编号非法".into()))?;
+        let conflict = match task.conflict {
+            ConflictPolicy::Rename => "rename",
+            ConflictPolicy::Skip => "skip",
+            ConflictPolicy::Overwrite => "overwrite",
+        };
+        Ok(crate::android_import::OpenDownloadRequest {
+            task_id: task.id.clone(),
+            file_index: file,
+            relative_path: entry.path.clone(),
+            expected_size: entry.size,
+            conflict: conflict.into(),
+            save_to_gallery: task.android_media_library,
+        })
     }
     pub fn cache_directory(&self) -> String {
         self.current_cache_root()

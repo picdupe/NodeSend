@@ -50,6 +50,7 @@ pub struct NetworkStatus {
     pub receive_directory: String,
     pub cache_directory: String,
     pub receive_policy: String,
+    pub media_library_enabled: bool,
 }
 pub struct NetworkManager {
     app: Arc<AppService>,
@@ -148,6 +149,14 @@ impl NetworkManager {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "ask".into()),
+            media_library_enabled: cfg!(target_os = "android")
+                && self
+                    .app
+                    .get_setting("android_save_to_gallery")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("true"),
         }
     }
     pub async fn add_endpoint(
@@ -547,13 +556,6 @@ impl NetworkManager {
                                 .await,
                             Ok(protocol::Response::Ack)
                         ) {
-                            if status == "cancelled" {
-                                let _ = channel
-                                    .request(&protocol::Request::Cancel {
-                                        id: current.wire_id.clone(),
-                                    })
-                                    .await;
-                            }
                             tracing::info!(task = %id, revision, %status, "对端已确认任务状态");
                             return;
                         }
@@ -567,7 +569,13 @@ impl NetworkManager {
             }
         });
     }
-    pub fn settings(&self, name: String, directory: String, cache_directory: String, policy: String) -> AppResult<()> {
+    pub fn settings(
+        &self,
+        name: String,
+        directory: String,
+        cache_directory: String,
+        policy: String,
+    ) -> AppResult<()> {
         if name.trim().is_empty()
             || name.len() > 128
             || !["ask", "trusted", "reject"].contains(&policy.as_str())
@@ -597,6 +605,12 @@ impl NetworkManager {
         // 设置保存成功后立即切换新任务使用的缓存目录；已运行任务仍固定在旧目录。
         self.transfers.refresh_cache_root_from_settings();
         Ok(())
+    }
+    pub fn set_android_media_library_enabled(&self, enabled: bool) -> AppResult<()> {
+        self.app.set_setting(
+            "android_save_to_gallery",
+            if enabled { "true" } else { "false" },
+        )
     }
     pub async fn shutdown(&self) {
         if let Some(d) = &self.discovery {

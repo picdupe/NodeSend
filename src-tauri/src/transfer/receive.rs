@@ -34,6 +34,17 @@ impl TransferService {
         if !(base..base + count).all(|index| task.completed.contains(&index)) {
             return Ok(());
         }
+        #[cfg(target_os = "android")]
+        if self.is_android_direct_receive(&task) {
+            let request = self.android_download_request(&task, file)?;
+            tokio::task::spawn_blocking(move || {
+                crate::android_import::publish_download_file(request)
+            })
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .map_err(AppError::Other)?;
+            return Ok(());
+        }
         let root = PathBuf::from(task.destination.as_deref().unwrap());
         let stage = paths::stage(&task)?;
         tokio::task::spawn_blocking(move || {
@@ -247,6 +258,11 @@ impl TransferService {
                     target_rows.push((file_index, path.to_string_lossy().into_owned()));
                     task.targets.push(Some(path.to_string_lossy().into_owned()));
                     if !entry.directory {
+                        #[cfg(target_os = "android")]
+                        if task.android_media_library {
+                            task.receive_directories
+                                .insert(paths::android_media_directory(&entry.path).to_string());
+                        }
                         task.relay_target_bytes =
                             task.relay_target_bytes.saturating_add(entry.size);
                     }
@@ -528,6 +544,40 @@ impl TransferService {
         // reject only when the durable completed count is short.
         if task.completed_count < task.chunk_count {
             return Err(AppError::Conflict("仍有未提交 Chunk".into()));
+        }
+        #[cfg(target_os = "android")]
+        if self.is_android_direct_receive(&task) {
+            let requests = task
+                .manifest
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(file, entry)| {
+                    !entry.directory
+                        && task.targets.get(*file).and_then(Option::as_ref).is_some()
+                })
+                .map(|(file, _)| self.android_download_request(&task, file))
+                .collect::<AppResult<Vec<_>>>()?;
+            tokio::task::spawn_blocking(move || {
+                for request in requests {
+                    crate::android_import::publish_download_file(request)?;
+                }
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .map_err(AppError::Other)?;
+            self.edit(id, |t| {
+                t.status = "completed".into();
+                t.error = None;
+                t.event("所有文件已持久化并提交，发送完成回执");
+            })?;
+            self.release_files(id);
+            if let Ok(stage) = paths::stage(&task) {
+                let _ = std::fs::remove_dir_all(stage);
+            }
+            self.release_runtime(id);
+            return Ok(Response::Ack);
         }
         let root = PathBuf::from(task.destination.as_ref().unwrap());
         let stage = paths::stage(&task)?;

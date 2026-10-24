@@ -298,7 +298,6 @@ impl TransferService {
     async fn notify_remote_stop(&self, control: &mut Channel, id: &str, wire_id: &str) {
         let request = match self.status_of(id).as_deref() {
             Ok("paused") | Ok("remote_paused") => Some(Request::Pause { id: wire_id.to_string() }),
-            Ok("cancelled") => Some(Request::Cancel { id: wire_id.to_string() }),
             _ => None,
         };
         if let Some(request) = request {
@@ -713,7 +712,13 @@ impl TransferService {
         }
         let mut control = self.channel(&peers, &task, &cooldown, true).await?;
         if let Some(old_wire) = stale_wire {
-            let _ = control.request(&Request::Cancel { id: old_wire }).await;
+            let _ = control
+                .request(&Request::TaskState {
+                    id: old_wire,
+                    revision: task.state_revision,
+                    status: "cancelled".into(),
+                })
+                .await;
         }
         // 先用摘要 + 指纹建立接收任务：重复 Offer 返回当前状态，`Ready` 表示需继续发分片清单。
         let mut offer_summary = task.manifest.offer_summary();
@@ -921,13 +926,6 @@ impl TransferService {
                 continue;
             }
             if self.stopped(id)? {
-                if self.record(id)?.status == "cancelled" {
-                    let _ = control
-                        .request(&Request::Cancel {
-                            id: task.wire_id.clone(),
-                        })
-                        .await;
-                }
                 return Ok(());
             }
             match state {
@@ -971,8 +969,15 @@ impl TransferService {
                     if ["rejected", "cancelled"].contains(&status.as_str()) =>
                 {
                     self.edit(id, |t| {
-                        t.status = status;
-                        t.event("接收方拒绝或取消任务");
+                        if !["cancelled", "rejected"].contains(&t.status.as_str()) {
+                            let cancelled = status == "cancelled";
+                            t.status = status;
+                            t.event(if cancelled {
+                                "接收方已取消任务"
+                            } else {
+                                "接收方已拒绝任务"
+                            });
+                        }
                     })?;
                     return Ok(());
                 }
@@ -1108,9 +1113,11 @@ impl TransferService {
                             }
                             Response::State { status, .. } if status == "cancelled" => {
                                 service.edit(&task.id, |t| {
-                                    t.status = "cancelled".into();
-                                    t.error = None;
-                                    t.event("接收方已取消任务");
+                                    if t.status != "cancelled" {
+                                        t.status = "cancelled".into();
+                                        t.error = None;
+                                        t.event("接收方已取消任务");
+                                    }
                                 })?;
                                 return Ok(());
                             }

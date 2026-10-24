@@ -152,9 +152,6 @@ pub enum Request {
     Commit {
         id: String,
     },
-    Cancel {
-        id: String,
-    },
     Pause {
         id: String,
     },

@@ -42,35 +42,43 @@ const PENDING_CLEANUP_KEY: &str = "pending_cleanup";
 /// 用户设置 `cache_directory` → `D:\ProgramData\NodeSend\Cache` → `C:\ProgramData\NodeSend\Cache`。
 /// 返回第一个「可创建」的目录；全部不可用时返回 `None`（此时所有任务自动直写）。
 pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(Some(dir)) = app.get_setting("cache_directory") {
-        // An explicitly empty setting means the user disabled caching.
-        if dir.trim().is_empty() {
-            return None;
-        }
-        candidates.push(PathBuf::from(dir));
-    }
-    #[cfg(windows)]
+    #[cfg(target_os = "android")]
     {
-        candidates.push(PathBuf::from(r"D:\ProgramData\NodeSend\Cache"));
-        candidates.push(PathBuf::from(r"C:\ProgramData\NodeSend\Cache"));
+        let _ = app;
+        return None;
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "android"))]
     {
-        // 非 Windows 平台没有 D:/C: ProgramData 约定，保留平台数据目录。
-        candidates.push(app.paths.data_dir.join("Cache"));
-    }
-    for candidate in candidates {
-        if is_filesystem_root(&candidate) {
-            tracing::error!(dir = %candidate.display(), "拒绝将磁盘根目录作为 NodeSend 缓存目录");
-            continue;
+        let mut candidates = Vec::new();
+        if let Ok(Some(dir)) = app.get_setting("cache_directory") {
+            // An explicitly empty setting means the user disabled caching.
+            if dir.trim().is_empty() {
+                return None;
+            }
+            candidates.push(PathBuf::from(dir));
         }
-        match std::fs::create_dir_all(&candidate) {
-            Ok(()) => return Some(candidate),
-            Err(err) => tracing::warn!(dir = %candidate.display(), "缓存目录不可用：{err}"),
+        #[cfg(windows)]
+        {
+            candidates.push(PathBuf::from(r"D:\ProgramData\NodeSend\Cache"));
+            candidates.push(PathBuf::from(r"C:\ProgramData\NodeSend\Cache"));
         }
+        #[cfg(not(windows))]
+        {
+            // 非 Windows 平台没有 D:/C: ProgramData 约定，保留平台数据目录。
+            candidates.push(app.paths.data_dir.join("Cache"));
+        }
+        for candidate in candidates {
+            if is_filesystem_root(&candidate) {
+                tracing::error!(dir = %candidate.display(), "拒绝将磁盘根目录作为 NodeSend 缓存目录");
+                continue;
+            }
+            match std::fs::create_dir_all(&candidate) {
+                Ok(()) => return Some(candidate),
+                Err(err) => tracing::warn!(dir = %candidate.display(), "缓存目录不可用：{err}"),
+            }
+        }
+        None
     }
-    None
 }
 
 fn is_filesystem_root(path: &Path) -> bool {

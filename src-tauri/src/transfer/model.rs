@@ -494,6 +494,13 @@ pub struct TaskRecord {
     /// Missing in older persisted task formats; legacy records are display-only.
     #[serde(default)]
     pub verify_hash: bool,
+    /// Android task-level snapshot of the media-library routing choice.
+    #[serde(default)]
+    pub android_media_library: bool,
+    /// Actual public media directories used by this task, populated while the
+    /// manifest is received. Empty when media-library routing is disabled.
+    #[serde(default)]
+    pub receive_directories: BTreeSet<String>,
     /// Summary counters were introduced after the original persisted task format.
     /// Missing counters default to zero; chunk_size=0 still marks old tasks incompatible.
     #[serde(default)]
@@ -671,6 +678,16 @@ impl TaskRecord {
             events: self.events.clone(),
             created_at: self.created_at.clone(),
             verify_hash: self.verify_hash,
+            android_media_library: self.android_media_library,
+            receive_directories: if self.android_media_library {
+                ["Pictures/NodeSend", "Movies/NodeSend", "Music/NodeSend", "Download/NodeSend"]
+                    .into_iter()
+                    .filter(|directory| self.receive_directories.contains(*directory))
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -696,6 +713,8 @@ pub struct TaskSnapshot {
     pub events: Vec<String>,
     pub created_at: String,
     pub verify_hash: bool,
+    pub android_media_library: bool,
+    pub receive_directories: Vec<String>,
 }
 pub fn random_id() -> String {
     format!("{:032x}", rand::random::<u128>())
