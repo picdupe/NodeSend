@@ -1598,6 +1598,7 @@ impl TransferService {
             } else {
                 "接收方已确认保存位置和冲突策略（未配置缓存目录，使用目标盘直写）".to_string()
             });
+            t.event("接收已确认，开始接收");
         })?;
         if let Some(cache_root) = current_cache_root {
             // Bind cache intent even if the top-level manifest contains only

@@ -100,7 +100,10 @@ impl TransferService {
             conflict: ConflictPolicy::Rename,
             transport: Some(transport.into()),
             error: None,
-            events: vec!["已验证发送方身份，正在接收文件清单".into()],
+            events: vec![format!(
+                "{} 已验证发送方身份，正在接收文件清单",
+                chrono::Local::now().to_rfc3339()
+            )],
             updated_at: now.clone(),
             created_at: now,
             allow_public: false,
@@ -182,9 +185,6 @@ impl TransferService {
             .await
         {
             Ok(()) => {
-                let _ = self.edit(id, |task| {
-                    task.event("已信任的设备：自动接收，无需手动确认")
-                });
                 tracing::info!(%peer, task = %id, "信任设备顶层清单已到齐，自动接收");
                 true
             }
@@ -248,13 +248,17 @@ impl TransferService {
             record.total_size = actual_total_size;
             record.chunk_count = record.manifest.chunk_count();
             record.digest = digest.clone();
-            record.scan_complete = true;
-            if record.use_cache {
+            // 清单校验完成是与接收决策无关的事实，必须无条件记录一次：
+            // 手动确认时决定发生在清单结束之后，use_cache 此刻尚未确定，
+            // 若按 use_cache 判断会永久漏掉这条里程碑，导致同一份文件在
+            // 自动接收与手动接收下日志不一致。
+            if !record.scan_complete {
                 record.event(format!(
-                    "清单扫描完成：共 {} 个文件使用缓存中转",
-                    record.cache_files.len()
+                    "清单扫描完成：{} 个文件 · {} 个目录",
+                    actual_file_count, record.directory_count
                 ));
             }
+            record.scan_complete = true;
         })?;
         if initial_status == "waiting" {
             let policy = self

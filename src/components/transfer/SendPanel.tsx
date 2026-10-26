@@ -98,12 +98,12 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
     } catch (e) { setError(errorText(e)); }
   }
   const [publicAddress, setPublicAddress] = useState('');
-  async function send(allowPublic = false) {
-    if (busy || preflighting || !peerId || !paths.length) return;
-    const selectedPeer = status.peers.find(peer => peer.node_id === peerId);
+  async function send(allowPublic = false, targetPeerId = peerId) {
+    if (busy || preflighting || !targetPeerId || !paths.length) return;
+    const selectedPeer = status.peers.find(peer => peer.node_id === targetPeerId);
     if (!selectedPeer) { setError('未找到接收设备，请刷新设备列表后重试。'); return; }
-    setPreflighting(true); setPreflightPeerId(peerId); setError('');
-    try { const id = await sendFiles(peerId, paths, verifyHash, allowPublic); setPaths([]); await refresh(); onSent(id); }
+    setPreflighting(true); setPreflightPeerId(targetPeerId); setError('');
+    try { const id = await sendFiles(targetPeerId, paths, verifyHash, allowPublic); setPaths([]); await refresh(); onSent(id); }
     catch (e) { if (!allowPublic && publicPathRejected(e)) { setPublicAddress(publicPathAddress(e)); setPublicPrompt(true); } else { setPublicPrompt(false); setError(errorText(e)); } }
     finally { setPreflighting(false); setPreflightPeerId(null); setCancellingPreflight(false); }
   }
@@ -159,14 +159,12 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
         <div className="section-title"><span className="step">2</span><h2>发送给谁</h2><span className="count-tag">{status.peers.filter(p => p.online).length} 在线</span></div>
         <input className="search-field" aria-label="搜索设备" placeholder="搜索设备名称、地址或 Node ID" value={search} onChange={e => setSearch(e.target.value)} />
         <div className="device-list">
-          {peers.map(peer => <button className={'device-card ' + (peerId === peer.node_id ? 'selected' : '')} key={peer.node_id} onClick={() => { setPeerId(peer.node_id); setContextPeer(null); }} onContextMenu={event => { event.preventDefault(); setContextPeer(peer.node_id); }} onKeyDown={event => { if (event.key === 'Delete') { event.preventDefault(); void forgetPeer(peer.node_id); } }} aria-keyshortcuts="Delete" aria-pressed={peerId === peer.node_id}>
+          {peers.map(peer => <button type="button" className={'device-card device-card-main ' + (peerId === peer.node_id ? 'selected' : '')} key={peer.node_id} onClick={() => { setContextPeer(null); if (preflighting && preflightPeerId === peer.node_id) { void cancelPreflight(); } else if (paths.length && !busy && !preflighting) { setPeerId(peer.node_id); void send(false, peer.node_id); } else { setPeerId(peer.node_id); } }} onContextMenu={event => { event.preventDefault(); setContextPeer(peer.node_id); }} onKeyDown={event => { if (event.key === 'Delete') { event.preventDefault(); void forgetPeer(peer.node_id); } }} aria-keyshortcuts="Delete" aria-pressed={peerId === peer.node_id}>
             <span className="device-icon"><Icon name="device" size={25} /></span>
             <span className="device-copy"><strong>{peer.display_name}</strong><span>{peer.endpoints[0]?.address || '等待网络地址'}</span><small>{peer.node_id.slice(0, 12)} · {peer.trusted ? '已信任' : peer.verified ? '身份已验证' : '连接时验证身份'}</small></span>
             {favoriteIds.has(peer.node_id) && <span className="device-favorite-mark" aria-label="已收藏"><Icon name="heart" size={16} /></span>}
             <span className={'status-dot ' + (peer.online ? 'online' : '')} />
-            {peerId === peer.node_id && <Icon name="check" size={18} />}
-          </button>)}
-          {!peers.length && <div className="empty-state"><span className="radar"><Icon name="device" size={28} /></span><h3>正在寻找附近的设备</h3><p>在另一台设备打开 NodeSend。<br />连接同一网络，即可在这里找到彼此。</p><small>也可以手动添加 IP 或主机名</small></div>}
+          </button>)}          {!peers.length && <div className="empty-state"><span className="radar"><Icon name="device" size={28} /></span><h3>正在寻找附近的设备</h3><p>在另一台设备打开 NodeSend。<br />连接同一网络，即可在这里找到彼此。</p><small>也可以手动添加 IP 或主机名</small></div>}
         </div>
       </section>
       </div>
@@ -190,7 +188,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
       </section></div>;
     })()}
     {textDialog === 'text' && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setTextDialog(null); }}><section className="modal surface" role="dialog" aria-modal="true" aria-labelledby="text-dialog-title"><div className="modal-heading"><div><span className="eyebrow">SEND TEXT</span><h2 id="text-dialog-title">输入要发送的文本</h2></div><button type="button" className="icon-button" aria-label="关闭" onClick={() => setTextDialog(null)}><Icon name="close" /></button></div><textarea className="text-entry" autoFocus value={textDraft} onChange={event => setTextDraft(event.target.value)} placeholder="输入文本内容" rows={6} /><div className="modal-actions"><button type="button" onClick={() => setTextDialog(null)}>取消</button><button type="button" className="primary" disabled={!textDraft.trim()} onClick={() => void confirmText()}>添加到发送列表</button></div></section></div>}
-    <div className="send-footer"><div><strong>{peerId ? '接收方：' + (status.peers.find(p => p.node_id === peerId)?.display_name ?? '') : '选择内容和接收方后即可发送'}</strong><span>接收方确认后才开始传输 · 无需账号</span></div>{preflighting ? <button className="primary send-button" disabled={cancellingPreflight} onClick={() => void cancelPreflight()}>取消</button> : <button className="primary send-button" disabled={busy || !paths.length || !peerId} onClick={() => void send()}>发送{manifest && !manifest.scanning && count ? ' ' + count + ' 个文件' : ''}</button>}</div>
+
     {publicPrompt && <PublicPathPrompt address={publicAddress} busy={busy} error="" onCancel={() => setPublicPrompt(false)} onConfirm={() => void send(true)} />}
   </div>;
 }

@@ -17,7 +17,7 @@ export default defineConfig({
   clearScreen: false,
   // Only scan the frontend entry; Rust/Android build directories can contain
   // thousands of generated files and are not frontend dependency entries.
-  optimizeDeps: { entries: ['index.html'] },
+  optimizeDeps: { noDiscovery: true, include: ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime', 'react/jsx-dev-runtime'], holdUntilCrawlEnd: false },
   server: {
     host: '127.0.0.1',
     port: 1420,
