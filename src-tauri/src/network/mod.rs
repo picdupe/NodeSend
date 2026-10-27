@@ -582,28 +582,18 @@ impl NetworkManager {
         {
             return Err(AppError::BadRequest("本机名称或接收策略非法".into()));
         }
-        if directory == self.transfers.default_destination()
-            && !std::path::Path::new(&directory).exists()
+        // 目录允许尚不存在：保存时只做词法校验，真正接收/缓存时才创建。
+        crate::transfer::paths::validate_destination(&directory)?;
+        let cache_directory = cache_directory.trim();
+        if !cache_directory.is_empty()
+            && !std::path::Path::new(cache_directory).is_absolute()
         {
-            std::fs::create_dir_all(&directory)?;
-        }
-        crate::transfer::paths::destination(&directory)?;
-        if !cache_directory.trim().is_empty() {
-            let cache_path = std::path::Path::new(cache_directory.trim());
-            if !cache_path.is_absolute() {
-                return Err(AppError::BadRequest("缓存目录必须是绝对路径".into()));
-            }
-            std::fs::create_dir_all(cache_path)?;
-            if !cache_path.is_dir() {
-                return Err(AppError::BadRequest("请选择有效的缓存目录".into()));
-        }
+            return Err(AppError::BadRequest("缓存目录必须是绝对路径".into()));
         }
         self.app.set_setting("display_name", name.trim())?;
         self.app.set_setting("receive_directory", &directory)?;
-        self.app.set_setting("cache_directory", cache_directory.trim())?;
+        self.app.set_setting("cache_directory", cache_directory)?;
         self.app.set_setting("receive_policy", &policy)?;
-        // 设置保存成功后立即切换新任务使用的缓存目录；已运行任务仍固定在旧目录。
-        self.transfers.refresh_cache_root_from_settings();
         Ok(())
     }
     pub fn set_android_media_library_enabled(&self, enabled: bool) -> AppResult<()> {

@@ -81,6 +81,38 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
     }
 }
 
+/// 仅解析设置页要展示的缓存目录，不创建任何目录。
+/// 用户未指定时给出平台默认候选（Windows 优先 D 盘，不存在则 C 盘）。
+pub(crate) fn configured_cache_root(app: &AppService) -> Option<PathBuf> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        return None;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Ok(Some(dir)) = app.get_setting("cache_directory") {
+            let dir = dir.trim();
+            if dir.is_empty() {
+                return None;
+            }
+            return Some(PathBuf::from(dir));
+        }
+        #[cfg(windows)]
+        {
+            let d = PathBuf::from(r"D:\ProgramData\NodeSend\Cache");
+            if Path::new("D:\\").exists() {
+                return Some(d);
+            }
+            return Some(PathBuf::from(r"C:\ProgramData\NodeSend\Cache"));
+        }
+        #[cfg(not(windows))]
+        {
+            Some(app.paths.data_dir.join("Cache"))
+        }
+    }
+}
+
 fn is_filesystem_root(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('/', "\\");
     normalized.len() == 3

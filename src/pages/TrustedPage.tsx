@@ -12,7 +12,7 @@ import {
   removeTrustedNode,
 } from '../api/ipc';
 import type { TrustedNode } from '../types';
-import { SidebarToggle } from '../components/AppLayout';
+import { SidebarToggle, WindowControls } from '../components/AppLayout';
 
 export function TrustedPage() {
   const [nodes, setNodes] = useState<TrustedNode[]>([]);
@@ -46,9 +46,10 @@ export function TrustedPage() {
   return (
     <div className="page">
       <header className="page-heading">
-        <h1>信任管理</h1>
+        <div><span className="eyebrow">NODESEND / TRUSTED</span></div>
         <div className="page-heading-actions">
           <SidebarToggle />
+          <WindowControls />
         </div>
       </header>
 

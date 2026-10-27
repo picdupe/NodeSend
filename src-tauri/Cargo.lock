@@ -3551,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "nodesend"
-version = "0.1.4-build.125"
+version = "0.1.4-build.126"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",

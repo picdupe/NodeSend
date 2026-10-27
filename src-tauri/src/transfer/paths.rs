@@ -141,6 +141,23 @@ pub fn ensure_under(root: &Path, path: &Path) -> AppResult<()> {
     }
     Ok(())
 }
+/// 设置页允许填写尚不存在的接收目录：只做词法校验，目录在首次真正接收时创建。
+pub fn validate_destination(raw: &str) -> AppResult<()> {
+    let path = Path::new(raw);
+    if raw.trim().is_empty() || !path.is_absolute() || raw.contains('\0') {
+        return Err(AppError::BadRequest("接收目录必须是绝对路径".into()));
+    }
+    Ok(())
+}
+/// 首次真正使用接收目录时创建并解析，避免设置后尚未使用就在磁盘上留下空目录。
+pub fn destination_for_use(raw: &str) -> AppResult<PathBuf> {
+    validate_destination(raw)?;
+    let path = Path::new(raw);
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+    }
+    destination(raw)
+}
 pub fn destination(raw: &str) -> AppResult<PathBuf> {
     let path = Path::new(raw);
     if !path.is_absolute() || !path.is_dir() {

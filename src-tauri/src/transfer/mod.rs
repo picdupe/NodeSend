@@ -210,7 +210,17 @@ impl TransferService {
             tasks.insert(task.id.clone(), task);
         }
         let (write_tx, write_rx) = mpsc::channel(write_queue::QUEUE_CHUNKS);
-        let cache_root = relay::resolve_cache_root(&app);
+        // 没有未完成的缓存任务时不去触碰缓存目录：目录只在真正有任务使用时创建。
+        let has_cached_tasks = tasks.values().any(|task| {
+            task.direction == "receive"
+                && task.use_cache
+                && !["completed", "cancelled", "rejected"].contains(&task.status.as_str())
+        });
+        let cache_root = if has_cached_tasks {
+            relay::resolve_cache_root(&app)
+        } else {
+            None
+        };
         let task_cache_roots = tasks
             .values()
             .filter(|task| task.direction == "receive" && task.use_cache && !["completed", "cancelled", "rejected"].contains(&task.status.as_str()))
@@ -1443,7 +1453,8 @@ impl TransferService {
         }
         let folder = destination.unwrap_or_else(|| self.default_destination());
         // 目标路径解析是同步文件系统调用（网络盘上可能明显阻塞），放到阻塞线程池。
-        let root = tokio::task::spawn_blocking(move || paths::destination(&folder))
+        // 目录可能尚未创建：直到这里（确认接收/开始任务）才按需创建。
+        let root = tokio::task::spawn_blocking(move || paths::destination_for_use(&folder))
             .await
             .map_err(|error| AppError::Other(error.to_string()))??;
         let targets = paths::plan_targets(&task, &root, &conflict, selected.as_deref())?;
@@ -1992,7 +2003,8 @@ impl TransferService {
         })
     }
     pub fn cache_directory(&self) -> String {
-        self.current_cache_root()
+        // 设置页展示用户配置的缓存目录（未配置时给出默认候选），与当前是否已创建/已解析无关。
+        relay::configured_cache_root(&self.app)
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default()

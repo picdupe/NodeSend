@@ -4,6 +4,7 @@ import type { ConflictPolicy, FileEntry, NetworkStatus, TransferTask } from '../
 import { chooseReceiveDirectory, errorText, listTaskEntries } from '../../api/network';
 import { useReceiveDecision } from '../../hooks/useReceiveDecision';
 import { Icon } from '../Icon';
+import { localDeviceIcon } from '../../utils/device';
 import { formatBytes } from './format';
 /** 清单分页大小：清单可能达百万条，必须按需分页加载，不能一次传入前端。 */
 const PAGE_SIZE = 200;
@@ -59,9 +60,9 @@ export function ReceivePanel({ status, refresh }: { status: NetworkStatus; refre
   const requests = status.tasks.filter(t => t.direction === 'receive' && t.status === 'waiting');
   const [copied, setCopied] = useState(false);
   return <>
-    <section className="receive-identity surface"><div className="identity-mark"><Icon name="device" size={34} /></div><div><span className="eyebrow">这台设备</span><h2>{status.display_name}</h2><p>告诉发送方选择这个名称</p><span className="badge success"><span className="status-dot online" />等待来自其他 Node 的请求</span></div><button className="copy-node-id" onClick={async () => { try { await navigator.clipboard.writeText(status.node_id); setCopied(true); } catch { setCopied(false); } }}>{copied ? '已复制 Node ID' : '复制 Node ID'}</button></section>
-    <div className="section-heading"><h2>接收请求 <span className="count-tag">{requests.length}</span></h2><span>由你决定接收内容和保存位置</span></div>
-    {!requests.length && <section className="surface empty-state generous"><Icon name="receive" size={38} /><h3>准备好接收了</h3><p>让另一台设备选择文件并发送给你。<br />收到请求后，会在这里等待你的确认。</p><span className="caption">默认每次询问</span></section>}
+    <section className="receive-identity surface"><div className="identity-mark"><Icon name={localDeviceIcon()} size={34} /></div><div><h2>{status.display_name}</h2><span className="badge success"><span className="status-dot online" />等待来自其他 Node 的请求</span></div><button className="copy-node-id" onClick={async () => { try { await navigator.clipboard.writeText(status.node_id); setCopied(true); } catch { setCopied(false); } }}>{copied ? '已复制 Node ID' : '复制 Node ID'}</button></section>
+    <div className="section-heading"><h2>接收请求 <span className="count-tag">{requests.length}</span></h2></div>
+    {!requests.length && <section className="surface empty-state generous"><Icon name="receive" size={38} /></section>}
     {requests.map(task => <RequestCard key={task.id} task={task} directory={status.receive_directory} decideReceive={decision.decide} busy={decision.busy} decisionError={decision.error} />)}
   </>;
 }

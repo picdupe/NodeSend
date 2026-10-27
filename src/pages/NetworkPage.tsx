@@ -5,7 +5,7 @@ import { SendSession } from '../components/transfer/SendSession';
 import { ReceivePanel } from '../components/transfer/ReceivePanel';
 import { TaskList } from '../components/transfer/TaskList';
 import { Icon } from '../components/Icon';
-import { SidebarToggle } from '../components/AppLayout';
+import { SidebarToggle, WindowControls } from '../components/AppLayout';
 import { PublicPathPrompt, publicPathRejected, publicPathAddress } from '../components/PublicPathPrompt';
 import { addEndpoint, errorText, sendFiles, transferAction } from '../api/network';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
@@ -14,7 +14,6 @@ import { useDeviceFavorites } from '../hooks/useDeviceFavorites';
 import type { SendSelectionState } from '../hooks/useSendSelection';
 
 export type TransferPage = 'send' | 'receive' | 'transfers';
-const copy: Record<TransferPage, [string, string]> = { send: ['传递，就在身边', '把文件送到另一台设备，简单、直接。'], receive: ['接收，尽在掌握', '每一次传递，都由你确认。'], transfers: ['每一次传递', '查看进度、继续任务，或回顾已经送达的文件。'] };
 export function NetworkPage({ mode, status, error, refresh, selection, sendTaskId, onSendTaskChange }: { mode: TransferPage; status: NetworkStatus | null; error: string; refresh: () => Promise<void>; selection: SendSelectionState; sendTaskId: string | null; onSendTaskChange: (id: string | null) => void }) {
   const [manualOpen, setManualOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
@@ -44,7 +43,7 @@ export function NetworkPage({ mode, status, error, refresh, selection, sendTaskI
   // Only a receiver-confirmed pending decision opens this view. Connecting
   // and queued tasks do not imply that the receiver needs user confirmation.
   if (mode === 'send' && sendTaskId && status && sendTask && ['waiting', 'rejected', 'cancelled', 'failed', 'incompatible'].includes(sendTask.status)) return <SendSession taskId={sendTaskId} status={status} onCancel={cancelSend} onClose={() => onSendTaskChange(null)} />;
-  return <div className={'page transfer-page ' + (mode === 'send' ? 'send-page' : '')}><header className="page-heading"><div><span className="eyebrow">NODESEND / {mode === 'send' ? 'SEND' : mode === 'receive' ? 'RECEIVE' : 'ACTIVITY'}</span><h1>{copy[mode][0]}</h1><p>{copy[mode][1]}</p></div><div className="page-heading-actions">{mode === 'send' && <><button type="button" className="icon-button device-info-button" aria-label="查看本机信息" onClick={() => setInfoOpen(true)}><Icon name="info" /></button><button type="button" className="icon-button device-info-button favorites-button" aria-label="查看收藏设备" disabled={!status} onClick={() => setFavoritesOpen(true)}><Icon name="heart" /></button><button type="button" className="icon-button manual-discovery-button" aria-label="手动发现设备" onClick={() => setManualOpen(true)}><Icon name="discover" /><span>手动发现设备</span></button></>}<button type="button" className={'icon-button refresh-button' + (refreshing ? ' refreshing' : '')} aria-label="刷新设备与任务" aria-busy={refreshing} onClick={runRefresh}><Icon name="refresh" /></button><SidebarToggle /></div></header>
+  return <div className={'page transfer-page ' + (mode === 'send' ? 'send-page' : '')}><header className="page-heading"><div><span className="eyebrow">NODESEND / {mode === 'send' ? 'SEND' : mode === 'receive' ? 'RECEIVE' : 'ACTIVITY'}</span></div><div className="page-heading-actions">{mode === 'send' && <><button type="button" className="icon-button device-info-button" aria-label="查看本机信息" onClick={() => setInfoOpen(true)}><Icon name="info" /></button><button type="button" className="icon-button device-info-button favorites-button" aria-label="查看收藏设备" disabled={!status} onClick={() => setFavoritesOpen(true)}><Icon name="heart" /></button><button type="button" className="icon-button manual-discovery-button" aria-label="手动发现设备" onClick={() => setManualOpen(true)}><Icon name="discover" /><span>手动发现设备</span></button></>}<button type="button" className={'icon-button refresh-button' + (refreshing ? ' refreshing' : '')} aria-label="刷新设备与任务" aria-busy={refreshing} onClick={runRefresh}><Icon name="refresh" /></button><SidebarToggle /><WindowControls /></div></header>
     {error && <div className="notice error" role="alert">{status ? error : '尚未连接到 NodeSend 本机服务。请通过桌面应用打开。'}<details><summary>查看原因</summary>{error}</details></div>}
     {cancelError && <div className="notice error" role="alert">取消请求失败：{cancelError}</div>}
     {status?.discovery.warnings.map(warning => <div className="notice" key={warning}>{warning}；可尝试手动连接设备。</div>)}

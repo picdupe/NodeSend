@@ -141,7 +141,6 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
       {scanError && <div className="notice error" role="alert">扫描状态读取失败：{scanError}</div>}
       <div className="send-grid">
       <section className="surface payload-panel">
-        <div className="section-title"><span className="step">1</span><h2>选择要发送的内容</h2></div>
         <div className={'drop-zone ' + (dragging ? 'dragging' : '')}>
           <span className="large-icon"><Icon name="folder" size={32} /></span>
           <h3>{dragging ? '松开即可添加' : '选择发送内容'}</h3>
@@ -156,8 +155,7 @@ export function SendPanel({ status, refresh, onSent, favorites, favoriteError, o
         <p className="caption">传输始终加密。额外哈希校验适合重要资料。</p>
       </section>
       <section className="surface devices-panel">
-        <div className="section-title"><span className="step">2</span><h2>发送给谁</h2><span className="count-tag">{status.peers.filter(p => p.online).length} 在线</span></div>
-        <input className="search-field" aria-label="搜索设备" placeholder="搜索设备名称、地址或 Node ID" value={search} onChange={e => setSearch(e.target.value)} />
+        <div className="search-box"><input className="search-field" aria-label="搜索设备" placeholder="搜索设备名称、地址或 Node ID" value={search} onChange={e => setSearch(e.target.value)} /><span className="search-online">{status.peers.filter(p => p.online).length} 在线</span></div>
         <div className="device-list">
           {peers.map(peer => <button type="button" className={'device-card device-card-main ' + (peerId === peer.node_id ? 'selected' : '')} key={peer.node_id} onClick={() => { setContextPeer(null); if (preflighting && preflightPeerId === peer.node_id) { void cancelPreflight(); } else if (paths.length && !busy && !preflighting) { setPeerId(peer.node_id); void send(false, peer.node_id); } else { setPeerId(peer.node_id); } }} onContextMenu={event => { event.preventDefault(); setContextPeer(peer.node_id); }} onKeyDown={event => { if (event.key === 'Delete') { event.preventDefault(); void forgetPeer(peer.node_id); } }} aria-keyshortcuts="Delete" aria-pressed={peerId === peer.node_id}>
             <span className="device-icon"><Icon name="device" size={25} /></span>
