@@ -53,16 +53,14 @@ def main() -> None:
                 raise SystemExit(f"Cannot merge existing updater manifest {manifest_path}: 'platforms' must be an object.")
             print(f"Merging updater manifest for existing version/build: {internal_version}")
         else:
-            manifest = {"version": internal_version, "platforms": {}}
+            manifest = {"version": internal_version, "notes": "", "platforms": {}}
     else:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest = {"version": internal_version, "platforms": {}}
+        manifest = {"version": internal_version, "notes": "", "platforms": {}}
 
     manifest.setdefault("version", internal_version)
+    manifest.setdefault("notes", "")
     manifest.setdefault("platforms", {})
-    # This manifest contains update metadata only; remove any legacy notes
-    # field when merging an existing manifest.
-    manifest.pop("notes", None)
     manifest["android"] = {
         "version": f"{version}.{build}",
         "versionCode": version_code,

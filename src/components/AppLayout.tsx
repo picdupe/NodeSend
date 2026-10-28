@@ -19,12 +19,12 @@ export function AppLayout({ current, onNavigate, status, refresh, children }: { 
   const [visibleRequest, setVisibleRequest] = useState<TransferTask | null>(null);
   const receiveDecision = useReceiveDecision(refresh);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
-  // Mobile drawer: a right swipe anywhere on the page opens the sidebar.
+  // Horizontal swipes open or close the mobile drawer without blocking scrolling.
   useEffect(() => {
     const onStart = (event: TouchEvent) => {
       const touch = event.touches[0];
-      if (!touch || event.touches.length > 1 || window.innerWidth > 850) return;
-      if (event.target instanceof Element && event.target.closest('.sidebar')) return;
+      if (!touch || event.touches.length > 1 || window.innerWidth > 850) { touchStart.current = null; return; }
+      if (!sidebarOpen && event.target instanceof Element && event.target.closest('.sidebar')) return;
       touchStart.current = { x: touch.clientX, y: touch.clientY };
     };
     const onMove = (event: TouchEvent) => {
@@ -33,15 +33,18 @@ export function AppLayout({ current, onNavigate, status, refresh, children }: { 
       if (!start || !touch) return;
       const dx = touch.clientX - start.x;
       const dy = Math.abs(touch.clientY - start.y);
-      if (dx > 56 && dx > dy * 1.4) { setSidebarOpen(true); touchStart.current = null; }
+      if (Math.abs(dx) > 56 && Math.abs(dx) > dy * 1.4 && (sidebarOpen ? dx < 0 : dx > 0)) {
+        setSidebarOpen(!sidebarOpen); touchStart.current = null;
+      }
       else if (dy > 48) touchStart.current = null;
     };
     const onEnd = () => { touchStart.current = null; };
     window.addEventListener('touchstart', onStart, { passive: true });
     window.addEventListener('touchmove', onMove, { passive: true });
     window.addEventListener('touchend', onEnd, { passive: true });
-    return () => { window.removeEventListener('touchstart', onStart); window.removeEventListener('touchmove', onMove); window.removeEventListener('touchend', onEnd); };
-  }, []);
+    window.addEventListener('touchcancel', onEnd, { passive: true });
+    return () => { window.removeEventListener('touchstart', onStart); window.removeEventListener('touchmove', onMove); window.removeEventListener('touchend', onEnd); window.removeEventListener('touchcancel', onEnd); };
+  }, [sidebarOpen]);
   const pendingTasks = status?.tasks.filter(t => t.direction === 'receive' && t.status === 'waiting') ?? [];
   const pending = pendingTasks.length;
   useEffect(() => {
@@ -75,7 +78,7 @@ export function AppLayout({ current, onNavigate, status, refresh, children }: { 
   }
   const nav = (items: typeof mainItems) => items.map(item => <button key={item.key} className={'nav-item ' + (current === item.key ? 'active' : '')} onClick={() => { onNavigate(item.key); setSidebarOpen(false); }} aria-current={current === item.key ? 'page' : undefined}><Icon name={item.icon} /><span>{item.label}</span>{item.key === 'receive' && pending > 0 && <span className="nav-badge">{pending}</span>}</button>);
   const sidebarToggle = <span className="sidebar-controls"><button type="button" className="icon-button mobile-sidebar-toggle" aria-controls="app-sidebar" aria-expanded={sidebarOpen} aria-label={sidebarOpen ? '关闭导航' : '打开导航'} onClick={() => setSidebarOpen(value => !value)}><Icon name={sidebarOpen ? 'close' : 'menu'} /></button></span>;
-  return <div className={'app-layout' + (sidebarCollapsed ? ' sidebar-collapsed' : '')}><header className="custom-titlebar" data-tauri-drag-region /><div className="app-shell"><aside id="app-sidebar" className={'sidebar ' + (sidebarOpen ? 'open' : '')}><div className="app-brand"><button type="button" className="brand-symbol rail-toggle" aria-controls="app-sidebar" aria-expanded={!sidebarCollapsed} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} onClick={() => setSidebarCollapsed(value => !value)}><i /><i /><i /><Icon name="panel-left" /></button><span className="brand-symbol brand-mark" aria-hidden="true"><i /><i /><i /></span><div>NodeSend</div></div><nav aria-label="主导航" className="nav-list">{nav(mainItems)}{nav(extraItems)}</nav><div className="sidebar-bottom">{nav([settingsItem])}<div className="sidebar-device"><span className="device-icon"><Icon name={localDeviceIcon()} /></span><div><strong>{status?.display_name ?? '本机设备'}</strong></div></div></div></aside>{sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} /> }<main className="content"><SidebarToggleContext.Provider value={sidebarToggle}>{children}</SidebarToggleContext.Provider></main>{request && <div className="untrusted-receive-overlay" role="presentation"><section className="untrusted-receive-screen" role="alertdialog" aria-modal="true" aria-labelledby="global-receive-title"><div className="untrusted-receive-body"><div className="untrusted-device-icon"><Icon name={request.peer_device_type === 'android' || request.peer_device_type === 'ios' ? 'phone' : 'device'} size={74} /></div><div className="untrusted-receive-name">{request.peer_name}</div><div className="untrusted-receive-device-meta">{senderIp && <span>#{senderIp}</span>}{vendor && <span>{vendor}</span>}</div><p className="untrusted-receive-message">想给你发送 <strong>{request.directory_count > 0 ? '一个文件夹' : request.file_count === 1 ? '一个文件' : '多个文件'}</strong>{request.directory_count > 0 && <><br />共 {request.file_count - request.directory_count} 个文件</>}</p></div>
+  return <div className={'app-layout' + (sidebarCollapsed ? ' sidebar-collapsed' : '')}><header className="custom-titlebar" data-tauri-drag-region /><div className="app-shell"><aside id="app-sidebar" className={'sidebar ' + (sidebarOpen ? 'open' : '')}><div className="app-brand"><button type="button" className="brand-symbol rail-toggle" aria-controls="app-sidebar" aria-expanded={!sidebarCollapsed} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} onClick={() => setSidebarCollapsed(value => !value)}><i /><i /><i /><Icon name="panel-left" /></button><span className="brand-symbol brand-mark" aria-hidden="true"><i /><i /><i /></span><div>NodeSend</div></div><nav aria-label="主导航" className="nav-list">{nav(mainItems)}{nav(extraItems)}</nav><div className="sidebar-bottom">{nav([settingsItem])}<div className="sidebar-device"><span className="device-icon"><Icon name={localDeviceIcon()} /></span><div><strong>{status?.display_name ?? '本机设备'}</strong></div></div></div></aside>{sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} /> }<main className="content"><SidebarToggleContext.Provider value={sidebarToggle}><div className="page-scroll-region">{children}</div></SidebarToggleContext.Provider></main>{request && <div className="untrusted-receive-overlay" role="presentation"><section className="untrusted-receive-screen" role="alertdialog" aria-modal="true" aria-labelledby="global-receive-title"><div className="untrusted-receive-body"><div className="untrusted-device-icon"><Icon name={request.peer_device_type === 'android' || request.peer_device_type === 'ios' ? 'phone' : 'device'} size={74} /></div><div className="untrusted-receive-name">{request.peer_name}</div><div className="untrusted-receive-device-meta">{senderIp && <span>#{senderIp}</span>}{vendor && <span>{vendor}</span>}</div><p className="untrusted-receive-message">想给你发送 <strong>{request.directory_count > 0 ? '一个文件夹' : request.file_count === 1 ? '一个文件' : '多个文件'}</strong>{request.directory_count > 0 && <><br />共 {request.file_count - request.directory_count} 个文件</>}</p></div>
         <div className="untrusted-receive-footer">
           {receiveDecision.error && <div className="notice error">{receiveDecision.error}</div>}
           {cancelledByPeer ? <>

@@ -202,6 +202,7 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         # starts a clean manifest so stale platform artifacts are not retained.
         $platforms = [ordered]@{}
         $androidUpdate = $null
+        $releaseNotes = ''
         if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
             try {
                 $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -210,6 +211,7 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
                         $platforms[$property.Name] = $property.Value
                     }
                     if ($null -ne $existingManifest.android) { $androidUpdate = $existingManifest.android }
+                    if ($null -ne $existingManifest.notes) { $releaseNotes = [string]$existingManifest.notes }
                     Write-Output "Merging updater manifest for existing version/build: $internalVersion"
                 }
             } catch {
@@ -223,6 +225,7 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         }
         $manifest = [ordered]@{
             version = $internalVersion
+            notes = $releaseNotes
             platforms = $platforms
             release_page_url = "https://gitcode.com/picdupe/NodeSend/releases"
         }

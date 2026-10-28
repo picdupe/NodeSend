@@ -10,6 +10,8 @@ import { TrustedPage } from './pages/TrustedPage';
 import { NetworkPage, type TransferPage } from './pages/NetworkPage';
 import { useNetwork } from './hooks/useNetwork';
 import { useSendSelection } from './hooks/useSendSelection';
+import { useUpdateNotification } from './hooks/useUpdateNotification';
+import { UpdateDialog } from './components/UpdateDialog';
 import { frontendPreview } from './api/runtime';
 export default function App() {
   const [page, setPage] = useState<PageKey>('send');
@@ -17,6 +19,7 @@ export default function App() {
   const [exitHint, setExitHint] = useState(false);
   const network = useNetwork();
   const sendSelection = useSendSelection();
+  const updateNotice = useUpdateNotification();
   const currentPage = useRef<PageKey>('send');
   const pageHistory = useRef<PageKey[]>(['send']);
   const exitDeadline = useRef(0);
@@ -105,11 +108,14 @@ export default function App() {
       .catch(() => {});
     return () => dispose?.();
   }, [navigate, sendSelection.setPaths]);
-  return <AppLayout current={page} onNavigate={navigate} status={network.status} refresh={network.refresh}>
-    {page === 'send' && exitHint && <div className="back-exit-hint" role="status">再按一次返回退出</div>}
-    {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} selection={sendSelection} sendTaskId={sendTaskId} onSendTaskChange={setSendTaskId} />}
-    {page === 'dashboard' && <DashboardPage network={network.status} onSaved={network.refresh} />}
-    {page === 'shares' && <ShareCenterPage />}
-    {page === 'trusted' && <TrustedPage />}
-  </AppLayout>;
+  return <>
+    <AppLayout current={page} onNavigate={navigate} status={network.status} refresh={network.refresh}>
+      {page === 'send' && exitHint && <div className="back-exit-hint" role="status">再按一次返回退出</div>}
+      {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} selection={sendSelection} sendTaskId={sendTaskId} onSendTaskChange={setSendTaskId} />}
+      {page === 'dashboard' && <DashboardPage network={network.status} onSaved={network.refresh} />}
+      {page === 'shares' && <ShareCenterPage />}
+      {page === 'trusted' && <TrustedPage />}
+    </AppLayout>
+    {updateNotice.update && <UpdateDialog update={updateNotice.update} onClose={updateNotice.close} onSkip={updateNotice.skip} />}
+  </>;
 }

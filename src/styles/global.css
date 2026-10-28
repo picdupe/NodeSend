@@ -52,6 +52,7 @@ h2 {font-size:17px;font-weight:650;} h3 {font-size:15px;font-weight:650;}
 .content::-webkit-scrollbar,.device-list::-webkit-scrollbar,.request-files::-webkit-scrollbar,.browser-tabs::-webkit-scrollbar,.breadcrumbs::-webkit-scrollbar,.modal::-webkit-scrollbar { display:none; width:0; height:0; }
 .page {max-width:1280px;margin:0 auto;min-height:calc(100vh - 135px);}
 .page-heading {position:relative;display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:30px;gap:20px;}
+.page-heading>div:first-child{margin-left:10px}
 .page-heading h1 {font-size:29px;letter-spacing:-.7px;margin:5px 0 8px;font-weight:680;}.page-heading p {color:var(--muted);margin:0;font-size:13px;}
 /* 操作区脱离标题高度：无论按钮数量多少，英文标题的落点完全一致。 */
 .page-heading-actions {position:absolute;top:50%;right:0;transform:translateY(-50%);display:flex;align-items:center;gap:8px;flex-shrink:0;}
@@ -107,7 +108,7 @@ h2 {font-size:17px;font-weight:650;} h3 {font-size:15px;font-weight:650;}
 .send-shell,.send-grid,.payload-panel,.selection-list,.selection-row{min-width:0;max-width:100%}
 .selection-row>span{min-width:0;flex:1 1 0}
 .selection-row>svg,.selection-row>button{flex-shrink:0}
-.send-page {height:calc(100vh - 60px);min-height:0;display:flex;flex-direction:column;}
+.send-page {height:100%;min-height:0;display:flex;flex-direction:column;}
 .send-page .page-heading {flex-shrink:0;}
 .send-shell,.send-panel {display:flex;flex:1;min-height:0;flex-direction:column;}
 .send-scroll {flex:1;min-height:0;overflow:auto;padding-bottom:4px;scrollbar-width:none;overscroll-behavior:contain;}
@@ -163,6 +164,8 @@ progress {width:100%;height:5px;border:0;border-radius:5px;overflow:hidden;displ
 @media (max-width:850px){.send-page .page-heading>div:first-child {min-width:0;}.send-page .page-heading>div:first-child .eyebrow,.send-page .page-heading>div:first-child h1,.send-page .page-heading>div:first-child p {white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .back-exit-hint{position:fixed;z-index:50;left:50%;bottom:calc(24px + env(safe-area-inset-bottom));transform:translateX(-50%);padding:10px 16px;border-radius:10px;background:#20283a;color:#fff;font-size:12px;box-shadow:0 8px 24px #10172444}
 @media (min-width:851px){.mobile-sidebar-toggle,.sidebar-backdrop{display:none;}}
+button.sidebar-backdrop,button.sidebar-backdrop:hover,button.sidebar-backdrop:active,button.sidebar-backdrop:focus{background:#10172466;border:0;box-shadow:none;-webkit-tap-highlight-color:transparent}
+button.sidebar-backdrop:active{animation:none}
 /* 公网路径确认弹窗：仅在原生层拒绝未授权公网地址后弹出，不常驻勾选框。 */
 .public-path-backdrop {z-index:21;}
 .public-path-prompt {width:min(430px,100%);}
@@ -176,6 +179,14 @@ progress {width:100%;height:5px;border:0;border-radius:5px;overflow:hidden;displ
 .app-modal-icon{width:44px;height:44px;display:grid;place-items:center;border-radius:14px;background:#f0edff;color:var(--primary);}
 .app-modal-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:24px;}
 .app-modal-actions button{min-width:92px;}
+/* 更新弹窗：版本信息 + 更新内容（来源 latest.json 的 notes），操作分跳过/下次提醒/立即更新。 */
+.update-dialog{width:min(520px,100%);}
+.update-dialog-meta{margin:0 0 18px;color:var(--muted);font-size:12px;}
+.update-dialog-notes{padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:var(--bg);max-height:34vh;overflow:auto;}
+.update-dialog-notes strong{display:block;margin-bottom:8px;font-size:12px;letter-spacing:.6px;}
+.update-dialog-notes p{margin:0;white-space:pre-line;font-size:13px;line-height:1.75;}
+.update-dialog-notes .update-dialog-empty{color:var(--muted);}
+.update-dialog .update-download-progress{margin-top:16px;}
 .browser-table th:first-child,.browser-table td:first-child{width:42px;padding-right:0}.browser-table input[type="checkbox"]{width:15px;height:15px;accent-color:var(--primary)}.browser-detail{display:flex;align-items:center;flex-wrap:wrap;gap:10px 16px;border-top:1px solid var(--border);padding:12px 18px;font-size:12px}.browser-detail strong{font-size:13px}.browser-detail span{color:var(--muted)}.browser-detail .mono{overflow-wrap:anywhere}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important;}}
 /* Refresh rotation conveys an in-progress operation, not decorative motion. */
@@ -186,7 +197,7 @@ progress {width:100%;height:5px;border:0;border-radius:5px;overflow:hidden;displ
 
 .task-meta{flex-wrap:wrap;gap:6px 12px;font-variant-numeric:tabular-nums;}
 
-button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not(.manual-discovery-button):not(.device-info-button):not(.mobile-sidebar-toggle):not(.rail-toggle):active{animation:button-tap .34s ease}
+button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not(.manual-discovery-button):not(.device-info-button):not(.mobile-sidebar-toggle):not(.rail-toggle):not(.sidebar-backdrop):active{animation:button-tap .34s ease}
 @keyframes button-tap{0%{box-shadow:inset 0 0 0 0 #a89fea00}35%{box-shadow:inset 0 0 0 2px #a89fea88}100%{box-shadow:inset 0 0 0 0 #a89fea00}}
 .task-bottom button,.task-bottom button:hover,.task-bottom button:active{background:var(--card-bg);border-color:var(--border);box-shadow:none;transition:transform .16s ease,opacity .16s ease}
 .task-bottom button.text-button,.task-bottom button.text-button:hover,.task-bottom button.text-button:active{background:transparent;border-color:transparent}
@@ -236,7 +247,7 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
 @media(prefers-reduced-motion:reduce){.untrusted-receive-overlay{animation:none}}
 .send-session{max-width:760px;margin:0 auto;padding-top:14px}.send-session-flow{display:flex;align-items:center;justify-content:center;gap:clamp(22px,8vw,80px);padding:38px 24px;margin-top:26px;text-align:center}.send-session-device{display:flex;flex-direction:column;align-items:center;gap:7px;min-width:120px}.send-session-device small{color:var(--muted);font-size:12px}.send-session-arrow{color:var(--primary)}.send-session-status{margin-top:16px;padding:22px}.send-session-status h2{margin:0;font-size:18px}.send-session-status .task-header{align-items:flex-start}.send-session-status progress{width:100%;margin:18px 0 8px}.send-session-actions{display:flex;justify-content:center;margin-top:20px}.send-session-actions button{min-width:140px}.send-session-actions svg{transform:rotate(180deg)}
 @media(max-width:600px){.send-session-flow{gap:12px;padding:28px 12px}.send-session-device{min-width:100px}.send-session-device strong{max-width:110px;overflow-wrap:anywhere}}
-.media-library-directory{align-items:center}.media-library-switch{transition:background-color .2s ease,border-color .2s ease,color .2s ease;animation:media-library-switch-pop .22s ease}.media-library-switch.enabled{background:var(--primary);border-color:var(--primary);color:#fff}.media-library-switch:active{transform:scale(.94)}.media-library-switch:disabled{opacity:1;cursor:wait}@keyframes media-library-switch-pop{0%{transform:scale(.92)}70%{transform:scale(1.04)}100%{transform:scale(1)}}@media(prefers-reduced-motion:reduce){.media-library-switch{animation:none;transition:none}}
+.media-library-directory{align-items:center}.media-library-switch{transition:background-color .2s ease,border-color .2s ease,color .2s ease}.media-library-switch.enabled{background:var(--primary);border-color:var(--primary);color:#fff}.media-library-switch:active{transform:scale(.94)}.media-library-switch:disabled{opacity:1;cursor:wait}
 
 /* Desktop app frame: rounded content panel, animated collapsible navigation rail. */
 .app-layout{display:flex;flex-direction:column;min-height:100vh;height:100vh;padding:0;background:var(--bg)}
@@ -256,12 +267,29 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
 .app-shell{display:flex;flex:1;min-height:0;padding:0 14px 14px;gap:14px}
 .app-shell>.sidebar{width:224px;flex-shrink:0;display:flex;flex-direction:column;padding:22px 13px 16px;border-radius:18px;transition:width .24s ease,padding .24s ease}
 .app-shell>.sidebar>.sidebar-top-controls{display:none}
-.app-shell>.content{flex:1;min-width:0;min-height:0;overflow:auto;padding:28px 34px 20px;border:1px solid var(--border);border-radius:20px;background:var(--card-bg);transition:padding .24s ease}
+.app-shell>.content{flex:1;min-width:0;min-height:0;overflow:hidden;padding:0;border:1px solid var(--border);border-radius:20px;background:var(--card-bg);transition:padding .24s ease}
+.page-scroll-region{width:100%;height:100%;min-height:0;overflow:auto;padding:22px 24px 24px;scrollbar-width:none;overscroll-behavior:contain}
+.page-scroll-region::-webkit-scrollbar{display:none;width:0;height:0}
+.page-scroll-region>.page{width:100%;max-width:none;min-height:100%;margin:0}
+.page-scroll-region>.page>:last-child{margin-bottom:0}
+.page-scroll-region>.page>.page-heading{position:sticky;top:-22px;z-index:5;margin:-22px -24px 0;padding:22px 24px 0;background:var(--card-bg)}
+.page-scroll-region>.page>.page-heading::before{content:'';position:absolute;left:0;right:0;bottom:100%;height:22px;background:var(--card-bg);pointer-events:none}
+.page-scroll-region>.page>.page-heading::after{content:'';position:absolute;left:0;right:0;top:100%;height:22px;background:var(--card-bg);pointer-events:none}
+.page-scroll-region>.page>.task-toolbar-fixed{position:sticky;top:50px;z-index:6;margin:0 -24px 20px;padding:8px 24px 14px;background:var(--card-bg);background-clip:padding-box;isolation:isolate}
+.page-scroll-region>.send-page>.page-heading{position:sticky;top:0;margin:0 0 22px;padding:0;background:var(--card-bg);z-index:5}
+.page-scroll-region:has(>.activity-page){overflow:hidden;padding:0 24px 24px;display:flex;flex-direction:column}
+.page-scroll-region>.activity-page{height:100%;min-height:0;display:grid;grid-template-rows:60px 54px minmax(0,1fr);overflow:hidden}
+.activity-page>.page-heading{position:relative;top:auto;grid-row:1;align-self:stretch;margin:0 -24px;padding:22px 24px 0;background:var(--card-bg);z-index:8}
+.activity-page>.page-heading .page-heading-actions{top:50%;right:24px}
+.activity-page>.task-toolbar-fixed{position:relative;top:auto;grid-row:2;margin:0 -24px;padding:5px 24px 10px;background:var(--card-bg);z-index:7}
+.activity-page>.task-items-list{grid-row:3;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:none}
+.activity-page>.task-items-list::-webkit-scrollbar{display:none;width:0;height:0}
+.activity-page>.task-items-list>:last-child{margin-bottom:0}
 .sidebar-collapsed .app-shell>.sidebar{width:66px}
 /* 菜单命中区在收起/展开时左边缘完全一致：始终向左补 2px，图标随之抵消 +2px。
    宽度用百分比跟随侧栏动画，因此收起只是整体向左缩窄，不会产生位移跳动。 */
-@media(max-width:1100px){.app-shell>.sidebar{width:195px;padding-inline:12px}.app-shell>.content{padding:30px 25px 15px}}
-@media(max-width:850px){.app-layout{padding:0}.custom-titlebar{display:none}.app-shell{padding:0;gap:0}.app-shell>.content{border:0;border-radius:0;background:transparent;padding:calc(13px + env(safe-area-inset-top) / 2) 10px calc(15px + env(safe-area-inset-bottom))}.app-shell>.sidebar{width:224px;padding:calc(22px + env(safe-area-inset-top) / 2) 13px calc(16px + env(safe-area-inset-bottom));border-radius:0;transition:transform .24s ease,box-shadow .24s ease}.sidebar-collapsed .app-shell>.sidebar{width:224px}.page-heading-actions .window-control-button{display:none}}
+@media(max-width:1100px){.app-shell>.sidebar{width:195px;padding-inline:12px}.page-scroll-region{padding:20px 24px 24px}.page-scroll-region>.page>.page-heading{top:-20px;margin:-20px -24px 0;padding:20px 24px 0}}
+@media(max-width:850px){.app-layout{padding:0}.custom-titlebar{display:none}.app-shell{padding:0;gap:0}.app-shell>.content{border:0;border-radius:0;background:transparent}.page-scroll-region{padding:calc(13px + env(safe-area-inset-top) / 2) 10px calc(10px + env(safe-area-inset-bottom))}.page-scroll-region>.page>.page-heading{top:calc(-13px - env(safe-area-inset-top) / 2);margin:calc(-13px - env(safe-area-inset-top) / 2) -10px 0;padding:calc(13px + env(safe-area-inset-top) / 2) 10px 0}.page-scroll-region>.page>.task-toolbar-fixed{top:42px;margin:0 -10px 16px;padding:6px 10px 10px}.page-scroll-region>.send-page>.page-heading{position:relative;top:auto;margin:0 0 22px;padding:0;background:transparent}.page-scroll-region:has(>.activity-page){overflow:hidden;padding:0 10px calc(10px + env(safe-area-inset-bottom))}.page-scroll-region>.activity-page{grid-template-rows:calc(42px + env(safe-area-inset-top) / 2) 48px minmax(0,1fr)}.activity-page>.page-heading{margin:0 -10px;padding:calc(13px + env(safe-area-inset-top) / 2) 10px 0}.activity-page>.page-heading .page-heading-actions{right:10px}.activity-page>.task-toolbar-fixed{margin:0 -10px;padding:4px 10px 8px}.app-shell>.sidebar{width:224px;padding:calc(22px + env(safe-area-inset-top) / 2) 13px calc(16px + env(safe-area-inset-bottom));border-radius:0;transition:transform .24s ease,box-shadow .24s ease}.sidebar-collapsed .app-shell>.sidebar{width:224px}.page-heading-actions .window-control-button{display:none}}
 
 
 /* Sidebar toggle belongs to the rail; revealing it never changes menu geometry. */
@@ -277,6 +305,7 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
 .sidebar-collapsed .app-brand>div,.sidebar-collapsed .nav-item>span:not(.nav-badge),.sidebar-collapsed .sidebar-bottom .sidebar-device>div{opacity:0}
 /* The send workspace stays anchored inside the content panel; only long device lists scroll. */
 .app-shell>.content:has(.send-page){overflow:hidden;display:flex;flex-direction:column}
+.page-scroll-region:has(>.send-page){overflow:hidden;padding:22px 24px 24px;display:flex;flex-direction:column}
 .send-page{height:auto;min-height:0;flex:1;overflow:hidden}
 .send-page .send-shell,.send-page .send-panel{height:100%;min-height:0;flex:1;overflow:hidden}
 .send-page .send-scroll{display:flex;flex:1;min-height:0;flex-direction:column;overflow:hidden}
@@ -284,7 +313,7 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
 .send-page .payload-panel,.send-page .devices-panel{height:100%;min-height:0;max-height:100%;overflow:auto;overscroll-behavior:contain}
 .send-page .devices-panel{display:flex;flex-direction:column}
 .send-page .devices-panel .device-list{min-height:0;flex:1;overflow:auto;overscroll-behavior:contain}
-@media(max-width:850px){.app-shell>.sidebar>.desktop-sidebar-toggle{display:none}.app-shell>.content:has(.send-page){overflow:auto;display:block}.send-page{height:auto;min-height:calc(100vh - 45px);overflow:visible}.send-page .send-shell,.send-page .send-panel{height:auto;min-height:0;overflow:visible}.send-page .send-grid{height:auto;overflow:visible;grid-template-rows:auto auto}.send-page .payload-panel,.send-page .devices-panel{height:auto;max-height:none;overflow:visible}.send-page .devices-panel .device-list{overflow:visible}}
+@media(max-width:850px){.app-shell>.sidebar>.desktop-sidebar-toggle{display:none}.page-scroll-region:has(>.send-page){overflow:auto;display:block;padding:calc(13px + env(safe-area-inset-top) / 2) 10px calc(10px + env(safe-area-inset-bottom))}.send-page{height:auto;min-height:calc(100vh - 45px);overflow:visible}.send-page .send-shell,.send-page .send-panel{height:auto;min-height:0;overflow:visible}.send-page .send-grid{height:auto;overflow:visible;grid-template-rows:auto auto}.send-page .send-page .payload-panel,.send-page .devices-panel{height:auto;max-height:none;overflow:visible}.send-page .devices-panel .device-list{overflow:visible}}
 
 
 /* Sidebar collapse is an animated swap on the existing brand mark, not a second control. */
@@ -314,6 +343,64 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
 .app-shell>.content>.send-page{width:100%;max-width:none;margin-left:0;margin-right:0;align-self:stretch}
 .send-page .devices-panel .device-list{max-height:none}
 
+/* Mobile headers share the send page's content baseline and theme background.
+   Keep padding out of the header so absolute actions center on its text row. */
+@media(max-width:850px){
+  .page-scroll-region{padding:0 10px calc(10px + env(safe-area-inset-bottom))}
+  .page-scroll-region>.page:not(.send-page)>.page-heading{
+    position:sticky;top:0;height:auto;min-height:0;
+    margin:0 -10px 22px;padding:max(48px, env(safe-area-inset-top)) 10px 0;background:var(--bg);
+    z-index:8;
+  }
+  .page-scroll-region>.page:not(.send-page)>.page-heading::before{
+    content:'';position:absolute;left:0;right:0;bottom:100%;
+    height:max(48px, env(safe-area-inset-top));background:var(--bg);pointer-events:none;
+  }
+  .page-scroll-region>.send-page>.page-heading{
+    position:sticky;top:0;
+    margin:0 -10px 22px;
+    padding:max(48px, env(safe-area-inset-top)) 10px 0;
+    background:var(--bg);z-index:9;
+  }
+  .page-scroll-region>.send-page>.page-heading::before{
+    content:'';position:absolute;left:0;right:0;bottom:100%;
+    height:max(48px, env(safe-area-inset-top));background:var(--bg);pointer-events:none;
+  }
+  .page-scroll-region>.send-page>.page-heading::after{
+    content:'';position:absolute;left:0;right:0;top:100%;height:22px;background:var(--bg);pointer-events:none;
+  }
+  .page-scroll-region>.send-page>.page-heading .page-heading-actions{
+    top:calc(max(48px, env(safe-area-inset-top)) + 9px);right:10px;transform:translateY(-50%);
+  }
+  .page-scroll-region>.page:not(.send-page)>.page-heading::after{
+    content:'';position:absolute;left:0;right:0;top:100%;height:22px;background:var(--bg);pointer-events:none;
+  }
+  .page-scroll-region>.settings-page>.page-heading{
+    top:0;
+    margin:0 -10px 22px;
+    padding:max(48px, env(safe-area-inset-top)) 10px 0;
+    background:var(--bg);z-index:9;
+  }
+  .page-scroll-region>.settings-page>.page-heading::before{
+    content:'';position:absolute;left:0;right:0;bottom:100%;
+    height:max(48px, env(safe-area-inset-top));background:var(--bg);
+  }
+  .page-scroll-region>.settings-page>.page-heading::after{
+    content:'';position:absolute;left:0;right:0;top:100%;height:22px;background:var(--bg);
+  }
+  .page-scroll-region>.page:not(.send-page)>.page-heading .page-heading-actions{
+    top:calc(max(48px, env(safe-area-inset-top)) + 9px);right:10px;transform:translateY(-50%);
+  }
+  .page-scroll-region:has(>.send-page){padding:0 10px calc(10px + env(safe-area-inset-bottom))}
+  .page-scroll-region:has(>.activity-page){padding:0 10px calc(10px + env(safe-area-inset-bottom))}
+  .page-scroll-region>.activity-page{grid-template-rows:auto 54px minmax(0,1fr)}
+  .page-scroll-region>.activity-page>.page-heading{position:sticky;top:0;align-self:start;z-index:9;margin-inline:0;padding-inline:0}
+  .page-scroll-region>.activity-page>.task-toolbar-fixed{
+    position:relative;top:auto;height:auto;min-height:48px;
+    margin:0;padding:0 0 14px;background:var(--bg);z-index:7;
+  }
+}
+
 /* Keep the icon rail geometry identical while labels are masked during collapse. */
 .app-shell>.sidebar .nav-item{position:relative;height:44px;min-height:44px;width:calc(100% + 4px);margin-inline:-2px;justify-content:flex-start;padding-left:11px}
 .app-shell>.sidebar .nav-item>svg{position:absolute;left:13px;flex:none}
@@ -341,4 +428,22 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
   .app-layout.sidebar-collapsed .app-shell>.sidebar .nav-item>.nav-badge{opacity:1;flex:0 0 auto}
   .app-layout.sidebar-collapsed .app-shell>.sidebar .sidebar-bottom{min-height:0;justify-content:flex-start;padding:14px 0 0;overflow:visible}
   .app-layout.sidebar-collapsed .app-shell>.sidebar .sidebar-bottom .sidebar-device>div{display:block;max-width:none;opacity:1;overflow:visible;white-space:normal;padding:0;margin:0}
+}
+/* 各页版式统一以发送页为准：页头静态且不铺满到边，首张卡片同一起点；
+   传输记录/共享中心用一条同高的工具条或标签条占据首卡位置，卡片在其下方对齐。 */
+@media(min-width:851px){
+  .page-scroll-region{padding:22px 24px 24px}
+  .page-scroll-region:has(>.send-page),.page-scroll-region:has(>.activity-page){padding:22px 24px 24px}
+  .page-scroll-region>.page>.page-heading,.page-scroll-region>.send-page>.page-heading,.page-scroll-region>.activity-page>.page-heading{position:relative;top:auto;margin:0 0 22px;padding:0;background:transparent}
+  .page-scroll-region>.activity-page>.page-heading{margin-inline:0;padding-inline:0}
+  /* 设置页内容较长：标题与窗口按钮吸顶，其余内容滚动。
+     吸顶位置与其它页页头一致；上方 22px 留白用伪元素遮挡，避免内容从标题上方露出。 */
+  .page-scroll-region>.settings-page>.page-heading{position:sticky;top:0;z-index:5;margin:0 0 22px;padding:0;background:var(--card-bg)}
+  .page-scroll-region>.settings-page>.page-heading::before{content:'';position:absolute;left:0;right:0;bottom:100%;height:22px;background:var(--card-bg)}
+  /* 遮罩下缘以卡片顶边为准：把标题与卡片之间的 22px 间距一并盖住，内容滚到卡片位置才露出。 */
+  .page-scroll-region>.settings-page>.page-heading::after{content:'';position:absolute;left:0;right:0;top:100%;height:22px;background:var(--card-bg)}
+  .page-scroll-region>.activity-page{grid-template-rows:auto auto minmax(0,1fr)}
+  .page-scroll-region>.activity-page>.task-toolbar-fixed{position:relative;top:auto;grid-row:2;margin:0 -24px 22px;padding:0 24px}
+  /* 页头已与其它页同为 737 宽，按钮组贴页头右缘即可对齐，去掉旧全宽页头的 24px 内缩。 */
+  .page-scroll-region>.activity-page>.page-heading .page-heading-actions{right:0}
 }
