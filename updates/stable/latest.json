@@ -1,23 +1,23 @@
 {
-  "version": "0.1.5-build.127",
-  "notes": "New features\n• Add automatic update checks with version skipping and release notes",
+  "version": "0.1.5-build.128",
+  "notes": "Repair\n· Fix persistent transfer sessions and add pending receive notifications",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0RBMmVzQmcvendFS1dPWW03aDVRMnFqVlFydG1DTG9Sa3ZNLzVBbVkxdUZONGRuTnVlRDVKYTRMdXNLT3R2dWlxUXJkN2hKV1g1VG1uR005c0tydWdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjAxODc3CWZpbGU6Tm9kZVNlbmRfMC4xLjUtYnVpbGQuMTI3X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNS1idWlsZC4xMjcKWmYyU1VVa01NUUN0ZEkvUXd5Rk1nQnlJeWZPOURYOURoMkt1R1lTdUR2UVZ1WTVET1QvOGNyTGxIK0hHTE45cmpxVjA3NkEyZ3psbE90WGRoUEpJQmc9PQo=",
-      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_0.1.5.127_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0N3TzhHZnBzWUljV2NXMjdtM3lkZklPZ2gvb0F1SW82akJCUmRRYU4rWmJqRGtxYkFnaENnUUZCL04xMmdOV3R0Qit3S0ZXVllsY1kzZ2M2UjZjQXdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjUxNzg1CWZpbGU6Tm9kZVNlbmRfMC4xLjUtYnVpbGQuMTI4X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNS1idWlsZC4xMjgKdHFlVG5HYUdXSHhJZ0d3MXJJbGxTZkNscER2ZndTT0tkRFhWckZiRC9SRUpHMDh1dlQ2ZGVqTFRRNFNaTVpXT0pwa0dzK1RwbVNSR1VGUENwNEVDRGc9PQo=",
+      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_0.1.5.128_x64-setup.exe",
       "fallback_urls": [
-        "https://github.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_0.1.5.127_x64-setup.exe"
+        "https://github.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_0.1.5.128_x64-setup.exe"
       ]
     }
   },
   "release_page_url": "https://gitcode.com/picdupe/NodeSend/releases",
   "android": {
-    "version": "0.1.5.127",
-    "versionCode": 1050127,
-    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_v0.1.5.127-arm64-v8a-release.apk",
+    "version": "0.1.5.128",
+    "versionCode": 1050128,
+    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_v0.1.5.128-arm64-v8a-release.apk",
     "fallbackUrls": [
-      "https://github.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_v0.1.5.127-arm64-v8a-release.apk"
+      "https://github.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_v0.1.5.128-arm64-v8a-release.apk"
     ],
-    "sha256": "d04861024db2424878be3112fee4994fbf850a3bf27da4cfe4457c305eb7f86c"
+    "sha256": "a61c197f696951a98d4a1dc84c8c207aed93fabcf198840181075bf4e98d29a4"
   }
 }

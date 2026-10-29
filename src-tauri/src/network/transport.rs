@@ -710,8 +710,26 @@ async fn session(
         },
     )
     .await?;
+    let mut persistent = false;
     loop {
-        let request: Request = protocol::read_frame(&mut *channel.reader).await?;
+        let request: Request = tokio::select! {
+            _ = transfers.shutdown.cancelled() => return Ok(()),
+            request = async {
+                if persistent {
+                    protocol::read_event(&mut *channel.reader).await
+                } else {
+                    protocol::read_frame(&mut *channel.reader).await
+                }
+            } => match request {
+                Ok(request) => request,
+                Err(error) if matches!(&error, AppError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof) => return Ok(()),
+                Err(error) => return Err(error),
+            },
+        };
+        persistent |= matches!(
+            &request,
+            Request::Offer { .. } | Request::Poll { .. } | Request::WatchTask { .. }
+        );
         // 清单/提交阶段的帧必须留痕：发送端说"已发出"而接收端毫无记录时，
         // 这是唯一能区分"帧没到"和"处理失败"的证据。
         match &request {
@@ -746,6 +764,62 @@ async fn session(
             _ => {}
         }
         match &request {
+            Request::WatchTask {
+                id,
+                revision: last_revision,
+            } => {
+                let id = crate::transfer::model::incoming_id(&channel.peer_id, id);
+                let runtime = transfers.runtime(&id);
+                let mut events = runtime.control_events.subscribe();
+                // Subscribe before reading durable state so a concurrent UI
+                // decision cannot fall between the snapshot and subscription.
+                let task = transfers.record(&id)?;
+                protocol::write_frame(&mut *channel.writer, &Response::Ack).await?;
+                if task.state_revision > *last_revision && task.status != "waiting" {
+                    if let Some(status) = TransferService::control_status(&task) {
+                        protocol::write_frame(
+                            &mut *channel.writer,
+                            &Response::TaskEvent {
+                                revision: task.state_revision,
+                                status: status.into(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+                loop {
+                    tokio::select! {
+                        _ = transfers.shutdown.cancelled() => return Ok(()),
+                        // Also notice a disconnected sender while no events
+                        // are being produced. This session has no more requests.
+                        closed = channel.reader.read_u8() => {
+                            return match closed {
+                                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
+                                Err(error) => Err(error.into()),
+                                Ok(_) => Err(other("状态订阅会话收到意外请求")),
+                            };
+                        }
+                        changed = events.changed() => {
+                            if changed.is_err() { return Ok(()); }
+                            let event = events.borrow_and_update().clone();
+                            if let Some((next_revision, status)) = event {
+                                if next_revision > *last_revision {
+                                    protocol::write_frame(
+                                        &mut *channel.writer,
+                                        &Response::TaskEvent {
+                                            revision: next_revision,
+                                            status: status.clone(),
+                                        },
+                                    ).await?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             Request::Addresses => {
                 let addresses = if_addrs::get_if_addrs()?
                     .into_iter()
@@ -949,6 +1023,7 @@ fn request_label(request: &Request) -> &'static str {
         Request::ManifestChunk { .. } => "ManifestChunk",
         Request::ManifestDone { .. } => "ManifestDone",
         Request::Poll { .. } => "Poll",
+        Request::WatchTask { .. } => "WatchTask",
         Request::Chunk { .. } => "Chunk",
         Request::Commit { .. } => "Commit",
         Request::Pause { .. } => "Pause",

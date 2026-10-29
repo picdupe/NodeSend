@@ -143,6 +143,11 @@ pub enum Request {
     Poll {
         id: String,
     },
+    /// Keep a sender-initiated session open for receiver control events.
+    WatchTask {
+        id: String,
+        revision: u64,
+    },
     Chunk {
         id: String,
         index: usize,
@@ -193,6 +198,10 @@ pub struct NativeEntry {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    TaskEvent {
+        revision: u64,
+        status: String,
+    },
     Addresses {
         addresses: Vec<String>,
         tcp_port: u16,
@@ -265,6 +274,17 @@ pub async fn read_frame_with_timeout<R: AsyncRead + Unpin + ?Sized, T: Deseriali
     })
     .await
     .map_err(|_| AppError::Other("网络读取超时".into()))?
+}
+
+/// Event streams may be idle while a person decides. Bound partial frames,
+/// but do not time out waiting for the first byte of the next event.
+pub async fn read_event<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
+    r: &mut R,
+) -> AppResult<T> {
+    let first = r.read_u8().await?;
+    let prefix = [first];
+    let mut frame = std::io::Cursor::new(prefix).chain(r);
+    read_frame(&mut frame).await
 }
 
 #[cfg(test)]

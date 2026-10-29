@@ -234,6 +234,7 @@ impl TransferService {
                         .send_once(peers.clone(), &id, cooldown.clone())
                         .await
                     {
+                        Ok(()) if service.status_of(&id)? == "queued" => continue,
                         Ok(()) => return Ok(()),
                         Err(err) => {
                             if service.stopped(&id)? {
@@ -639,6 +640,40 @@ impl TransferService {
         }
         Ok(())
     }
+    async fn wait_remote_event(&self, control: &mut Channel, id: &str) -> AppResult<String> {
+        let task = self.record(id)?;
+        if !matches!(
+            control
+                .request(&Request::WatchTask {
+                    id: task.wire_id.clone(),
+                    revision: task.remote_state_revision,
+                })
+                .await?,
+            Response::Ack
+        ) {
+            return Err(AppError::Other("接收方未确认任务状态等待".into()));
+        }
+        let Response::TaskEvent { revision, status } =
+            crate::network::protocol::read_event(&mut *control.reader).await?
+        else {
+            return Err(AppError::Other("接收方未返回任务状态事件".into()));
+        };
+        self.apply_remote_state(&task.peer_id, &task.wire_id, revision, &status)
+            .await?;
+        self.status_of(id)
+    }
+    async fn wait_remote_resume(&self, control: &mut Channel, id: &str) -> AppResult<bool> {
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return Ok(false),
+                status = self.wait_remote_event(control, id) => match status?.as_str() {
+                    "queued" => return Ok(true),
+                    "cancelled" | "rejected" | "completed" => return Ok(false),
+                    _ => {}
+                }
+            }
+        }
+    }
     async fn send_once(
         self: &Arc<Self>,
         peers: Arc<PeerStore>,
@@ -839,6 +874,11 @@ impl TransferService {
             )
             .await?;
             if self.stopped(id)? {
+                if self.status_of(id)? == "remote_paused" {
+                    if self.wait_remote_resume(&mut control, id).await? {
+                        return Ok(());
+                    }
+                }
                 self.notify_remote_stop(&mut control, id, &task.wire_id).await;
                 return Ok(());
             }
@@ -875,6 +915,11 @@ impl TransferService {
                 .stream_scan(&mut control, &task, &mut stream, scanner, roots_count)
                 .await?;
             if self.stopped(id)? {
+                if self.status_of(id)? == "remote_paused" {
+                    if self.wait_remote_resume(&mut control, id).await? {
+                        return Ok(());
+                    }
+                }
                 return Ok(());
             }
             let ScanStream {
@@ -985,11 +1030,14 @@ impl TransferService {
                     if ["waiting", "paused", "interrupted"].contains(&status.as_str()) =>
                 {
                     self.edit(id, |t| {
-                        t.status = match status.as_str() {
-                            "paused" => "remote_paused",
-                            "interrupted" => "interrupted",
-                            _ => "waiting",
-                        }.into();
+                        if !t.resume_requested {
+                            t.status = match status.as_str() {
+                                "paused" => "remote_paused",
+                                "interrupted" => "interrupted",
+                                _ => "waiting",
+                            }
+                            .into();
+                        }
                         t.event(if status == "paused" {
                             "接收方已暂停，等待恢复"
                         } else {
@@ -999,22 +1047,63 @@ impl TransferService {
                     loop {
                         tokio::select! {
                             _ = self.shutdown.cancelled() => return Ok(()),
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                        }
-                        match self.status_of(id)?.as_str() {
-                            "queued" => {
-                                state = control
-                                    .request(&Request::Poll { id: task.wire_id.clone() })
-                                    .await?;
-                                break;
+                            result = self.wait_remote_event(&mut control, id) => {
+                                match result? .as_str() {
+                                    "queued" => {
+                                        self.edit(id, |task| task.resume_requested = false)?;
+                                        state = control.request(&Request::Poll { id: task.wire_id.clone() }).await?;
+                                        break;
+                                    }
+                                    "cancelled" | "rejected" | "completed" => return Ok(()),
+                                    _ => {}
+                                }
                             }
-                            "cancelled" | "rejected" | "completed" => return Ok(()),
-                            _ => {}
                         }
                     }
                 }
                 _ => return Err(AppError::Other("接收方未返回有效接收状态".into())),
             }
+        }
+        let mut creation_control = control;
+        let mut control = self.channel(&peers, &task, &cooldown, true).await?;
+        let state = control
+            .request(&Request::Poll {
+                id: task.wire_id.clone(),
+            })
+            .await?;
+        match state {
+            Response::State { status, completed }
+                if ["accepted", "transferring", "completed"].contains(&status.as_str()) =>
+            {
+                self.edit(id, |record| {
+                    record.completed = completed.iter().collect();
+                    record.completed_count = record.completed.len();
+                    record.completed_bytes = record.completed.iter()
+                        .filter_map(|index| record.manifest.chunk(*index))
+                        .filter(|chunk| !record.skipped_files.contains(&chunk.file))
+                        .map(|chunk| chunk.length as u64)
+                        .sum();
+                    record.status = if status == "completed" {
+                        "completed"
+                    } else {
+                        "transferring"
+                    }
+                    .into();
+                })?;
+                if status == "completed" {
+                    return Ok(());
+                }
+            }
+            Response::State { status, .. } if status == "paused" => {
+                self.edit(id, |record| record.status = "remote_paused".into())?;
+                let _ = self.wait_remote_resume(&mut creation_control, id).await?;
+                return Ok(());
+            }
+            Response::State { status, .. } if ["cancelled", "rejected"].contains(&status.as_str()) => {
+                self.edit(id, |record| record.status = status)?;
+                return Ok(());
+            }
+            _ => return Err(AppError::Other("接收方未就绪，无法建立传输会话".into())),
         }
         let chunks = task.manifest.chunks();
         let pending = chunks
@@ -1036,8 +1125,8 @@ impl TransferService {
         let concurrency = pending.len().clamp(1, per_task_workers);
         let queue = Arc::new(Mutex::new(pending));
         let mut workers = tokio::task::JoinSet::new();
-        // Close the idle control connection while file workers own active streams.
-        drop(control);
+        // Keep the creation connection open for receiver state events while the
+        // task connection and chunk streams carry transfer traffic.
         for _ in 0..concurrency {
             let service = self.clone();
             let peers = peers.clone();
@@ -1135,7 +1224,10 @@ impl TransferService {
                 return Err(err);
             }
         }
-        let mut control = self.channel(&peers, &task, &cooldown, true).await?;
+        if self.status_of(id)? == "remote_paused" {
+            let _ = self.wait_remote_resume(&mut creation_control, id).await?;
+            return Ok(());
+        }
         if self.stopped(id)? {
             if self.status_of(id)?.as_str() == "paused" {
                 let _ = control.request(&Request::Pause { id: task.wire_id.clone() }).await;

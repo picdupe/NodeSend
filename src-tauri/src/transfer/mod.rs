@@ -74,8 +74,8 @@ pub(crate) struct RelayPlan {
 /// relay_active / committing / send_files / receive_files），各自清理、各自成键，
 /// 生命周期与锁顺序只能靠人记。现在收敛成一个结构体：任务结束调用
 /// [`TransferService::release_runtime`] 即整体释放。
-#[derive(Default)]
 pub(crate) struct TaskRuntime {
+    pub(crate) control_events: tokio::sync::watch::Sender<Option<(u64, String)>>,
     /// 串行化该任务的会话、决策与提交操作。
     pub(crate) gate: Arc<AsyncMutex<()>>,
     /// 是否有发送任务正在运行该任务。
@@ -93,6 +93,21 @@ pub(crate) struct TaskRuntime {
     pub(crate) send_files: Mutex<HashMap<usize, Arc<AsyncMutex<tokio::fs::File>>>>,
     /// 接收端目标盘写句柄（文件序号 → File）。
     pub(crate) receive_files: Mutex<HashMap<usize, Arc<AsyncMutex<tokio::fs::File>>>>,
+}
+
+impl Default for TaskRuntime {
+    fn default() -> Self {
+        Self {
+            control_events: tokio::sync::watch::channel(None).0,
+            gate: Arc::default(),
+            active: AtomicBool::new(false),
+            write_pending: Mutex::default(),
+            relay_active: AtomicBool::new(false),
+            committing: AtomicBool::new(false),
+            send_files: Mutex::default(),
+            receive_files: Mutex::default(),
+        }
+    }
 }
 
 pub struct TransferService {
@@ -1268,8 +1283,24 @@ impl TransferService {
             .ok_or_else(|| AppError::NotFound("任务不存在".into()))?;
         change(&mut task);
         self.persist(&task)?;
+        let control_changed = map.get(id).is_some_and(|old| old.state_revision != task.state_revision);
         map.insert(id.to_string(), task.clone());
+        drop(map);
+        if control_changed {
+            if let Some(status) = Self::control_status(&task) {
+                self.runtime(id).control_events.send_replace(Some((task.state_revision, status.into())));
+            }
+        }
         Ok(task)
+    }
+    pub(crate) fn control_status(task: &TaskRecord) -> Option<&'static str> {
+        match task.status.as_str() {
+            "paused" => Some("paused"),
+            "cancelling" | "cancelled" => Some("cancelled"),
+            "rejected" => Some("rejected"),
+            "accepted" | "transferring" | "waiting" | "queued" => Some("resumed"),
+            _ => None,
+        }
     }
     /// 取（必要时新建）某任务的运行期资源。任务结束时用 `release_runtime` 释放。
     pub(crate) fn runtime(&self, id: &str) -> Arc<TaskRuntime> {

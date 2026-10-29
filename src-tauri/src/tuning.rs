@@ -40,8 +40,8 @@ pub(crate) const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 // --- 清单与分块 ---
 
 /// 协议版本：帧格式变更必须同步提升，两端不一致时 HELLO 会直接拒绝。
-/// v4：`Response::State.completed` 由 `Vec<usize>` 改为区间编码 `CompletedRanges`。
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+/// v5：增加发送端建立的持久任务状态事件流。
+pub(crate) const PROTOCOL_VERSION: u16 = 5;
 /// 单帧清单条数（**发送起点**）。小批量先行：选完目录立刻就能发第一批，
 /// 不必等扫满整批落库批次（[`MANIFEST_PAGE`]）才开始发送。
 pub(crate) const MANIFEST_BATCH: usize = 256;

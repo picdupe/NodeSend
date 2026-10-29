@@ -159,6 +159,34 @@ impl NetworkManager {
                     == Some("true"),
         }
     }
+    pub fn pending_manual_receive_count(&self) -> usize {
+        let policy = self
+            .app
+            .get_setting("receive_policy")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "ask".into());
+        let trusted = crate::registry::list(&self.app.db)
+            .map(|nodes| nodes.into_iter().map(|node| node.node_id).collect::<std::collections::HashSet<_>>())
+            .unwrap_or_default();
+        self.transfers
+            .snapshots()
+            .into_iter()
+            .filter(|task| task.direction == "receive" && task.status == "waiting")
+            .filter(|task| {
+                let auto_receive = trusted.contains(&task.peer_id)
+                    && (policy == "trusted"
+                        || self
+                            .app
+                            .get_setting(&format!("auto_receive_{}", task.peer_id))
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some("true"));
+                !auto_receive
+            })
+            .count()
+    }
     pub async fn add_endpoint(
         &self,
         address: String,
@@ -513,6 +541,15 @@ impl NetworkManager {
         Ok(())
     }
     fn spawn_state_sync(&self, id: String, status: String, revision: u64) {
+        // Receive-side decisions are delivered on the persistent session that
+        // the sender opened. Never require a new receiver-to-sender connection.
+        if self
+            .transfers
+            .record(&id)
+            .is_ok_and(|task| task.direction == "receive")
+        {
+            return;
+        }
         let service = self.transfers.clone();
         let app = self.app.clone();
         let peers = self.peers.clone();
