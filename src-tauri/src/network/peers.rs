@@ -27,7 +27,7 @@ impl Endpoint {
             format!("{}:{port}", self.address)
         };
         raw.parse()
-            .map_err(|_| AppError::BadRequest("Endpoint 地址非法".into()))
+            .map_err(|_| AppError::BadRequest("Endpoint address is invalid".into()))
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,9 +53,17 @@ impl PeerStore {
         let mut peers = HashMap::new();
         for value in values {
             let mut peer: Peer = serde_json::from_str(&value)?;
+            // 全新 ID 格式不兼容旧版：无法规整的记录直接跳过，
+            // 等对端重新广播后再以规范 ID 入库。
+            let Some(node_id) = crate::identity::node_identity::normalize_node_id(&peer.node_id)
+            else {
+                tracing::warn!(stored = %peer.node_id, "Stored peer has an invalid Node ID");
+                continue;
+            };
+            peer.node_id = node_id;
             peer.online = false;
             for ep in &mut peer.endpoints {
-                ep.error = Some("等待重新连接".into());
+                ep.error = Some("Waiting to reconnect".into());
             }
             peers.insert(peer.node_id.clone(), peer);
         }
@@ -71,15 +79,20 @@ impl PeerStore {
         endpoints: Vec<Endpoint>,
         verified: bool,
     ) -> AppResult<()> {
+        // 发现报文允许大小写与 I/L/O 等易混字符；统一规整为规范的
+        // `XXXX-XXXX-XXXX-XXXX-XX`，保证去重、信任与数据库键值一致。
+        let Some(node_id) = crate::identity::node_identity::normalize_node_id(&node_id) else {
+            return Err(AppError::BadRequest("Invalid Node ID".into()));
+        };
         if node_id == self.app.identity.node_id {
             return Ok(());
         }
-        if !valid_id(&node_id) || name.len() > 128 {
-            return Err(AppError::BadRequest("Node 发现报文非法".into()));
+        if name.len() > 128 {
+            return Err(AppError::BadRequest("Node discovery packet is invalid".into()));
         }
         let mut peers = crate::locks::lock(&self.peers);
         if peers.len() >= 2048 && !peers.contains_key(&node_id) {
-            return Err(AppError::Forbidden("发现设备数量超出限制".into()));
+            return Err(AppError::Forbidden("Discovered device count exceeded the limit".into()));
         }
         let previous = peers.get(&node_id).cloned();
         let peer = peers.entry(node_id.clone()).or_insert(Peer {
@@ -95,19 +108,12 @@ impl PeerStore {
         }
         peer.verified |= verified;
         let now = chrono::Utc::now().timestamp();
-        peer.endpoints.retain(|e| {
-            !e.socket(false).is_ok_and(|a| a.ip().is_ipv4())
-                || now.saturating_sub(e.last_seen) < 86400
-        });
+        peer.endpoints.retain(|e| retain_previous_address(e, now));
         for ep in endpoints {
             if ep.socket(false).is_err() || ep.tcp_port == 0 {
                 continue;
             }
-            if let Some(existing) = peer
-                .endpoints
-                .iter_mut()
-                .find(|v| v.address == ep.address && v.tcp_port == ep.tcp_port)
-            {
+            if let Some(existing) = peer.endpoints.iter_mut().find(|v| v.address == ep.address) {
                 *existing = ep;
             } else if peer.endpoints.len() < 32 {
                 peer.endpoints.push(ep);
@@ -128,12 +134,10 @@ impl PeerStore {
         Ok(())
     }
     pub fn list(&self) -> Vec<Peer> {
-        // A failed Trust query must not be interpreted as "nobody is trusted".
-        // Preserve the last known in-memory flag and log the database error.
         let trusted = match crate::registry::list(&self.app.db) {
             Ok(trusted) => Some(trusted),
             Err(error) => {
-                tracing::error!(%error, "读取受信任设备列表失败；保留已知 Trust 状态");
+                tracing::error!(%error, "Failed to read the trusted-device list; retaining the known Trust state");
                 None
             }
         };
@@ -145,15 +149,7 @@ impl PeerStore {
             .collect::<Vec<_>>();
         let now = chrono::Utc::now().timestamp();
         for p in &mut peers {
-            p.endpoints.retain(|e| {
-                !e.socket(false).is_ok_and(|a| a.ip().is_ipv4())
-                    || now.saturating_sub(e.last_seen) < 86400
-            });
-            // Discovery announcements are periodic, but mDNS may only emit a
-            // resolved event once and mobile multicast delivery can be
-            // delayed while the app is resumed. mDNS registration remains a
-            // live service signal until a connection failure; other discovery
-            // sources use a five-minute freshness window.
+            p.endpoints.retain(|e| retain_previous_address(e, now));
             p.online = p.endpoints.iter().any(|e| {
                 e.error.is_none() && (e.source == "mdns" || now.saturating_sub(e.last_seen) < 300)
             });
@@ -170,7 +166,11 @@ impl PeerStore {
         self.list()
             .into_iter()
             .find(|p| p.node_id == id)
-            .ok_or_else(|| AppError::NotFound("目标 Node 尚未发现，请手动添加地址".into()))
+            .ok_or_else(|| {
+                AppError::NotFound(
+                    "Target Node has not been discovered; add its address manually".into(),
+                )
+            })
     }
     pub fn refresh_addresses(&self, id: &str, endpoints: Vec<Endpoint>) -> AppResult<()> {
         let mut peers = crate::locks::lock(&self.peers);
@@ -184,7 +184,7 @@ impl PeerStore {
             if let Some(old) = peer
                 .endpoints
                 .iter_mut()
-                .find(|e| e.address == endpoint.address && e.tcp_port == endpoint.tcp_port)
+                .find(|e| e.address == endpoint.address)
             {
                 *old = endpoint;
             } else {
@@ -206,22 +206,14 @@ impl PeerStore {
     }
     pub fn failure(&self, id: &str, ep: &Endpoint, error: String) {
         if let Some(p) = crate::locks::lock(&self.peers).get_mut(id) {
-            if let Some(e) = p
-                .endpoints
-                .iter_mut()
-                .find(|e| e.address == ep.address && e.tcp_port == ep.tcp_port)
-            {
+            if let Some(e) = p.endpoints.iter_mut().find(|e| e.address == ep.address) {
                 e.error = Some(error);
             }
         }
     }
     pub fn seen(&self, id: &str, ep: &Endpoint) {
         if let Some(peer) = crate::locks::lock(&self.peers).get_mut(id) {
-            if let Some(current) = peer
-                .endpoints
-                .iter_mut()
-                .find(|e| e.address == ep.address && e.tcp_port == ep.tcp_port)
-            {
+            if let Some(current) = peer.endpoints.iter_mut().find(|e| e.address == ep.address) {
                 current.last_seen = chrono::Utc::now().timestamp();
                 current.error = None;
             }
@@ -239,7 +231,7 @@ impl PeerStore {
     }
 }
 pub fn valid_id(id: &str) -> bool {
-    id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit())
+    crate::identity::node_identity::is_node_id(id)
 }
 fn retain_previous_address(endpoint: &Endpoint, now: i64) -> bool {
     endpoint.socket(false).is_ok_and(|a| match a.ip() {

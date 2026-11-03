@@ -8,6 +8,7 @@
  * - 不做数据请求（数据由父页面通过 httpShare.fetchTree 取得并传入）。
  */
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { TreeNode } from '../types';
 
 interface DirectoryTreeProps {
@@ -17,9 +18,10 @@ interface DirectoryTreeProps {
 }
 
 export function DirectoryTree({ node, defaultExpanded = true }: DirectoryTreeProps) {
+  const { i18n } = useTranslation();
   return (
     <ul className="tree">
-      <TreeItem node={node} defaultExpanded={defaultExpanded} depth={0} />
+      <TreeItem node={node} defaultExpanded={defaultExpanded} depth={0} language={i18n.language} />
     </ul>
   );
 }
@@ -28,9 +30,10 @@ interface TreeItemProps {
   node: TreeNode;
   defaultExpanded: boolean;
   depth: number;
+  language: string;
 }
 
-function TreeItem({ node, defaultExpanded, depth }: TreeItemProps) {
+function TreeItem({ node, defaultExpanded, depth, language }: TreeItemProps) {
   const isDir = node.node_type === 'dir';
   const [expanded, setExpanded] = useState(defaultExpanded);
   const nodeKey = `${isDir ? 'dir' : 'file'}:${node.path || '/'}`;
@@ -48,7 +51,7 @@ function TreeItem({ node, defaultExpanded, depth }: TreeItemProps) {
         </span>
         {!isDir && (
           <span className="tree-meta">
-            {formatSize(node.size)} · {formatDate(node.modified)}
+            {formatSize(node.size)} · {formatDate(node.modified, language)}
           </span>
         )}
       </div>
@@ -60,6 +63,7 @@ function TreeItem({ node, defaultExpanded, depth }: TreeItemProps) {
               node={child}
               defaultExpanded={false}
               depth={depth + 1}
+              language={language}
             />
           ))}
         </ul>
@@ -80,10 +84,10 @@ function formatSize(size: number): string {
   return `${value.toFixed(2)} ${units[unit]}`;
 }
 
-function formatDate(value: string): string {
+function formatDate(value: string, language: string): string {
   if (!value) return '';
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? value
-    : date.toLocaleString('zh-CN', { hour12: false });
+    : date.toLocaleString(language, { hour12: false });
 }

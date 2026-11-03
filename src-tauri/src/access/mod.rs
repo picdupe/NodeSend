@@ -26,26 +26,33 @@ impl Caller {
 /// 按共享访问模式鉴权，失败返回 [`AppError::Forbidden`]。
 pub fn authorize(share: &ShareConfig, caller: &Caller, db: &Db) -> AppResult<()> {
     if !share.enabled {
-        return Err(AppError::NotFound(format!("共享 {} 已禁用", share.name)));
+        return Err(AppError::NotFound(format!(
+            "Share {} is disabled",
+            share.name
+        )));
     }
 
     match share.access_mode {
-        AccessMode::Deny => Err(AppError::Forbidden("该共享禁止所有访问".into())),
+        AccessMode::Deny => Err(AppError::Forbidden("This share denies all access".into())),
         AccessMode::Open => Ok(()),
         AccessMode::Token => {
             let expected = share.access_token.as_deref().unwrap_or_default();
             if expected.is_empty() {
-                return Err(AppError::Forbidden("共享未配置访问令牌".into()));
+                return Err(AppError::Forbidden("The share has no access token configured".into()));
             }
             match &caller.token {
                 Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => Ok(()),
-                _ => Err(AppError::Forbidden("访问令牌缺失或不正确".into())),
+                _ => Err(AppError::Forbidden("Access token is missing or incorrect".into())),
             }
         }
         AccessMode::Trusted => match &caller.node_id {
             Some(node_id) if is_trusted(db, node_id) => Ok(()),
-            Some(_) => Err(AppError::Forbidden("该 Node 不在信任列表中".into())),
-            None => Err(AppError::Forbidden("无法识别 Node 身份，拒绝访问".into())),
+            Some(_) => Err(AppError::Forbidden(
+                "Node is not in the trusted devices list".into(),
+            )),
+            None => Err(AppError::Forbidden(
+                "Could not identify the Node identity; access denied".into(),
+            )),
         },
     }
 }

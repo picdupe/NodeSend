@@ -1,5 +1,3 @@
-//! Per-user update-source configuration. Defaults are merged by source ID;
-//! existing entries and their order are never overwritten.
 use serde_json::{json, Value};
 use std::{collections::HashSet, fs, path::PathBuf};
 use tauri::{AppHandle, Manager};
@@ -22,7 +20,6 @@ fn source_id(source: &Value) -> Option<&str> {
 fn merge_defaults(config: &mut Value, defaults: &Value) -> bool {
     let mut changed = false;
     if !config.is_object() {
-        *config = json!({"schema_version": 1, "config_version": 1, "channels": {}});
         changed = true;
     }
     let object = config.as_object_mut().expect("object initialized above");
@@ -53,7 +50,6 @@ fn merge_defaults(config: &mut Value, defaults: &Value) -> bool {
             .get_mut(channel)
             .and_then(Value::as_object_mut)
             .unwrap();
-        // Migrate the earlier split-list format without reordering existing entries.
         if !channel_config.get("sources").is_some_and(Value::is_array) {
             let mut legacy_sources = Vec::new();
             if let Some(intranet) = channel_config
@@ -98,19 +94,18 @@ fn merge_defaults(config: &mut Value, defaults: &Value) -> bool {
 fn write_atomically(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
     let temporary = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
-    fs::write(&temporary, contents)
-        .map_err(|error| format!("无法写入更新源配置临时文件：{error}"))?;
+    fs::write(&temporary, contents).map_err(|error| format!("Failed to write temporary update source configuration: {error}"))?;
     if path.exists() {
         if backup.exists() {
-            fs::remove_file(&backup).map_err(|error| format!("无法清理更新源配置备份：{error}"))?;
+            fs::remove_file(&backup).map_err(|error| format!("Failed to remove update source configuration backup: {error}"))?;
         }
-        fs::rename(path, &backup).map_err(|error| format!("无法备份原更新源配置：{error}"))?;
+        fs::rename(path, &backup).map_err(|error| format!("Failed to back up the existing update source configuration: {error}"))?;
     }
     if let Err(error) = fs::rename(&temporary, path) {
         if backup.exists() {
             let _ = fs::rename(&backup, path);
         }
-        return Err(format!("无法保存更新源配置：{error}"));
+        return Err(format!("Failed to save update source configuration: {error}"));
     }
     if backup.exists() {
         let _ = fs::remove_file(backup);
@@ -123,20 +118,22 @@ fn load_and_merge(path: &PathBuf) -> Result<Value, String> {
         serde_json::from_str(DEFAULT_CONFIG).map_err(|error| error.to_string())?;
     if !path.exists() {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("无法创建更新配置目录：{error}"))?;
+            fs::create_dir_all(parent).map_err(|error| format!("Failed to create update configuration directory: {error}"))?;
         }
         fs::write(
             path,
             serde_json::to_vec_pretty(&defaults).map_err(|error| error.to_string())?,
         )
-        .map_err(|error| format!("无法初始化更新源配置：{error}"))?;
+        .map_err(|error| format!("Failed to initialize update source configuration: {error}"))?;
         return Ok(defaults);
     }
 
     let contents =
-        fs::read_to_string(path).map_err(|error| format!("无法读取更新源配置：{error}"))?;
+        fs::read_to_string(path).map_err(|error| format!("Failed to read update source configuration: {error}"))?;
     let mut config: Value = serde_json::from_str(&contents).map_err(|error| {
-        format!("update-sources.json 格式无效；为保护用户配置，未覆盖原文件：{error}")
+        format!(
+            "update-sources.json is invalid; the existing file was preserved to protect user settings: {error}"
+        )
     })?;
     if merge_defaults(&mut config, &defaults) {
         write_atomically(
@@ -149,19 +146,18 @@ fn load_and_merge(path: &PathBuf) -> Result<Value, String> {
 
 pub fn load_sources(app: &AppHandle, channel: &str) -> Result<Vec<String>, String> {
     if !matches!(channel, "stable" | "test") {
-        return Err("更新通道无效。".into());
+        return Err("Invalid update channel.".into());
     }
     let config = load_and_merge(&config_path(app)?)?;
     let sources = config
         .pointer(&format!("/channels/{channel}/sources"))
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("更新源配置缺少 {channel}.sources 列表。"))?;
+        .ok_or_else(|| format!("Update source configuration is missing the {channel}.sources list."))?;
     let mut endpoints = Vec::new();
     for source in sources {
         let Some(url) = source.get("manifest_url").and_then(Value::as_str) else {
             continue;
         };
-        // URL validation and HTTPS enforcement also happen in updater.rs.
         if !url.trim().is_empty() {
             endpoints.push(url.to_owned());
         }
@@ -169,8 +165,6 @@ pub fn load_sources(app: &AppHandle, channel: &str) -> Result<Vec<String>, Strin
     Ok(endpoints)
 }
 
-/// Seed/merge the current user's config during app startup so it can be edited
-/// before the first manual update check. Failure must not prevent app startup.
 pub fn initialize(app: &AppHandle) -> Result<(), String> {
     load_and_merge(&config_path(app)?).map(|_| ())
 }

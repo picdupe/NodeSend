@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { listen } from '@tauri-apps/api/event';
 import { exit, onBackButtonPress } from '@tauri-apps/api/app';
@@ -14,6 +15,7 @@ import { useUpdateNotification } from './hooks/useUpdateNotification';
 import { UpdateDialog } from './components/UpdateDialog';
 import { frontendPreview } from './api/runtime';
 export default function App() {
+  const { t } = useTranslation('common');
   const [page, setPage] = useState<PageKey>('send');
   const [sendTaskId, setSendTaskId] = useState<string | null>(null);
   const [exitHint, setExitHint] = useState(false);
@@ -110,7 +112,7 @@ export default function App() {
   }, [navigate, sendSelection.setPaths]);
   return <>
     <AppLayout current={page} onNavigate={navigate} status={network.status} refresh={network.refresh}>
-      {page === 'send' && exitHint && <div className="back-exit-hint" role="status">再按一次返回退出</div>}
+      {page === 'send' && exitHint && <div className="back-exit-hint" role="status">{t('common:exitHint')}</div>}
       {['send', 'receive', 'transfers'].includes(page) && <NetworkPage mode={page as TransferPage} {...network} selection={sendSelection} sendTaskId={sendTaskId} onSendTaskChange={setSendTaskId} />}
       {page === 'dashboard' && <DashboardPage network={network.status} onSaved={network.refresh} />}
       {page === 'shares' && <ShareCenterPage />}

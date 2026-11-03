@@ -1,0 +1,37 @@
+{
+  "generic": {
+    "unexpected": "予期しないエラーが発生しました。もう一度お試しください。",
+    "invalidResponse": "サービスから無効な応答が返されました。",
+    "operationFailed": "操作に失敗しました：{{reason}}",
+    "database": "データベース操作に失敗しました。",
+    "io": "ファイル操作に失敗しました。",
+    "crypto": "ID または鍵の処理に失敗しました。",
+    "certificate": "証明書の検証に失敗しました。",
+    "invalidRequest": "リクエストの内容が無効です。",
+    "notFound": "要求された項目が見つかりません。",
+    "forbidden": "この操作は許可されていません。",
+    "conflict": "現在の状態と競合しています。",
+    "unknown": "操作に失敗しました。もう一度お試しください。"
+  },
+  "transfer": {
+    "connectionFailed": "{{device}} に接続できません",
+    "sendFailed": "転送に失敗しました：{{reason}}",
+    "sourceChanged": "送信元ファイルが変更されました：{{file}}",
+    "noFiles": "送信するファイルがありません。",
+    "connectionUnreachable": "このデバイスに接続できません。相手側で NodeSend が起動していて、両方のデバイスが同じネットワークに接続されていることを確認してください。",
+    "connectionRefused": "相手側のデバイスが接続を拒否しました。NodeSend が起動していることと、ファイアウォールの設定を確認してください。",
+    "timedOut": "接続がタイムアウトしました。相手側がオンラインであることと、ネットワークおよびファイアウォールを確認してください。"
+  },
+  "settings": {
+    "saveFailed": "設定を保存できませんでした：{{reason}}",
+    "favoriteSaveFailed": "お気に入りを保存できません。アプリの空き容量を確認して、もう一度お試しください。",
+    "invalidLanguage": "選択した言語はサポートされていません。"
+  },
+  "update": {
+    "desktopOnly": "更新機能はデスクトップアプリでのみ利用できます。",
+    "manifestIncomplete": "Android の更新マニフェストが不完全です。"
+  },
+  "preview": {
+    "nativeRequired": "このプレビュー操作にはネイティブサービスが必要です。デバイスへの接続や実ファイルの読み書きは行いません。"
+  }
+}

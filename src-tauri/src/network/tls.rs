@@ -1,4 +1,3 @@
-//! Mutual TLS 1.3 using device keys. Discovery data never establishes Trust.
 use crate::{
     error::{AppError, AppResult},
     service::AppService,
@@ -14,7 +13,7 @@ use std::{io::BufReader, sync::Arc};
 use x509_parser::prelude::*;
 
 pub fn certificate_node_id(der: &[u8]) -> Result<String, rustls::Error> {
-    let invalid = || rustls::Error::General("无效的 Node 身份证书".into());
+    let invalid = || rustls::Error::General("Invalid Node identity certificate".into());
     let (rest, cert) = X509Certificate::from_der(der).map_err(|_| invalid())?;
     if !rest.is_empty() || !cert.validity().is_valid() {
         return Err(invalid());
@@ -23,16 +22,18 @@ pub fn certificate_node_id(der: &[u8]) -> Result<String, rustls::Error> {
     let raw = cert.public_key().subject_public_key.data.as_ref();
     let key = p256::PublicKey::from_sec1_bytes(raw).map_err(|_| invalid())?;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
-    let node_id = format!(
-        "{:x}",
-        Sha256::digest(key.to_encoded_point(false).as_bytes())
-    );
+    let node_id = crate::identity::node_identity::crockford_id(&Sha256::digest(
+        key.to_encoded_point(false).as_bytes(),
+    ));
     let cn = cert
         .subject()
         .iter_common_name()
         .next()
         .and_then(|v| v.as_str().ok());
-    if cn != Some(node_id.as_str()) {
+    // 证书 CN 由本机生成，但历史/异常证书可能出现小写或 I/L/O 等易混字符；
+    // 统一规整后再比较，避免合法身份因书写差异被拒绝。
+    let cn = cn.and_then(crate::identity::node_identity::normalize_node_id);
+    if cn.as_deref() != Some(node_id.as_str()) {
         return Err(invalid());
     }
     Ok(node_id)
@@ -49,7 +50,9 @@ impl NodeVerifier {
         chain: &[CertificateDer<'_>],
     ) -> Result<(), rustls::Error> {
         if !chain.is_empty() {
-            return Err(rustls::Error::General("只接受 Node 自签名身份".into()));
+            return Err(rustls::Error::General(
+                "Only Node self-signed identities are accepted".into(),
+            ));
         }
         let id = certificate_node_id(cert.as_ref())?;
         if self
@@ -57,7 +60,7 @@ impl NodeVerifier {
             .as_ref()
             .is_some_and(|expected| expected != &id)
         {
-            return Err(rustls::Error::General("Node ID 与目标证书不匹配".into()));
+            return Err(rustls::Error::General("Node ID does not match the target certificate".into()));
         }
         Ok(())
     }
@@ -92,7 +95,7 @@ impl ServerCertVerifier for NodeVerifier {
         _: &CertificateDer<'_>,
         _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General("需要 TLS 1.3".into()))
+        Err(rustls::Error::General("TLS 1.3 is required".into()))
     }
     fn verify_tls13_signature(
         &self,
@@ -125,7 +128,7 @@ impl ClientCertVerifier for NodeVerifier {
         _: &CertificateDer<'_>,
         _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General("需要 TLS 1.3".into()))
+        Err(rustls::Error::General("TLS 1.3 is required".into()))
     }
     fn verify_tls13_signature(
         &self,
@@ -149,7 +152,7 @@ fn material(
         .collect::<Result<Vec<_>, _>>()?;
     let key = std::fs::read(&s.paths.identity_key)?;
     let key = rustls_pemfile::private_key(&mut BufReader::new(key.as_slice()))?
-        .ok_or_else(|| AppError::Certificate("身份私钥缺失".into()))?;
+        .ok_or_else(|| AppError::Certificate("Identity private key is missing".into()))?;
     Ok((certs, key))
 }
 pub fn server(s: &AppService) -> AppResult<rustls::ServerConfig> {
@@ -182,7 +185,7 @@ pub fn client(s: &AppService, expected: Option<String>) -> AppResult<rustls::Cli
 pub fn remember(s: &AppService, certificates: &[CertificateDer<'_>]) -> AppResult<String> {
     let cert = certificates
         .first()
-        .ok_or_else(|| AppError::Certificate("对端未提供身份".into()))?;
+        .ok_or_else(|| AppError::Certificate("Peer did not provide an identity".into()))?;
     let id = certificate_node_id(cert.as_ref()).map_err(tls_error)?;
     s.db.with_conn(|conn| {
         conn.execute("INSERT INTO node_certificates(node_id,certificate,updated_at) VALUES (?1,?2,?3) ON CONFLICT(node_id) DO UPDATE SET certificate=excluded.certificate,updated_at=excluded.updated_at", rusqlite::params![id,cert.as_ref(),chrono::Utc::now().to_rfc3339()])?;

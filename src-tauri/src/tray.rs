@@ -6,13 +6,13 @@
 //! - 托盘只存在于桌面端：模块由 `#[cfg(desktop)]` 排除，移动端没有托盘，
 //!   因此保持系统默认的关闭行为，不会留下无法唤回的后台进程。
 
+use std::time::Duration;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    App, AppHandle, Manager, Runtime, Window, WindowEvent,
+    App, AppHandle, Listener, Manager, Runtime, Window, WindowEvent,
 };
-use std::time::Duration;
 
 /// 主窗口标签；tauri.conf.json 只声明一个窗口，未显式命名时为 "main"。
 const MAIN_WINDOW: &str = "main";
@@ -20,20 +20,60 @@ const MENU_SHOW: &str = "tray-show";
 const MENU_QUIT: &str = "tray-quit";
 const TRAY_ID: &str = "nodesend-tray";
 
+fn tray_translation(locale: &str) -> serde_json::Value {
+    let source = match locale {
+        "zh-TW" => include_str!("../../src/i18n/locales/zh-TW/common.json"),
+        "en-US" => include_str!("../../src/i18n/locales/en-US/common.json"),
+        "ja-JP" => include_str!("../../src/i18n/locales/ja-JP/common.json"),
+        _ => include_str!("../../src/i18n/locales/zh-CN/common.json"),
+    };
+    serde_json::from_str(source).unwrap_or_default()
+}
+
+fn native_menu_text(locale: &str) -> (String, String) {
+    let bundle = tray_translation(locale);
+    let show = bundle["tray"]["show"].as_str().unwrap_or("Show NodeSend");
+    let quit = bundle["tray"]["quit"].as_str().unwrap_or("Exit NodeSend");
+    (show.to_string(), quit.to_string())
+}
+
+fn tray_tooltip(locale: &str, count: usize) -> String {
+    if count == 0 {
+        return "NodeSend".to_string();
+    }
+    let label = tray_translation(locale)["tray"]["pendingReceive"]
+        .as_str()
+        .unwrap_or("{{count}} pending receive requests")
+        .replace("{{count}}", &count.to_string());
+    format!("NodeSend · {label}")
+}
+
+pub fn quit_gui(app: &AppHandle) {
+    let _ = tauri::async_runtime::block_on(crate::cli::control(
+        "entry_detach",
+        vec!["gui".into(), std::process::id().to_string()],
+    ));
+    app.exit(0);
+}
+
 /// 创建托盘图标与菜单，在 setup 阶段调用一次。
 pub fn init(app: &App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, MENU_SHOW, "显示主界面", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, MENU_QUIT, "退出 NodeSend", true, None::<&str>)?;
+    let initial_language = crate::locale::preferred_language();
+    let (show_text, quit_text) = native_menu_text(&initial_language);
+    let show = MenuItem::with_id(app, MENU_SHOW, show_text, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, MENU_QUIT, quit_text, true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &PredefinedMenuItem::separator(app)?, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .tooltip("NodeSend · 近在身边")
+        .tooltip("NodeSend")
         // 左键只负责显示主窗口，窗口关闭按钮负责隐藏到托盘。
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             MENU_SHOW => show_main(app),
-            MENU_QUIT => app.exit(0),
+            MENU_QUIT => {
+                quit_gui(app);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -51,11 +91,24 @@ pub fn init(app: &App) -> tauri::Result<()> {
         builder = builder.icon(icon);
     }
     let tray = builder.build(app)?;
-    let app_handle: AppHandle = AppHandle::clone(tray.app_handle());
-    let base_icon = app.default_window_icon().map(|icon| {
-        Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height())
+    let language = std::sync::Arc::new(std::sync::Mutex::new(initial_language));
+    let language_for_event = language.clone();
+    let show_for_event = show.clone();
+    let quit_for_event = quit.clone();
+    app.listen("nodesend-language-changed", move |event| {
+        let locale = event.payload().trim_matches('"').to_string();
+        if let Ok(mut current) = language_for_event.lock() {
+            *current = locale.clone();
+        }
+        let (show_text, quit_text) = native_menu_text(&locale);
+        let _ = show_for_event.set_text(show_text);
+        let _ = quit_for_event.set_text(quit_text);
     });
-    start_pending_monitor(app_handle, tray, base_icon);
+    let app_handle: AppHandle = AppHandle::clone(tray.app_handle());
+    let base_icon = app
+        .default_window_icon()
+        .map(|icon| Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height()));
+    start_pending_monitor(app_handle, tray, base_icon, language);
     Ok(())
 }
 
@@ -63,6 +116,7 @@ fn start_pending_monitor<R: Runtime>(
     app: AppHandle<R>,
     tray: TrayIcon<R>,
     base_icon: Option<Image<'static>>,
+    language: std::sync::Arc<std::sync::Mutex<String>>,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -70,13 +124,19 @@ fn start_pending_monitor<R: Runtime>(
         let mut previous_minimized = false;
         let mut previous_flashing = false;
         let mut flash_on = false;
+        let mut previous_locale = String::new();
 
         loop {
             interval.tick().await;
-            let Some(network) = app.try_state::<std::sync::Arc<crate::network::NetworkManager>>() else {
+            let count = if let Some(network) =
+                app.try_state::<std::sync::Arc<crate::network::NetworkManager>>()
+            {
+                network.pending_manual_receive_count()
+            } else if crate::cli::is_gui_client() {
+                crate::cli::pending_count().await
+            } else {
                 continue;
             };
-            let count = network.pending_manual_receive_count();
             let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
                 continue;
             };
@@ -102,12 +162,13 @@ fn start_pending_monitor<R: Runtime>(
                 }
             }
             previous_flashing = flashing;
-            if count != previous_count {
-                let _ = tray.set_tooltip(Some(if count == 0 {
-                    "NodeSend · 近在身边".into()
-                } else {
-                    format!("NodeSend · {count} 个待确认接收请求")
-                }));
+            let locale = language
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_else(|_| "zh-CN".to_string());
+            if count != previous_count || locale != previous_locale {
+                let _ = tray.set_tooltip(Some(tray_tooltip(&locale, count)));
+                previous_locale = locale;
             }
 
             #[cfg(target_os = "windows")]
@@ -150,16 +211,36 @@ fn count_overlay_rgba(count: usize) -> Vec<u8> {
     const SIZE: usize = 16;
     const SS: usize = 4;
     const DIGITS: [[u8; 7]; 10] = [
-        [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        [0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110],
-        [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
     ];
     const SMALL_DIGITS: [[u8; 5]; 10] = [
         [0b111, 0b101, 0b101, 0b101, 0b111],
@@ -179,7 +260,11 @@ fn count_overlay_rgba(count: usize) -> Vec<u8> {
     const CENTER_Y: f32 = 5.4;
     const HALF_HEIGHT: f32 = 5.0;
 
-    let label = if count > 999 { "99+".to_string() } else { count.to_string() };
+    let label = if count > 999 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
     let compact = label.len() > 1;
     let glyph_width = if compact { 3 } else { 5 };
     let glyph_height = if compact { 5 } else { 7 };
@@ -187,7 +272,11 @@ fn count_overlay_rgba(count: usize) -> Vec<u8> {
     let spacing = if label.len() >= 3 { 0 } else { 1 };
     let text_width = label.len() * glyph_width + (label.len() - 1) * spacing;
     // 一两位数字用圆形徽标；三位数字横向拉成胶囊，避免数字挤出圆外。
-    let half_width = if text_width > 7 { (text_width as f32 + 1.5) / 2.0 } else { HALF_HEIGHT };
+    let half_width = if text_width > 7 {
+        (text_width as f32 + 1.5) / 2.0
+    } else {
+        HALF_HEIGHT
+    };
     let corner = HALF_HEIGHT.min(half_width);
     let start_x = (CENTER_X - text_width as f32 / 2.0).round();
     let start_y = (CENTER_Y - glyph_height as f32 / 2.0).round();
@@ -217,7 +306,9 @@ fn count_overlay_rgba(count: usize) -> Vec<u8> {
         } else if let Some(digit) = ch.to_digit(10) {
             DIGITS[digit as usize].to_vec()
         } else {
-            vec![0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100]
+            vec![
+                0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
+            ]
         };
         for (row, bits) in pattern.into_iter().enumerate() {
             for col in 0..glyph_width {
@@ -242,10 +333,17 @@ fn count_overlay_rgba(count: usize) -> Vec<u8> {
         }
         let color = if foreground > 0.0 { GLYPH } else { BADGE };
         // 数字按徽标的圆形覆盖率裁剪，避免笔画越出徽标边缘。
-        let alpha = if foreground > 0.0 { foreground * background } else { background };
+        let alpha = if foreground > 0.0 {
+            foreground * background
+        } else {
+            background
+        };
         let offset = index * 4;
         rgba[offset..offset + 4].copy_from_slice(&[
-            color[0], color[1], color[2], (alpha.min(1.0) * 255.0).round() as u8,
+            color[0],
+            color[1],
+            color[2],
+            (alpha.min(1.0) * 255.0).round() as u8,
         ]);
     }
     rgba
@@ -254,12 +352,13 @@ fn count_overlay_rgba(count: usize) -> Vec<u8> {
 #[cfg(target_os = "windows")]
 fn set_taskbar_overlay(hwnd: usize, count: Option<usize>) {
     use std::{ffi::c_void, mem::size_of, ptr, sync::Mutex};
+    use windows::Win32::Foundation::HWND;
     use windows::{
         core::PCWSTR,
         Win32::{
             Graphics::Gdi::{
-                CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER,
-                BI_RGB, DIB_RGB_COLORS,
+                CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+                DIB_RGB_COLORS,
             },
             System::Com::{
                 CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_SERVER,
@@ -267,17 +366,18 @@ fn set_taskbar_overlay(hwnd: usize, count: Option<usize>) {
             },
             UI::{
                 Shell::{ITaskbarList3, TaskbarList},
-                WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, ICONINFO, HICON},
+                WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO},
             },
         },
     };
-    use windows::Win32::Foundation::HWND;
 
     static ACTIVE_ICON: Mutex<isize> = Mutex::new(0);
     let hwnd = HWND(hwnd as *mut c_void);
 
     let should_uninitialize = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
-    let Ok(taskbar) = (unsafe { CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_SERVER) }) else {
+    let Ok(taskbar) =
+        (unsafe { CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_SERVER) })
+    else {
         if should_uninitialize {
             unsafe { CoUninitialize() };
         }
@@ -311,10 +411,9 @@ fn set_taskbar_overlay(hwnd: usize, count: Option<usize>) {
             ..Default::default()
         };
         let mut bits = ptr::null_mut();
-        let color_bitmap = unsafe {
-            CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0)
-        }
-        .ok()?;
+        let color_bitmap =
+            unsafe { CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .ok()?;
         if bits.is_null() {
             let _ = unsafe { DeleteObject(color_bitmap.into()) };
             return None;
@@ -378,7 +477,6 @@ fn set_taskbar_overlay(hwnd: usize, count: Option<usize>) {
     }
 }
 
-/// Hide the window on close while keeping the native service and tray alive.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if let WindowEvent::CloseRequested { api, .. } = event {
         api.prevent_close();
@@ -387,11 +485,13 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
 }
 
 /// 显示并聚焦主窗口。
-pub fn show_main(app: &AppHandle) {
+pub fn show_main<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(true);
+    }
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
 }
-

@@ -1,8 +1,4 @@
-//! Android document-picker and share-intent bridge.
 //!
-//! Android exposes selected and shared files as `content://` URIs. The transfer
-//! service works with local paths, so the native bridge copies each URI to the
-//! app cache before it reaches the normal send flow.
 
 #[cfg(target_os = "android")]
 use serde::{Deserialize, Serialize};
@@ -68,8 +64,6 @@ fn is_default_receive_root<R: Runtime>(app: &AppHandle<R>, root: &str) -> Result
     if actual == expected {
         return Ok(true);
     }
-    // Android aliases the same package directory as /data/data and
-    // /data/user/0. Canonical paths avoid treating those as custom directories.
     Ok(match (actual.canonicalize(), expected.canonicalize()) {
         (Ok(actual), Ok(expected)) => actual == expected,
         _ => false,
@@ -79,7 +73,7 @@ fn is_default_receive_root<R: Runtime>(app: &AppHandle<R>, root: &str) -> Result
 #[cfg(target_os = "android")]
 pub async fn export_received(task: crate::transfer::model::TaskRecord) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        RECEIVE_EXPORT.get().ok_or("Android 目录服务尚未就绪")?(task)
+        RECEIVE_EXPORT.get().ok_or("Android directory service is not ready")?(task)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -91,21 +85,21 @@ pub(crate) fn open_download_file(
 ) -> Result<OpenDownloadResult, String> {
     OPEN_DOWNLOAD
         .get()
-        .ok_or_else(|| "Android MediaStore 服务尚未就绪".to_string())?(request)
+        .ok_or_else(|| "Android MediaStore service is not ready".to_string())?(request)
 }
 
 #[cfg(target_os = "android")]
 pub(crate) fn publish_download_file(request: OpenDownloadRequest) -> Result<(), String> {
     PUBLISH_DOWNLOAD
         .get()
-        .ok_or_else(|| "Android MediaStore 服务尚未就绪".to_string())?(request)
+        .ok_or_else(|| "Android MediaStore service is not ready".to_string())?(request)
 }
 
 #[cfg(target_os = "android")]
 pub(crate) fn discard_download_files(task_id: String) -> Result<(), String> {
     DISCARD_DOWNLOADS
         .get()
-        .ok_or_else(|| "Android MediaStore 服务尚未就绪".to_string())?(task_id)
+        .ok_or_else(|| "Android MediaStore service is not ready".to_string())?(task_id)
 }
 
 #[cfg(target_os = "android")]
@@ -207,12 +201,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let Some(network) = notification_app.try_state::<std::sync::Arc<crate::network::NetworkManager>>() else { continue; };
+                    let language = network.ui_language();
                     let tasks = network.transfers.snapshots().into_iter().map(|task| serde_json::json!({
                         "id": task.id, "status": task.status, "direction": task.direction,
                         "peer_name": task.peer_name, "completed_bytes": task.completed_bytes, "total_bytes": task.total_bytes
                     })).collect::<Vec<_>>();
                     let _ = notification_app.state::<AndroidImport<R>>().0.run_mobile_plugin_async::<()>(
-                        "updateTransferNotifications", serde_json::json!({ "payload": serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".into()) })
+                        "updateTransferNotifications", serde_json::json!({ "payload": serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".into()), "language": language })
                     ).await;
                 }
             });
@@ -266,9 +261,7 @@ pub async fn directory_label<R: Runtime>(
 }
 
 #[cfg(target_os = "android")]
-pub async fn request_media_permissions<R: Runtime>(
-    app: AppHandle<R>,
-) -> Result<bool, String> {
+pub async fn request_media_permissions<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
     #[derive(Deserialize)]
     struct PermissionResult {
         granted: bool,
@@ -284,7 +277,10 @@ pub async fn request_media_permissions<R: Runtime>(
 #[cfg(target_os = "android")]
 pub async fn pick_directory<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
     let paths = pick(app, true, "receive".into()).await?;
-    paths.into_iter().next().ok_or_else(|| "未选择目录".into())
+    paths
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No directory selected".into())
 }
 
 #[cfg(target_os = "android")]

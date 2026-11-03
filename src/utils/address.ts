@@ -1,4 +1,3 @@
-// Prefer IPv4, then private/local addresses within each address family.
 export function addressPriority(address: string): number {
   if (!address.includes(':')) {
     const [first, second] = address.split('.').map(Number);

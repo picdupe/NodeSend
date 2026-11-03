@@ -73,9 +73,7 @@ $env:RC = $rc
 $bundleArg = if ($Bundle -eq 'all') { 'nsis,msi' } else { $Bundle }
 $profile = if ($Fast) { 'debug' } else { 'release' }
 $profileDir = Join-Path $projectRoot "src-tauri/target/$profile"
-# nodesend-cli 属于 cli feature，不应进入 GUI 安装包。修复前的 tauri-cli 在
-# src/bin 扫描时会忽略 required-features（tauri-apps/tauri#15325），把上一次
-# 构建残留的可执行文件重新打进安装包；打包前先清掉，让产物只可能来自本次构建。
+# GUI and CLI share nodesend.exe. Remove obsolete standalone CLI artifacts.
 if (-not $Dev) {
     Get-ChildItem -LiteralPath $profileDir -Filter 'nodesend-cli*' -File -ErrorAction SilentlyContinue | Remove-Item -Force
 }
@@ -92,7 +90,7 @@ try {
 if ($Dev) { exit 0 }
 $strayCli = @(Get-ChildItem -LiteralPath $profileDir -Filter 'nodesend-cli*' -File -ErrorAction SilentlyContinue)
 if ($strayCli.Count) {
-    throw ("nodesend-cli was produced while packaging the GUI; it must stay behind the cli feature:`n - " + (($strayCli | Select-Object -ExpandProperty FullName) -join "`n - "))
+    throw ("Obsolete nodesend-cli artifact found; package only nodesend.exe:`n - " + (($strayCli | Select-Object -ExpandProperty FullName) -join "`n - "))
 }
 $bundleRoot = Join-Path $profileDir 'bundle'
 $bundleKinds = if ($Bundle -eq 'all') { @('nsis', 'msi') } else { @($Bundle) }

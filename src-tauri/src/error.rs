@@ -7,28 +7,28 @@ use serde::{ser::SerializeStruct, Serialize, Serializer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("数据库错误: {0}")]
+    #[error("Database error: {0}")]
     Db(#[from] rusqlite::Error),
 
-    #[error("文件 IO 错误: {0}")]
+    #[error("File I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("身份/密钥错误: {0}")]
+    #[error("Identity or key error: {0}")]
     Crypto(String),
 
-    #[error("证书错误: {0}")]
+    #[error("Certificate error: {0}")]
     Certificate(String),
 
-    #[error("参数错误: {0}")]
+    #[error("Invalid parameter: {0}")]
     BadRequest(String),
 
-    #[error("未找到: {0}")]
+    #[error("Not found: {0}")]
     NotFound(String),
 
-    #[error("禁止访问: {0}")]
+    #[error("Access denied: {0}")]
     Forbidden(String),
 
-    #[error("冲突: {0}")]
+    #[error("Conflict: {0}")]
     Conflict(String),
 
     #[error("{0}")]
@@ -67,7 +67,7 @@ impl Serialize for AppError {
 
 impl From<serde_json::Error> for AppError {
     fn from(value: serde_json::Error) -> Self {
-        AppError::Other(format!("JSON 错误: {value}"))
+        AppError::Other(format!("JSON error: {value}"))
     }
 }
 

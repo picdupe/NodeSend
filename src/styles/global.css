@@ -447,3 +447,4 @@ button:not(.icon-button):not(.send-type-buttons button):not(.refresh-button):not
   /* 页头已与其它页同为 737 宽，按钮组贴页头右缘即可对齐，去掉旧全宽页头的 24px 内缩。 */
   .page-scroll-region>.activity-page>.page-heading .page-heading-actions{right:0}
 }
+.settings-language-field{width:100%;min-width:0;margin-top:18px}.settings-language-field>label{display:block;margin-bottom:6px;color:var(--muted);font-size:12px}.settings-language-field .policy-picker{width:100%}.settings-language-field .policy-trigger{min-height:43px}

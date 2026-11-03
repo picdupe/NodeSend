@@ -14,6 +14,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (3, include_str!("../../migrations/0003_browser.sql")),
     (4, include_str!("../../migrations/0004_share_protocols.sql")),
     (5, include_str!("../../migrations/0005_task_streaming.sql")),
+    (
+        6,
+        include_str!("../../migrations/0006_file_cache_names.sql"),
+    ),
 ];
 
 pub fn run_migrations(db: &Db) -> AppResult<()> {
@@ -29,13 +33,15 @@ pub fn run_migrations(db: &Db) -> AppResult<()> {
         }
         db.with_transaction(|tx| {
             tx.execute_batch(sql).map_err(|err| {
-                AppError::Other(format!("迁移 {version:04} 执行失败，已回滚: {err}"))
+                AppError::Other(format!(
+                    "Migration {version:04} failed and was rolled back: {err}"
+                ))
             })?;
             // user_version 无法在事务内用参数绑定，版本号来自代码常量，安全。
             tx.execute_batch(&format!("PRAGMA user_version = {version}"))?;
             Ok(())
         })?;
-        tracing::info!(version = version, "数据库迁移已应用");
+        tracing::info!(version = version, "Database migration applied");
     }
     Ok(())
 }

@@ -1,5 +1,6 @@
 import { Channel } from '@tauri-apps/api/core';
 import { frontendPreview, invoke } from './runtime';
+import i18next from 'i18next';
 
 export type UpdateChannel = 'stable' | 'test';
 
@@ -27,7 +28,7 @@ export interface UpdateDownloadProgress {
 }
 
 function requireDesktopRuntime() {
-  if (frontendPreview) throw new Error('更新功能仅在桌面应用中可用。');
+  if (frontendPreview) throw new Error(i18next.t('update.desktopOnly', { ns: 'errors' }));
 }
 
 export function checkUpdate(channel: UpdateChannel, endpoints: UpdateEndpoints) {
@@ -51,7 +52,7 @@ export async function checkAndroidUpdate(channel: UpdateChannel): Promise<(Updat
   }>('check_android_update', { channel });
   if (!result.updateAvailable) return null;
   if (!result.version || !result.downloadUrl || !result.sha256 || !result.versionCode) {
-    throw new Error('Android 更新清单内容不完整。');
+    throw new Error(i18next.t('update.manifestIncomplete', { ns: 'errors' }));
   }
   return {
     version: result.version,

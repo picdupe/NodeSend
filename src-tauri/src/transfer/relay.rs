@@ -1,24 +1,4 @@
-//! 接收端「缓存盘中转」转写任务。
-//!
-//! 目标：让机械盘目标盘只做**连续顺序写**，把随机写、每块 `sync_data`、完成记录
-//! 等全部留在缓存盘上，从而消除「接收与写盘交错」造成的顺序写打断。
-//!
-//! 流程：
-//! ```text
-//! 接收 → 写缓存分段（write_queue，sync 在缓存盘）
-//!      → 缓存中已 sync 字节 ≥ 256 MiB（或全部收齐）→ 启动本模块的转写任务
-//!      → 转写任务持续运行：按偏移顺序读缓存分段 → 连续追加目标盘临时文件
-//!                          → 记录转写进度（sync 成功后才记录）→ 删除已转写的缓存分段
-//!      → 全部转写完成 → 由 `receive::commit` 做 rename
-//! ```
-//!
-//! 关键语义：
-//! - 256 MiB 是「启动转写」的触发线，**不是缓存上限**；缓存无逻辑上限。
-//! - 缓存盘写满时**阻塞接收**（见 `await_cache_space`），不报错、不丢数据。
-//! - 转写启动后**持续运行**，与接收并行；目标盘写入严格按偏移顺序。
-//! - 缓存分段文件是必需的：Windows 无法截断文件头部，只有分段才能回收已转写数据。
-
-use super::{paths, write_queue::writable, RelayPlan, RelayState, TransferService};
+use super::{paths, recovery::processing, RelayPlan, RelayState, TransferService};
 use crate::error::{AppError, AppResult};
 use crate::service::AppService;
 use std::{
@@ -27,10 +7,49 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// 缓存分段大小。见 [`crate::tuning::RELAY_SEGMENT_BYTES`]。
 pub(crate) const SEG_BYTES: u64 = crate::tuning::RELAY_SEGMENT_BYTES;
+
+#[cfg(test)]
+pub(crate) fn cache_usage(root: &Path) -> AppResult<u64> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut bytes = 0u64;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let metadata = match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            paths::ensure_plain_meta(&metadata)?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn cache_write_fits(
+    root: &Path,
+    segment: &Path,
+    end: u64,
+    limit: u64,
+) -> AppResult<bool> {
+    let used = cache_usage(root)?;
+    let existing = match std::fs::metadata(segment) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(used.saturating_add(end.saturating_sub(existing)) <= limit)
+}
 
 /// 巡检间隔（触发转写任务、等待缺口）。
 const TICK: Duration = crate::tuning::WRITE_TICK;
@@ -51,7 +70,6 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
     {
         let mut candidates = Vec::new();
         if let Ok(Some(dir)) = app.get_setting("cache_directory") {
-            // An explicitly empty setting means the user disabled caching.
             if dir.trim().is_empty() {
                 return None;
             }
@@ -69,15 +87,37 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
         }
         for candidate in candidates {
             if is_filesystem_root(&candidate) {
-                tracing::error!(dir = %candidate.display(), "拒绝将磁盘根目录作为 NodeSend 缓存目录");
+                tracing::error!(dir = %candidate.display(), "Refusing to use a drive root as the NodeSend cache directory");
                 continue;
             }
             match std::fs::create_dir_all(&candidate) {
-                Ok(()) => return Some(candidate),
-                Err(err) => tracing::warn!(dir = %candidate.display(), "缓存目录不可用：{err}"),
+                Ok(()) if cache_writable(&candidate) => return Some(candidate),
+                Ok(()) => {
+                    tracing::warn!(dir = %candidate.display(), "Cache directory is not writable")
+                }
+                Err(err) => tracing::warn!(dir = %candidate.display(), "Cache directory is unavailable: {err}"),
             }
         }
         None
+    }
+}
+
+/// 缓存目录存在不等于可写（ProgramData 常见为管理员独占）。真正建一个探针文件，
+/// 否则接收任务会先选缓存中转、再在写分段时因「拒绝访问」把任务暂停。
+#[cfg(not(target_os = "android"))]
+fn cache_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".nodesend-write-probe");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -141,7 +181,7 @@ pub(crate) fn installation_warning() -> Option<String> {
     let executable = std::env::current_exe().ok()?;
     let install_dir = executable.parent()?;
     if is_protected_cleanup_root(install_dir) {
-        return Some("安装目录异常：软件位于磁盘根目录或 Program Files 根目录。为保护其他文件，已禁用缓存清理；请重新安装到 NodeSend 子目录。".into());
+        return Some("Invalid installation directory: the app is installed at a drive root or the Program Files root. Cache cleanup was disabled to protect other files. Reinstall NodeSend in its own subdirectory.".into());
     }
     None
 }
@@ -170,7 +210,7 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
                         let task_id = id.clone();
                         tokio::spawn(async move {
                             if let Err(err) = relay_task(&worker, &task_id).await {
-                                tracing::error!(task = %task_id, "缓冲中转写失败：{err}");
+                                tracing::error!(task = %task_id, "Buffered relay write failed: {err}");
                                 fail_relay(&worker, &task_id, &err);
                             }
                             if let Some(runtime) = worker.runtime_if_exists(&task_id) {
@@ -179,17 +219,6 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
                                     .store(false, std::sync::atomic::Ordering::SeqCst);
                             }
                         });
-                    }
-                    // The sender may have disconnected after every chunk was
-                    // acknowledged but before its final Commit arrived. Once
-                    // the local relay is complete, finish the filesystem
-                    // commit here instead of leaving .part files indefinitely.
-                    for id in service.receive_ids() {
-                        if service.auto_commit_ready(&id) {
-                            if let Err(err) = service.commit(&id).await {
-                                tracing::warn!(task = %id, "自动恢复接收任务提交失败：{err}");
-                            }
-                        }
                     }
                 }
             }
@@ -200,8 +229,8 @@ pub(crate) fn spawn(service: Arc<TransferService>) {
 /// 是否应启动/继续转写该任务（只用标量状态，O(1)）。
 fn candidate(state: &RelayState) -> bool {
     state.use_cache
-        && state.error.is_none()
-        && writable(&state.status)
+        && state.status != "finishing"
+        && processing(&state.status)
         && trigger(state)
         && !relay_done(state)
 }
@@ -231,13 +260,13 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
     }
     loop {
         let state = service.relay_state(id)?;
-        if !writable(&state.status) || !state.use_cache {
+        if state.status == "finishing" || !processing(&state.status) || !state.use_cache {
             return Ok(());
         }
         // 接收端可能在传输过程中继续追加清单。不能只使用启动时的快照：
         // 否则转写器会永远看不到后续文件，缓存不断增长，暂停/继续重启转写后才可能推进。
         // 只有条目数量发生变化时才重新加载清单，避免每轮复制几十万条记录。
-        if plan.entries.len() < state.file_count {
+        if plan.entries.len() < state.file_count || plan.digest != state.digest {
             plan = service.relay_plan(id)?;
         }
         if relay_done(&state) {
@@ -255,25 +284,41 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
             }
             let mut done = service.relayed_at(id, file);
             loop {
-                if !writable(&service.status_of(id)?) {
+                if !processing(&service.status_of(id)?) {
                     return Ok(());
                 }
                 if done >= entry.size {
                     break;
                 }
-                match relay_file_step(service, &plan, &cache_root, id, file, entry.size, done)
-                    .await?
-                {
+                let result =
+                    relay_file_step(service, &plan, &cache_root, id, file, entry.size, done).await;
+                let step = match result {
+                    Ok(step) => step,
+                    Err(error)
+                        if matches!(&error, AppError::Io(e) if [std::io::ErrorKind::NotFound,std::io::ErrorKind::UnexpectedEof].contains(&e.kind()))
+                            || matches!(&error, AppError::Conflict(_)) =>
+                    {
+                        let gate = service.gate(id);
+                        let _guard = gate.lock().await;
+                        if service.record(id)?.manifest.entries.get(file) == plan.entries.get(file)
+                        {
+                            service.invalidate_file(id, file)?;
+                        }
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match step {
                     Some(next) => {
                         done = next;
                         progressed = true;
                     }
-                    None => break, // 所需块未到，先处理下一个文件，下一轮再回来
+                    None => break,
                 }
             }
         }
         let state = service.relay_state(id)?;
-        if relay_done(&state) || !writable(&state.status) {
+        if relay_done(&state) || !processing(&state.status) {
             return Ok(());
         }
         if !progressed {
@@ -282,10 +327,8 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
     }
 }
 
-/// 转写一个文件的一个分段：读缓存 → 顺序追加目标盘临时文件 → sync → 记录进度 → 删缓存。
-/// 返回 `Some(新偏移)` 表示取得进展；`None` 表示所需块尚未在缓存中，等下一轮。
 async fn relay_file_step(
-    service: &Arc<TransferService>,
+    service: &TransferService,
     plan: &RelayPlan,
     cache_root: &Path,
     id: &str,
@@ -293,129 +336,200 @@ async fn relay_file_step(
     size: u64,
     done: u64,
 ) -> AppResult<Option<u64>> {
-    let destination = Path::new(
-        plan.targets
-            .get(file)
-            .and_then(Option::as_deref)
-            .ok_or_else(|| AppError::NotFound("缓存文件目标路径不存在".into()))?,
-    );
-    let root = service.record(id)?.destination.ok_or_else(|| AppError::NotFound("接收目录不存在".into()))?;
-    paths::ensure_under(Path::new(&root), destination)?;
     if done >= size {
-        let metadata = tokio::fs::metadata(destination).await?;
-        if metadata.len() == size {
-            service.set_relayed(id, file, size)?;
-            let assembled = paths::cache_file(cache_root, id, file);
-            let _ = std::fs::remove_file(assembled);
-            for segment in 0..size.div_ceil(SEG_BYTES) {
-                let _ = std::fs::remove_file(paths::cache_segment(cache_root, id, file, segment));
-            }
-            return Ok(Some(size));
-        }
-    }
-    let seg_end = ((done / SEG_BYTES + 1) * SEG_BYTES).min(size);
-    let chunk_size = plan.chunk_size;
-    let base = plan.bases[file];
-    // 先确认本段的第一个块已在缓存中，避免无谓地打开/截断目标文件。
-    let first = base + (done / chunk_size) as usize;
-    if !service.is_completed(id, first) {
         return Ok(None);
     }
-    let assembled = paths::cache_file(cache_root, id, file);
-    paths::ensure_plain(&assembled)?;
-    if let Some(parent) = assembled.parent() {
-        std::fs::create_dir_all(parent)?;
+    if size > crate::tuning::CACHE_ASSEMBLE_BYTES {
+        return Err(AppError::Conflict(
+            "File exceeds the cache assembly size limit".into(),
+        ));
     }
-    let mut handle = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&assembled)
-        .await?;
-    // A pause/restart can leave the destination staging file from the older
-    // relay implementation while the cache-side assembled file is absent.
-    // Seed the cache file from that durable prefix so resume does not attempt
-    // to read a deleted segment from offset zero.
-    if done > 0 && handle.metadata().await?.len() < done {
-        if let Ok(source) = tokio::fs::File::open(destination).await {
-            let available = source.metadata().await?.len().min(done);
-            if available > 0 {
-                let mut seeded = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(&assembled)
-                    .await?;
-                seeded.set_len(0).await?;
-                tokio::io::copy(&mut source.take(available), &mut seeded).await?;
-                seeded.sync_data().await?;
-            }
+    let base = plan.bases[file];
+    let count = size.div_ceil(plan.chunk_size) as usize;
+    if !(base..base + count).all(|index| service.is_completed(id, index)) {
+        return Ok(None);
+    }
+    let _writer = service.destination_writer.lock().await;
+    let task = service.record(id)?;
+    if task.manifest.entries.get(file) != plan.entries.get(file) {
+        return Ok(None);
+    }
+    let root = Path::new(
+        task.destination
+            .as_deref()
+            .ok_or_else(|| AppError::NotFound("Receive destination is not set".into()))?,
+    );
+    let target = Path::new(
+        plan.targets[file]
+            .as_ref()
+            .ok_or_else(|| AppError::NotFound("Receive target is not set".into()))?,
+    );
+    paths::ensure_under(root, target)?;
+    let assembled = paths::cache_file(cache_root, &task, file);
+    std::fs::create_dir_all(assembled.parent().unwrap())?;
+    let state = service.journal_state(id, file)?;
+    if state.as_deref() == Some("published") {
+        if !std::fs::metadata(target).is_ok_and(|m| m.is_file() && m.len() == size) {
+            return Err(AppError::Conflict(
+                "Published file is missing or its size does not match the manifest".into(),
+            ));
         }
+        service.set_relayed(id, file, size)?;
+        if assembled.exists() {
+            std::fs::remove_file(assembled)?;
+        }
+        return Ok(Some(size));
     }
-    // 崩溃后目标文件可能比已记录的进度更长（写入成功但进度未保存）：
-    // 回退到已 sync 的进度点，保证「达到初始长度」与「内容正确」一致。
-    if handle.metadata().await?.len() > done {
-        handle.set_len(done).await?;
-    }
-    let mut offset = done;
-    while offset < seg_end {
-        let index = base + (offset / chunk_size) as usize;
-        if !service.is_completed(id, index) {
+    if !matches!(state.as_deref(), Some("assembled" | "publishing")) {
+        if !service.reserve_cached_file(id, file, size, crate::tuning::CACHE_RECEIVE_BYTES)? {
             return Ok(None);
         }
-        let len = chunk_size.min(size - offset) as usize;
-        let seg_path = paths::cache_segment(cache_root, id, file, offset / SEG_BYTES);
-        let data = match read_segment(&seg_path, offset % SEG_BYTES, len).await {
-            Ok(data) => data,
-            Err(error) if matches!(&error, AppError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) => {
-                // The final destination file is a durable fallback for files
-                // interrupted during a relay upgrade or pause/resume cycle.
-                let Ok(mut source) = tokio::fs::File::open(destination).await else {
-                    tracing::debug!(task = %id, file, offset, path = %seg_path.display(), "缓存分段尚未可读，稍后重试");
-                    return Ok(None);
-                };
-                source.seek(std::io::SeekFrom::Start(offset)).await?;
-                let mut data = vec![0u8; len];
-                tokio::io::AsyncReadExt::read_exact(&mut source, &mut data).await?;
-                data
+        let mut output = tokio::fs::File::create(&assembled).await?;
+        use sha2::{Digest, Sha256};
+        let mut assembled_hash = task.verify_hash.then(Sha256::new);
+        let mut offset = 0;
+        while offset < size {
+            if !processing(&service.status_of(id)?) {
+                return Ok(None);
             }
-            Err(error) => return Err(error),
-        };
-        handle.seek(std::io::SeekFrom::Start(offset)).await?;
-        handle.write_all(&data).await?;
-        offset += len as u64;
-    }
-    handle.sync_data().await?;
-    drop(handle);
-    if offset >= size {
-        // Cache mode publishes directly to the final target. The cache-side
-        // relay cursor is the recovery record; no destination `.part` or
-        // per-chunk target marker is involved.
-        paths::ensure_plain(destination)?;
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
+            let len = plan
+                .chunk_size
+                .min(size - offset)
+                .min(SEG_BYTES - offset % SEG_BYTES) as usize;
+            let segment = paths::cache_segment(cache_root, &task, file, offset / SEG_BYTES);
+            let data = read_segment(&segment, offset % SEG_BYTES, len).await?;
+            if task.verify_hash {
+                use rusqlite::OptionalExtension;
+                use sha2::{Digest, Sha256};
+                let index = base + (offset / plan.chunk_size) as usize;
+                let expected: Option<String> = service.app.db.with_conn(|db| Ok(db.query_row("SELECT digest FROM transfer_chunk_hash WHERE task_id=?1 AND chunk_index=?2",rusqlite::params![id,index as i64],|r| r.get(0)).optional()?))?;
+                if expected.as_deref() != Some(format!("{:x}", Sha256::digest(&data)).as_str()) {
+                    return Err(AppError::Conflict(
+                        "Cached chunk SHA-256 verification failed".into(),
+                    ));
+                }
+            }
+            if let Some(hash) = &mut assembled_hash {
+                hash.update(&data);
+            }
+            output.write_all(&data).await?;
+            service
+                .runtime(id)
+                .relay_progress
+                .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+            offset += len as u64;
         }
-        let output = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(destination)
-            .await?;
-        let input = tokio::fs::File::open(&assembled).await?;
-        let mut input = BufReader::with_capacity(1024 * 1024, input);
-        let mut output = BufWriter::with_capacity(1024 * 1024, output);
-        tokio::io::copy(&mut input, &mut output).await?;
-        output.flush().await?;
+        output.sync_all().await?;
+        if output.metadata().await?.len() != size {
+            return Err(AppError::Conflict("Assembled cache file size does not match the manifest".into()));
+        }
         drop(output);
-        let _ = std::fs::remove_file(&assembled);
-        for segment in 0..size.div_ceil(SEG_BYTES) {
-            let _ = std::fs::remove_file(paths::cache_segment(cache_root, id, file, segment));
+        if let Some(hash) = assembled_hash {
+            let digest = format!("{:x}", hash.finalize());
+            service.app.db.with_conn(|db| { db.execute("INSERT OR REPLACE INTO transfer_cache_digest(task_id,file_index,digest) VALUES(?1,?2,?3)",rusqlite::params![id,file as i64,digest])?; Ok(()) })?;
+        }
+        service.journal_transition(id, file, size, "assembled", Some(&target.to_string_lossy()))?;
+    }
+    if !tokio::fs::metadata(&assembled)
+        .await
+        .is_ok_and(|m| m.is_file() && m.len() == size)
+    {
+        return Err(AppError::Conflict(
+            "Assembled cache file is missing or its size does not match the manifest".into(),
+        ));
+    }
+    if task.verify_hash {
+        use rusqlite::OptionalExtension;
+        let expected: Option<String> = service.app.db.with_conn(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT digest FROM transfer_cache_digest WHERE task_id=?1 AND file_index=?2",
+                    rusqlite::params![id, file as i64],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })?;
+        let path = assembled.clone();
+        let actual = tokio::task::spawn_blocking(move || super::recovery::hash_file(&path))
+            .await
+            .map_err(|e| AppError::Other(e.to_string()))??;
+        if expected.as_ref() != Some(&actual) {
+            return Err(AppError::Conflict(
+                "Assembled cache file SHA-256 verification failed".into(),
+            ));
         }
     }
-    // The progress marker is written only after the cache file and, for a
-    // complete file, the destination staging copy are durable.
-    service.set_relayed(id, file, offset)?;
-    Ok(Some(offset))
+    for segment in 0..size.div_ceil(SEG_BYTES) {
+        let path = paths::cache_segment(cache_root, &task, file, segment);
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    service.journal_transition(
+        id,
+        file,
+        size,
+        "publishing",
+        Some(&target.to_string_lossy()),
+    )?;
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    paths::ensure_plain(target)?;
+    let mut input = tokio::fs::File::open(&assembled).await?;
+    let mut output = tokio::fs::File::create(target).await?;
+    let mut copied = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        if !processing(&service.status_of(id)?) {
+            return Ok(None);
+        }
+        let len = input.read(&mut buffer).await?;
+        if len == 0 {
+            break;
+        }
+        output.write_all(&buffer[..len]).await?;
+        copied += len as u64;
+        service
+            .runtime(id)
+            .relay_progress
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    output.sync_all().await?;
+    drop(output);
+    if copied != size
+        || !tokio::fs::metadata(target)
+            .await
+            .is_ok_and(|m| m.is_file() && m.len() == size)
+    {
+        return Err(AppError::Conflict(
+            "Published file size does not match the manifest".into(),
+        ));
+    }
+    service.journal_transition(id, file, size, "published", Some(&target.to_string_lossy()))?;
+    service.set_relayed(id, file, size)?;
+    drop(input);
+    tokio::fs::remove_file(&assembled).await?;
+    let journal =
+        paths::cache_journal_named(cache_root, id, file, paths::cache_name_of(&task, file));
+    if journal.exists() {
+        tokio::fs::remove_file(journal).await?;
+    }
+    Ok(Some(size))
+}
+
+pub(crate) async fn relay_file_step_shared(
+    service: &TransferService,
+    plan: &RelayPlan,
+    cache: &Path,
+    id: &str,
+    file: usize,
+    size: u64,
+    done: u64,
+) -> AppResult<Option<u64>> {
+    relay_file_step(service, plan, cache, id, file, size, done).await
 }
 
 /// 从缓存分段文件的指定偏移读取一块数据。
@@ -430,8 +544,9 @@ async fn read_segment(path: &Path, offset: u64, len: usize) -> AppResult<Vec<u8>
 /// 转写失败：记录错误（阻止调度器反复重试），`commit` 会据此尽早失败而非永久等待。
 fn fail_relay(service: &Arc<TransferService>, task_id: &str, err: &AppError) {
     let _ = service.edit(task_id, |t| {
+        t.status = "failed".into();
         t.error = Some(err.to_string());
-        t.event(format!("缓存中转写失败：{err}"));
+        t.event(format!("Cache relay write failed: {err}"));
     });
 }
 
@@ -443,22 +558,35 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
         return;
     };
     if is_protected_cleanup_root(&cache_root) {
-        tracing::error!(dir = %cache_root.display(), "缓存清理已跳过：目录是磁盘根目录或 Program Files 根目录");
+        tracing::error!(dir = %cache_root.display(), "Skipped cache cleanup because the directory is a drive root or Program Files root");
         return;
     }
     retry_pending_cleanup(service);
     let protected: HashSet<String> = service
         .receive_ids()
         .into_iter()
-        .filter(|id| {
-            service
-                .status_of(id)
-                .map(|status| {
-                    ["waiting", "accepted", "transferring", "paused", "interrupted"].contains(&status.as_str())
-                })
-                .unwrap_or(false)
+        .filter_map(|id| {
+            let status = service.status_of(&id).ok()?;
+            if [
+                "completed",
+                "cancelled",
+                "rejected",
+                "partial_completed",
+                "incompatible",
+            ]
+            .contains(&status.as_str())
+            {
+                return None;
+            }
+            let task = service.record(&id).ok()?;
+            Some(
+                paths::cache_task_dirs(&cache_root, &task)
+                    .into_iter()
+                    .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
         })
-        .map(|id| paths::safe_component(&id))
+        .flatten()
         .collect();
     let Ok(entries) = std::fs::read_dir(&cache_root) else {
         return;
@@ -472,14 +600,26 @@ pub(crate) fn sweep(service: &Arc<TransferService>) {
         else {
             continue;
         };
-        if !path.is_dir() || protected.contains(&name) || !name.starts_with("in-") {
+        if !path.is_dir()
+            || protected.contains(&name)
+            || !(name.starts_with("in-") || is_node_cache_dir(&name))
+        {
             continue;
         }
         if let Err(err) = std::fs::remove_dir_all(&path) {
-            tracing::warn!(dir = %path.display(), "清理孤儿缓存失败：{err}");
+            tracing::warn!(dir = %path.display(), "Failed to clean orphaned cache: {err}");
             record_pending_cleanup(service, &path);
         }
     }
+}
+
+fn is_node_cache_dir(name: &str) -> bool {
+    let parts = name.splitn(6, '-').collect::<Vec<_>>();
+    if parts.len() != 6 || parts[5].is_empty() {
+        return false;
+    }
+    let id = parts[..5].join("-");
+    crate::identity::node_identity::normalize_node_id(&id).is_some()
 }
 
 /// 删除失败时登记「待清理」，下次启动重试。
@@ -513,7 +653,24 @@ fn retry_pending_cleanup(service: &TransferService) {
     for value in list {
         let path = PathBuf::from(&value);
         if is_protected_cleanup_root(&path) {
-            tracing::error!(dir = %path.display(), "跳过危险的磁盘根目录清理记录");
+            tracing::error!(dir = %path.display(), "Skipped unsafe drive-root cleanup record");
+            continue;
+        }
+        let active = service.receive_ids().into_iter().any(|id| {
+            path.file_name().and_then(|n| n.to_str()) == Some(paths::safe_component(&id).as_str())
+                && service.status_of(&id).is_ok_and(|s| {
+                    ![
+                        "completed",
+                        "cancelled",
+                        "rejected",
+                        "partial_completed",
+                        "incompatible",
+                    ]
+                    .contains(&s.as_str())
+                })
+        });
+        if active {
+            remaining.push(value);
             continue;
         }
         if !path.exists() {
@@ -525,5 +682,106 @@ fn retry_pending_cleanup(service: &TransferService) {
     }
     if let Ok(json) = serde_json::to_string(&remaining) {
         let _ = service.app.set_setting(PENDING_CLEANUP_KEY, &json);
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::{config::AppPaths, transfer::model::random_id};
+
+    #[tokio::test]
+    async fn relay_publishes_durable_bytes_and_rejects_missing_cache() {
+        let root = std::env::temp_dir().join(format!("relay-{}", random_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let app = AppService::init(AppPaths::new(root.join("data"))).unwrap();
+        app.set_setting("cache_directory", "").unwrap();
+        let service = TransferService::new(app).unwrap();
+        let source = root.join("payload.bin");
+        let bytes = vec![73u8; 4 * 1024 * 1024 + 3];
+        std::fs::write(&source, &bytes).unwrap();
+        let id = service
+            .create_outgoing(
+                "peer".into(),
+                "peer".into(),
+                "test".into(),
+                vec![source.to_string_lossy().into()],
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let inbox = root.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        let target = inbox.join("payload.bin");
+        service
+            .edit(&id, |t| {
+                t.direction = "receive".into();
+                t.status = "paused".into();
+                t.destination = Some(inbox.to_string_lossy().into());
+                t.targets = vec![Some(target.to_string_lossy().into())];
+                t.use_cache = true;
+                t.cache_files.insert(0);
+                t.relay_target_bytes = bytes.len() as u64;
+            })
+            .unwrap();
+        service.save_decision(&id).unwrap();
+        let task = service.record(&id).unwrap();
+        for (index, chunk) in task.manifest.chunks().iter().enumerate() {
+            service
+                .mark_chunk_done(&id, index, chunk.length as u64)
+                .unwrap();
+        }
+        let cache = root.join("cache");
+        let segment = paths::cache_segment(&cache, &task, 0, 0);
+        std::fs::create_dir_all(segment.parent().unwrap()).unwrap();
+        let plan = service.relay_plan(&id).unwrap();
+        assert!(
+            relay_file_step(&service, &plan, &cache, &id, 0, bytes.len() as u64, 0)
+                .await
+                .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(service.relayed_at(&id, 0), 0);
+        std::fs::write(&segment, &bytes).unwrap();
+        assert_eq!(
+            relay_file_step(&service, &plan, &cache, &id, 0, bytes.len() as u64, 0)
+                .await
+                .unwrap(),
+            Some(bytes.len() as u64)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(!segment.exists());
+        assert!(!paths::cache_file(&cache, &task, 0).exists());
+        std::fs::remove_file(&target).unwrap();
+        let current = service.record(&id).unwrap();
+        assert!(TransferService::commit_staged_file(
+            &current,
+            &inbox,
+            &paths::stage(&current).unwrap(),
+            0
+        )
+        .is_err());
+        service.shutdown.cancel();
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_counts_all_tasks_and_legacy_assembled_files() {
+        let root = std::env::temp_dir().join(format!("relay-budget-{}", random_id()));
+        std::fs::create_dir_all(root.join("in-a")).unwrap();
+        std::fs::create_dir_all(root.join("in-b")).unwrap();
+        std::fs::write(root.join("in-a/0.0.seg"), [1u8; 17]).unwrap();
+        std::fs::write(root.join("in-b/0.file"), [2u8; 31]).unwrap();
+        assert_eq!(cache_usage(&root).unwrap(), 48);
+        let segment = root.join("in-a/0.0.seg");
+        assert!(cache_write_fits(&root, &segment, 17, 48).unwrap());
+        assert!(!cache_write_fits(&root, &segment, 18, 48).unwrap());
+        assert!(!cache_write_fits(&root, &root.join("in-b/1.0.seg"), 1, 48).unwrap());
+        assert_eq!(crate::tuning::CACHE_MAX_BYTES, 32 * 1024 * 1024 * 1024);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { Peer } from '../types/network';
 
 export interface FavoriteDevice {
@@ -25,6 +26,7 @@ function readFavorites(): FavoriteDevice[] {
 }
 
 export function useDeviceFavorites() {
+  const { t } = useTranslation('errors');
   const [favorites, setFavorites] = useState(readFavorites);
   const [favoriteError, setFavoriteError] = useState('');
   function save(next: FavoriteDevice[]) {
@@ -32,7 +34,7 @@ export function useDeviceFavorites() {
       localStorage.setItem(storageKey, JSON.stringify(next));
       setFavorites(next);
       setFavoriteError('');
-    } catch { setFavoriteError('无法保存收藏夹，请检查应用存储空间后重试。'); }
+    } catch { setFavoriteError(t('settings.favoriteSaveFailed')); }
   }
   function removeFavorite(nodeId: string) {
     save(favorites.filter(item => item.node_id !== nodeId));

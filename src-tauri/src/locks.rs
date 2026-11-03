@@ -14,7 +14,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            tracing::warn!("互斥锁已中毒（持锁线程曾 panic），从内部数据恢复继续使用");
+            tracing::warn!("The mutex was poisoned (a thread panicked while holding it); recovered and continuing with internal data");
             poisoned.into_inner()
         }
     }

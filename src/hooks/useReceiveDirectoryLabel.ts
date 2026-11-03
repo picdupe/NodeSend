@@ -1,18 +1,20 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '../api/runtime';
+import { useTranslation } from 'react-i18next';
 
 export function useReceiveDirectoryLabel(path: string) {
+  const { t } = useTranslation('common');
   const android = /Android/i.test(navigator.userAgent);
-  const [label, setLabel] = useState(android ? '读取保存目录…' : path);
+  const [label, setLabel] = useState(android ? t('receiveDirectory.reading') : path);
   useEffect(() => {
     if (!android) { setLabel(path); return; }
     let disposed = false;
-    setLabel('读取保存目录…');
+    setLabel(t('receiveDirectory.reading'));
     void invoke<string>('describe_receive_directory', { root: path }).then(value => {
       if (!disposed) setLabel(value);
-    }).catch(() => { if (!disposed) setLabel('目录不可用，请重新选择'); });
+    }).catch(() => { if (!disposed) setLabel(t('receiveDirectory.unavailable')); });
     return () => { disposed = true; };
-  }, [path, android]);
+  }, [path, android, t]);
   return android ? label : path;
 }
 

@@ -8,11 +8,10 @@
  * - 动态片段（路径）一律 encodeURIComponent，固定前缀不编码（经验教训）。
  */
 import type { ListResponse, ShareConfig, TreeNode } from '../types';
+import i18next from 'i18next';
 
 /** 由 NodeInfo.http_listen（如 0.0.0.0:58080）得到浏览器可访问的基地址 */
 export function toHttpBase(httpListen: string): string {
-  // SocketAddr::to_string() uses `[::1]:port` for IPv6, so taking the
-  // second colon-separated segment produces an empty/incorrect port.
   const separator = httpListen.lastIndexOf(':');
   const port = separator >= 0 ? httpListen.slice(separator + 1) : httpListen;
   return `http://localhost:${port}`;
@@ -29,7 +28,7 @@ async function safeFetchJson<T>(url: string): Promise<T> {
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new Error(`响应不是合法 JSON (${url}): ${text.slice(0, 200)}`);
+    throw new Error(i18next.t('generic.invalidResponse', { ns: 'errors' }));
   }
 }
 

@@ -69,7 +69,7 @@ class OpenDownloadArgs {
 class DiscardDownloadArgs { var taskId: String = "" }
 
 @InvokeArg
-class NotificationArgs { var payload: String = "[]" }
+class NotificationArgs { var payload: String = "[]"; var language: String = "zh-CN" }
 
 @TauriPlugin(
     permissions = [
@@ -183,7 +183,9 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun updateTransferNotifications(invoke: Invoke) {
-        val tasks = org.json.JSONArray(invoke.parseArgs(NotificationArgs::class.java).payload)
+        val args = invoke.parseArgs(NotificationArgs::class.java)
+        val tasks = org.json.JSONArray(args.payload)
+        val language = args.language
         activity.runOnUiThread {
             runCatching {
                 if (activity.intent?.getBooleanExtra("nodesend-open-transfers", false) == true) {
@@ -203,7 +205,7 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
                 }
                 val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
                 val channel = "nodesend-transfers"
-                if (android.os.Build.VERSION.SDK_INT >= 26) manager.createNotificationChannel(android.app.NotificationChannel(channel, "文件传输", android.app.NotificationManager.IMPORTANCE_LOW))
+                if (android.os.Build.VERSION.SDK_INT >= 26) manager.createNotificationChannel(android.app.NotificationChannel(channel, "NodeSend", android.app.NotificationManager.IMPORTANCE_LOW))
                 val ids = mutableSetOf<String>()
                 for (index in 0 until tasks.length()) {
                     val task = tasks.getJSONObject(index)
@@ -217,12 +219,18 @@ class NodeSendImportPlugin(private val activity: Activity) : Plugin(activity) {
                     val signature = "$status:$percent"
                     if (notifiedTasks[id] == signature || (!active && !notifiedTasks.containsKey(id))) continue
                     notifiedTasks[id] = signature
-                    val description = when(status) { "completed" -> "已完成"; "failed" -> "传输失败"; "paused" -> "已暂停"; "cancelled" -> "已取消"; "rejected" -> "已拒绝"; "waiting" -> "等待确认"; "connecting" -> "正在连接"; "interrupted" -> "等待重试"; else -> "正在传输" }
+                    val description = when (language) {
+                        "en-US" -> when(status) { "completed" -> "Completed"; "failed" -> "Transfer failed"; "paused" -> "Paused"; "cancelled" -> "Cancelled"; "rejected" -> "Declined"; "waiting" -> "Waiting for approval"; "connecting" -> "Connecting"; "interrupted" -> "Waiting to reconnect"; else -> "Transferring" }
+                        "ja-JP" -> when(status) { "completed" -> "完了"; "failed" -> "転送に失敗しました"; "paused" -> "一時停止中"; "cancelled" -> "キャンセル済み"; "rejected" -> "拒否されました"; "waiting" -> "受信確認待ち"; "connecting" -> "接続中"; "interrupted" -> "再接続待ち"; else -> "転送中" }
+                        "zh-TW" -> when(status) { "completed" -> "已完成"; "failed" -> "傳輸失敗"; "paused" -> "已暫停"; "cancelled" -> "已取消"; "rejected" -> "已拒絕"; "waiting" -> "等待確認"; "connecting" -> "正在連線"; "interrupted" -> "等待重新連線"; else -> "傳輸中" }
+                        else -> when(status) { "completed" -> "已完成"; "failed" -> "传输失败"; "paused" -> "已暂停"; "cancelled" -> "已取消"; "rejected" -> "已拒绝"; "waiting" -> "等待确认"; "connecting" -> "正在连接"; "interrupted" -> "等待重连"; else -> "正在传输" }
+                    }
+                    val direction = if (language == "en-US") { if (task.getString("direction") == "send") "Sending to " else "Receiving from " } else if (language == "ja-JP") { if (task.getString("direction") == "send") "送信先：" else "受信元：" } else if (language == "zh-TW") { if (task.getString("direction") == "send") "傳送至 " else "接收自 " } else { if (task.getString("direction") == "send") "发送至 " else "接收自 " }
                     val intent = Intent(activity, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP).putExtra("nodesend-open-transfers", true)
                     val pending = android.app.PendingIntent.getActivity(activity, 42, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
                     val notification = androidx.core.app.NotificationCompat.Builder(activity, channel)
                         .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-                        .setContentTitle((if (task.getString("direction") == "send") "发送至 " else "接收自 ") + task.getString("peer_name"))
+                        .setContentTitle(direction + task.getString("peer_name"))
                         .setContentText("$description · ${formatBytes(bytes)} / ${formatBytes(total)}")
                         .setContentIntent(pending).setOnlyAlertOnce(true).setOngoing(active).setAutoCancel(!active)
                         .setCategory(androidx.core.app.NotificationCompat.CATEGORY_PROGRESS)

@@ -1,4 +1,3 @@
-//! Unified file browser adapters for local shares, native NodeSend, WebDAV, SMB and FTP.
 use crate::locks::MutexExt;
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -46,7 +45,6 @@ pub struct BrowserConnection {
     pub username: Option<String>,
     pub read_only: bool,
     pub connected: bool,
-    /// Device-bound encrypted credential. It is never used as plaintext by the UI.
     #[serde(default)]
     pub saved_credential: Option<String>,
 }
@@ -101,8 +99,6 @@ impl BrowserManager {
         let mut sessions = HashMap::new();
         for record in records {
             let value: serde_json::Value = serde_json::from_str(&record)?;
-            // HTTP browser connections were removed from the current product surface.
-            // Ignore legacy records so an upgrade cannot prevent the app from starting.
             if value.get("protocol").and_then(serde_json::Value::as_str) == Some("http") {
                 continue;
             }
@@ -131,7 +127,7 @@ impl BrowserManager {
     pub async fn connect(&self, input: BrowserConnectionInput) -> AppResult<BrowserConnection> {
         let address = input.address.trim().to_string();
         if address.is_empty() || input.name.trim().is_empty() {
-            return Err(AppError::BadRequest("连接名称和地址不能为空".into()));
+            return Err(AppError::BadRequest("Connection name and address cannot be empty".into()));
         }
         validate_address(input.protocol, &address)?;
         let id = format!("conn-{:032x}", rand::random::<u128>());
@@ -175,7 +171,7 @@ impl BrowserManager {
         let mut sessions = crate::locks::lock(&self.sessions);
         let session = sessions
             .get_mut(id)
-            .ok_or_else(|| AppError::NotFound("连接标签不存在".into()))?;
+            .ok_or_else(|| AppError::NotFound("Connection label not found".into()))?;
         session.public.connected = false;
         session.password = None;
         self.persist(&session.public)?;
@@ -188,7 +184,7 @@ impl BrowserManager {
             .lock_or_recover()
             .get(id)
             .cloned()
-            .ok_or_else(|| AppError::NotFound("连接配置不存在".into()))?;
+            .ok_or_else(|| AppError::NotFound("Connection configuration does not exist".into()))?;
         let entered_password = password.filter(|value| !value.is_empty());
         session.password = match entered_password.clone() {
             Some(value) => Some(value),
@@ -209,7 +205,7 @@ impl BrowserManager {
     pub async fn test(&self, input: BrowserConnectionInput) -> AppResult<()> {
         let address = input.address.trim().to_string();
         if address.is_empty() || input.name.trim().is_empty() {
-            return Err(AppError::BadRequest("连接名称和地址不能为空".into()));
+            return Err(AppError::BadRequest("Connection name and address cannot be empty".into()));
         }
         validate_address(input.protocol, &address)?;
         let session = Session {
@@ -231,13 +227,13 @@ impl BrowserManager {
     pub fn update(&self, id: &str, input: BrowserConnectionInput) -> AppResult<BrowserConnection> {
         let address = input.address.trim().to_string();
         if address.is_empty() || input.name.trim().is_empty() {
-            return Err(AppError::BadRequest("连接名称和地址不能为空".into()));
+            return Err(AppError::BadRequest("Connection name and address cannot be empty".into()));
         }
         validate_address(input.protocol, &address)?;
         let mut sessions = crate::locks::lock(&self.sessions);
         let session = sessions
             .get_mut(id)
-            .ok_or_else(|| AppError::NotFound("连接配置不存在".into()))?;
+            .ok_or_else(|| AppError::NotFound("Connection configuration does not exist".into()))?;
         session.public.name = input.name.trim().to_string();
         session.public.protocol = input.protocol;
         session.public.address = address;
@@ -258,7 +254,7 @@ impl BrowserManager {
     pub fn remove_connection(&self, id: &str) -> AppResult<()> {
         let removed = crate::locks::lock(&self.sessions).remove(id);
         if removed.is_none() {
-            return Err(AppError::NotFound("连接配置不存在".into()));
+            return Err(AppError::NotFound("Connection configuration does not exist".into()));
         }
         self.app.db.with_conn(|conn| {
             conn.execute(
@@ -272,7 +268,7 @@ impl BrowserManager {
     pub async fn browse(&self, id: &str, path: String) -> AppResult<BrowserListing> {
         let session = self.session(id)?;
         if !session.public.connected {
-            return Err(AppError::Forbidden("连接已关闭".into()));
+            return Err(AppError::Forbidden("Connection is closed".into()));
         }
         let path = normalize_remote_path(&path)?;
         let entries = match session.public.protocol {
@@ -345,7 +341,7 @@ impl BrowserManager {
     pub async fn upload(&self, id: &str, local: String, path: String) -> AppResult<()> {
         let session = self.session(id)?;
         if session.public.read_only {
-            return Err(AppError::Forbidden("该连接只读".into()));
+            return Err(AppError::Forbidden("This connection is read-only".into()));
         }
         validate_local_destination(&local)?;
         let path = normalize_remote_path(&path)?;
@@ -378,7 +374,7 @@ impl BrowserManager {
     pub async fn mkdir(&self, id: &str, path: String) -> AppResult<()> {
         let session = self.session(id)?;
         if session.public.read_only {
-            return Err(AppError::Forbidden("该连接只读".into()));
+            return Err(AppError::Forbidden("This connection is read-only".into()));
         }
         let path = normalize_remote_path(&path)?;
         match session.public.protocol {
@@ -389,7 +385,7 @@ impl BrowserManager {
             BrowserProtocol::Ftp => {
                 ftp_simple(&session, &format!("MKD {}", ftp_path(&session, &path)?)).await?
             }
-            _ => return Err(AppError::Forbidden("该协议不支持创建目录".into())),
+            _ => return Err(AppError::Forbidden("This protocol does not support creating directories".into())),
         }
         Ok(())
     }
@@ -397,14 +393,14 @@ impl BrowserManager {
     pub async fn delete(&self, id: &str, path: String) -> AppResult<()> {
         let session = self.session(id)?;
         if session.public.read_only {
-            return Err(AppError::Forbidden("该连接只读".into()));
+            return Err(AppError::Forbidden("This connection is read-only".into()));
         }
         let path = normalize_remote_path(&path)?;
         match session.public.protocol {
             BrowserProtocol::Local | BrowserProtocol::Smb => {
                 let p = safe_local_existing(&session.public.address, &path)?;
                 if path.is_empty() {
-                    return Err(AppError::Forbidden("不能删除连接根目录".into()));
+                    return Err(AppError::Forbidden("Cannot delete the connection root".into()));
                 }
                 if fs::metadata(&p).await?.is_dir() {
                     fs::remove_dir_all(p).await?
@@ -414,7 +410,7 @@ impl BrowserManager {
             }
             BrowserProtocol::Webdav => webdav_method(&session, &path, "DELETE", None).await?,
             BrowserProtocol::Ftp => ftp_delete(&session, &path).await?,
-            _ => return Err(AppError::Forbidden("该协议不支持删除".into())),
+            _ => return Err(AppError::Forbidden("This protocol does not support deletion".into())),
         }
         Ok(())
     }
@@ -422,17 +418,17 @@ impl BrowserManager {
     pub async fn rename(&self, id: &str, path: String, new_name: String) -> AppResult<()> {
         let session = self.session(id)?;
         if session.public.read_only {
-            return Err(AppError::Forbidden("该连接只读".into()));
+            return Err(AppError::Forbidden("This connection is read-only".into()));
         }
         if new_name.is_empty()
             || normalize_remote_path(&new_name)? != new_name
             || new_name.contains('/')
         {
-            return Err(AppError::BadRequest("新名称非法".into()));
+            return Err(AppError::BadRequest("Invalid new name".into()));
         }
         let path = normalize_remote_path(&path)?;
         if path.is_empty() {
-            return Err(AppError::BadRequest("不能重命名连接根目录".into()));
+            return Err(AppError::BadRequest("Cannot rename the connection root".into()));
         }
         let parent = Path::new(&path)
             .parent()
@@ -455,7 +451,7 @@ impl BrowserManager {
                 webdav_method(&session, &path, "MOVE", Some(&new_path)).await?
             }
             BrowserProtocol::Ftp => ftp_rename(&session, &path, &new_path).await?,
-            _ => return Err(AppError::Forbidden("该协议只读".into())),
+            _ => return Err(AppError::Forbidden("This protocol is read-only".into())),
         }
         Ok(())
     }
@@ -463,7 +459,7 @@ impl BrowserManager {
     pub async fn move_entry(&self, id: &str, path: String, target: String) -> AppResult<()> {
         let session = self.session(id)?;
         if session.public.read_only {
-            return Err(AppError::Forbidden("该连接只读".into()));
+            return Err(AppError::Forbidden("This connection is read-only".into()));
         }
         let path = normalize_remote_path(&path)?;
         let target = normalize_remote_path(&target)?;
@@ -479,7 +475,7 @@ impl BrowserManager {
                 webdav_method(&session, &path, "MOVE", Some(&target)).await?
             }
             BrowserProtocol::Ftp => ftp_rename(&session, &path, &target).await?,
-            _ => return Err(AppError::Forbidden("该协议不支持移动".into())),
+            _ => return Err(AppError::Forbidden("This protocol does not support moving items".into())),
         }
         Ok(())
     }
@@ -490,9 +486,9 @@ impl BrowserManager {
             .lock_or_recover()
             .get(id)
             .cloned()
-            .ok_or_else(|| AppError::NotFound("连接标签不存在".into()))?;
+            .ok_or_else(|| AppError::NotFound("Connection label not found".into()))?;
         if !session.public.connected {
-            return Err(AppError::Forbidden("连接已关闭".into()));
+            return Err(AppError::Forbidden("Connection is closed".into()));
         }
         Ok(session)
     }
@@ -522,7 +518,7 @@ impl BrowserManager {
         let nonce_bytes: [u8; 12] = rand::random();
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes())
-            .map_err(|_| AppError::Crypto("连接密码加密失败".into()))?;
+            .map_err(|_| AppError::Crypto("Failed to encrypt connection password".into()))?;
         Ok(B64.encode([nonce_bytes.as_slice(), ciphertext.as_slice()].concat()))
     }
     #[allow(deprecated)]
@@ -530,24 +526,26 @@ impl BrowserManager {
         let Some(value) = value else { return Ok(None) };
         let raw = B64
             .decode(value)
-            .map_err(|_| AppError::Crypto("连接密码格式无效".into()))?;
+            .map_err(|_| AppError::Crypto("Invalid connection password format".into()))?;
         if raw.len() < 12 {
-            return Err(AppError::Crypto("连接密码格式无效".into()));
+            return Err(AppError::Crypto("Invalid connection password format".into()));
         }
         let cipher = Aes256Gcm::new_from_slice(&self.credential_key())
             .map_err(|e| AppError::Crypto(e.to_string()))?;
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&raw[..12]), &raw[12..])
-            .map_err(|_| AppError::Crypto("连接密码无法在此设备解密".into()))?;
+            .map_err(|_| AppError::Crypto("Connection password cannot be decrypted on this device".into()))?;
         Ok(Some(String::from_utf8(plaintext).map_err(|_| {
-            AppError::Crypto("连接密码格式无效".into())
+            AppError::Crypto("Invalid connection password format".into())
         })?))
     }
     async fn check_connection(&self, s: &Session) -> AppResult<()> {
         match s.public.protocol {
             BrowserProtocol::Local | BrowserProtocol::Smb => {
                 if !Path::new(&s.public.address).is_dir() {
-                    return Err(AppError::NotFound("本地/SMB 目录不存在或无法访问".into()));
+                    return Err(AppError::NotFound(
+                        "Local/SMB directory does not exist or is inaccessible".into(),
+                    ));
                 }
             }
             BrowserProtocol::Nodesend => {
@@ -574,7 +572,7 @@ impl BrowserManager {
                     && response.status() != reqwest::StatusCode::MULTI_STATUS
                 {
                     return Err(AppError::Other(format!(
-                        "连接返回 HTTP {}",
+                        "Connection returned HTTP {}",
                         response.status()
                     )));
                 }
@@ -596,7 +594,7 @@ fn validate_address(protocol: BrowserProtocol, address: &str) -> AppResult<()> {
                 Ok(())
             } else {
                 Err(AppError::BadRequest(
-                    "NodeSend 地址必须是已发现设备的 Node ID".into(),
+                    "NodeSend address must be the Node ID of a discovered device".into(),
                 ))
             }
         }
@@ -605,14 +603,15 @@ fn validate_address(protocol: BrowserProtocol, address: &str) -> AppResult<()> {
                 url::Url::parse(address).map_err(|e| AppError::BadRequest(e.to_string()))?;
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
                 Err(AppError::BadRequest(
-                    "WebDAV 地址必须以 http:// 或 https:// 开头".into(),
+                    "WebDAV address must start with http:// or https://"
+                        .into(),
                 ))
             } else if !parsed.username().is_empty()
                 || parsed.password().is_some()
                 || parsed.query().is_some()
             {
                 Err(AppError::BadRequest(
-                    "地址不能包含凭据或查询参数，请在凭据栏输入".into(),
+                    "Address cannot contain credentials or query parameters; enter credentials in the credentials field".into(),
                 ))
             } else {
                 Ok(())
@@ -629,7 +628,7 @@ fn validate_address(protocol: BrowserProtocol, address: &str) -> AppResult<()> {
                 Ok(())
             } else {
                 Err(AppError::BadRequest(
-                    "FTP 地址须以 ftp:// 开头，且不能包含凭据或查询参数".into(),
+                    "FTP address must start with ftp:// and must not include credentials or query parameters".into(),
                 ))
             }
         }
@@ -644,7 +643,7 @@ fn normalize_remote_path(path: &str) -> AppResult<String> {
             || p.contains(':')
             || p.chars().any(char::is_control)
     }) {
-        return Err(AppError::BadRequest("远端路径非法".into()));
+        return Err(AppError::BadRequest("Invalid remote path".into()));
     }
     Ok(path)
 }
@@ -659,34 +658,34 @@ fn safe_local_existing(root: &str, path: &str) -> AppResult<PathBuf> {
     let base = Path::new(root).canonicalize()?;
     let target = local_path(root, path).canonicalize()?;
     if !target.starts_with(&base) {
-        return Err(AppError::Forbidden("路径不在连接目录内".into()));
+        return Err(AppError::Forbidden("Path is outside the connection root".into()));
     }
     Ok(target)
 }
 fn safe_local_target(root: &str, path: &str) -> AppResult<PathBuf> {
     if path.is_empty() {
-        return Err(AppError::BadRequest("目标路径不能为空".into()));
+        return Err(AppError::BadRequest("Target path cannot be empty".into()));
     }
     let target = local_path(root, path);
     let parent = target
         .parent()
-        .ok_or_else(|| AppError::BadRequest("目标路径非法".into()))?;
+        .ok_or_else(|| AppError::BadRequest("Invalid target path".into()))?;
     let base = Path::new(root).canonicalize()?;
     let real_parent = parent.canonicalize()?;
     if !real_parent.starts_with(&base) {
-        return Err(AppError::Forbidden("路径不在连接目录内".into()));
+        return Err(AppError::Forbidden("Path is outside the connection root".into()));
     }
     if target.exists() {
         let real_target = target.canonicalize()?;
         if !real_target.starts_with(&base) {
-            return Err(AppError::Forbidden("路径不在连接目录内".into()));
+            return Err(AppError::Forbidden("Path is outside the connection root".into()));
         }
     }
     Ok(target)
 }
 fn validate_local_destination(path: &str) -> AppResult<()> {
     if path.trim().is_empty() {
-        Err(AppError::BadRequest("本地文件路径不能为空".into()))
+        Err(AppError::BadRequest("Local file path cannot be empty".into()))
     } else {
         Ok(())
     }
@@ -709,7 +708,7 @@ fn auth(req: reqwest::RequestBuilder, s: &Session) -> reqwest::RequestBuilder {
     }
 }
 fn net_error(e: impl std::fmt::Display) -> AppError {
-    AppError::Other(format!("网络连接失败: {e}"))
+    AppError::Other(format!("Network connection failed: {e}"))
 }
 
 async fn save_response(response: reqwest::Response, destination: &str) -> AppResult<()> {
@@ -796,7 +795,7 @@ async fn webdav_list(s: &Session, path: &str) -> AppResult<Vec<BrowserEntry>> {
     .map_err(net_error)?;
     if !response.status().is_success() && response.status() != reqwest::StatusCode::MULTI_STATUS {
         return Err(AppError::Other(format!(
-            "WebDAV 返回 HTTP {}",
+            "WebDAV returned HTTP {}",
             response.status()
         )));
     }
@@ -817,7 +816,7 @@ fn parse_webdav(text: &str, root: &str, prefix: &str) -> AppResult<Vec<BrowserEn
     loop {
         let event = reader
             .read_event()
-            .map_err(|e| AppError::Other(format!("WebDAV XML 无效: {e}")))?;
+            .map_err(|e| AppError::Other(format!("Invalid WebDAV XML: {e}")))?;
         match event {
             Event::Start(e) => {
                 let name = e.local_name().as_ref().to_string();
@@ -900,7 +899,7 @@ async fn webdav_get(s: &Session, path: &str, destination: &str) -> AppResult<()>
     .map_err(net_error)?;
     if !r.status().is_success() {
         return Err(AppError::Other(format!(
-            "WebDAV 下载返回 HTTP {}",
+            "WebDAV download returned HTTP {}",
             r.status()
         )));
     }
@@ -922,7 +921,7 @@ async fn webdav_put(s: &Session, path: &str, local: &str) -> AppResult<()> {
     .map_err(net_error)?;
     if !r.status().is_success() {
         return Err(AppError::Other(format!(
-            "WebDAV 上传返回 HTTP {}",
+            "WebDAV upload returned HTTP {}",
             r.status()
         )));
     }
@@ -943,7 +942,7 @@ async fn webdav_method(
     let r = auth(r, s).send().await.map_err(net_error)?;
     if !r.status().is_success() {
         return Err(AppError::Other(format!(
-            "WebDAV {method} 返回 HTTP {}",
+            "WebDAV {method} returned HTTP {}",
             r.status()
         )));
     }
@@ -955,7 +954,7 @@ async fn ftp_connect(s: &Session) -> AppResult<TcpStream> {
         url::Url::parse(&s.public.address).map_err(|e| AppError::BadRequest(e.to_string()))?;
     let host = url
         .host_str()
-        .ok_or_else(|| AppError::BadRequest("FTP 地址缺少主机".into()))?;
+        .ok_or_else(|| AppError::BadRequest("FTP address is missing a host".into()))?;
     let port = url.port().unwrap_or(21);
     let mut stream = TcpStream::connect((host, port)).await.map_err(net_error)?;
     ftp_expect(&mut stream, &[220]).await?;
@@ -974,10 +973,10 @@ async fn ftp_connect(s: &Session) -> AppResult<TcpStream> {
             .unwrap_or("anonymous@");
         let response = ftp_command(&mut stream, &format!("PASS {password}")).await?;
         if !response.starts_with("230") {
-            return Err(AppError::Other("FTP 登录失败".into()));
+            return Err(AppError::Other("FTP login failed".into()));
         }
     } else if !response.starts_with("230") {
-        return Err(AppError::Other("FTP 登录失败".into()));
+        return Err(AppError::Other("FTP login failed".into()));
     }
     ftp_expect_command(&mut stream, "TYPE I", &[200]).await?;
     Ok(stream)
@@ -1023,7 +1022,7 @@ async fn ftp_response(stream: &mut TcpStream) -> AppResult<String> {
             }
         }
         if buf.len() > 64 * 1024 {
-            return Err(AppError::Other("FTP 响应过大".into()));
+            return Err(AppError::Other("FTP response is too large".into()));
         }
     }
 }
@@ -1043,14 +1042,14 @@ async fn ftp_passive(stream: &mut TcpStream) -> AppResult<TcpStream> {
         .split('(')
         .nth(1)
         .and_then(|v| v.split(')').next())
-        .ok_or_else(|| AppError::Other("FTP PASV 响应非法".into()))?;
+        .ok_or_else(|| AppError::Other("FTP PASV response is invalid".into()))?;
     let nums = body
         .split(',')
         .map(|v| v.trim().parse::<u16>())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| AppError::Other("FTP PASV 地址非法".into()))?;
+        .map_err(|_| AppError::Other("FTP PASV address is invalid".into()))?;
     if nums.len() != 6 || nums.iter().any(|n| *n > 255) || nums[4] == 0 && nums[5] == 0 {
-        return Err(AppError::Other("FTP PASV 地址非法".into()));
+        return Err(AppError::Other("FTP PASV address is invalid".into()));
     }
     TcpStream::connect((
         format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]),
@@ -1133,7 +1132,7 @@ async fn ftp_store(s: &Session, path: &str, local: &str) -> AppResult<()> {
 }
 async fn ftp_delete(s: &Session, path: &str) -> AppResult<()> {
     if path.is_empty() {
-        return Err(AppError::Forbidden("不能删除连接根目录".into()));
+        return Err(AppError::Forbidden("Cannot delete the connection root".into()));
     }
     let full = ftp_path(s, path)?;
     let mut control = ftp_connect(s).await?;

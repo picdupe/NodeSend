@@ -1,5 +1,5 @@
 use super::{
-    model::{incoming_id, ConflictPolicy, FileEntry, Manifest},
+    model::{incoming_id, FileEntry, Manifest},
     paths, relay, TransferService,
 };
 use crate::{
@@ -13,19 +13,69 @@ mod control;
 mod manifest;
 
 impl TransferService {
-    /// Publish one already durable staged file without rescanning the entire manifest.
-    /// The hot path for direct-to-disk reception uses this after each file completes;
-    /// scanning all entries here would make a large folder quadratic.
+    #[cfg(desktop)]
+    pub(crate) async fn drain_completed_cache(&self) -> AppResult<()> {
+        for id in self.receive_ids() {
+            if !super::recovery::processing(&self.status_of(&id)?) {
+                continue;
+            }
+            self.await_writes(&id).await?;
+            self.ensure_bulk(&id)?;
+            let mut previous = 0;
+            let mut progress_at = tokio::time::Instant::now();
+            loop {
+                let task = self.record(&id)?;
+                if let Some(error) = task.error {
+                    return Err(AppError::Other(error));
+                }
+                let pending = task.cache_files.iter().any(|file| {
+                    let Some(entry) = task.manifest.entries.get(*file) else {
+                        return false;
+                    };
+                    if entry.directory
+                        || entry.size == 0
+                        || task.relayed.get(*file).copied().unwrap_or(0) >= entry.size
+                    {
+                        return false;
+                    }
+                    let base = task.manifest.file_base(*file);
+                    let count = entry.size.div_ceil(task.chunk_size) as usize;
+                    (base..base + count).all(|chunk| task.completed.contains(&chunk))
+                });
+                if !pending {
+                    break;
+                }
+                let progress = task.relayed_total.saturating_add(
+                    self.runtime(&id)
+                        .relay_progress
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                if progress != previous {
+                    previous = progress;
+                    progress_at = tokio::time::Instant::now();
+                }
+                if progress_at.elapsed() >= crate::tuning::RELAY_STALL_TIMEOUT {
+                    return Err(AppError::Conflict(
+                        "Cache relay made no progress before the timeout".into(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        Ok(())
+    }
     pub(crate) async fn commit_ready_file(&self, id: &str, file: usize) -> AppResult<()> {
         let task = self.record(id)?;
         if task.direction != "receive"
             || task.destination.is_none()
-            || !["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
+            || !super::recovery::processing(&task.status)
             || task.cache_files.contains(&file)
         {
             return Ok(());
         }
-        let Some(entry) = task.manifest.entries.get(file) else { return Ok(()); };
+        let Some(entry) = task.manifest.entries.get(file) else {
+            return Ok(());
+        };
         if entry.directory || task.targets.get(file).and_then(Option::as_ref).is_none() {
             return Ok(());
         }
@@ -47,12 +97,15 @@ impl TransferService {
         }
         let root = PathBuf::from(task.destination.as_deref().unwrap());
         let stage = paths::stage(&task)?;
+        let size = entry.size;
+        let target = task.targets[file].clone();
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&stage)?;
             TransferService::commit_staged_file(&task, &root, &stage, file)
         })
         .await
         .map_err(|error| AppError::Other(error.to_string()))??;
+        self.journal_transition(id, file, size, "published", target.as_deref())?;
         Ok(())
     }
 
@@ -63,12 +116,10 @@ impl TransferService {
         let task = self.record(id)?;
         if task.direction != "receive"
             || task.destination.is_none()
-            || !["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
+            || !super::recovery::processing(&task.status)
         {
             return Ok(());
         }
-        // Incremental publication and final commit share one guard. Cancellation
-        // waits for this flag before rolling back already-published files.
         if !self.begin_commit(id) {
             return Ok(());
         }
@@ -76,7 +127,7 @@ impl TransferService {
             let task = self.record(id)?;
             if task.direction != "receive"
                 || task.destination.is_none()
-                || !["accepted", "transferring", "interrupted"].contains(&task.status.as_str())
+                || !super::recovery::processing(&task.status)
             {
                 return Ok(());
             }
@@ -123,17 +174,23 @@ impl TransferService {
         peer: &str,
         wire: &str,
         first: usize,
-        entries: Vec<FileEntry>,
+        mut entries: Vec<FileEntry>,
     ) -> AppResult<Response> {
         let id = incoming_id(peer, wire);
         let gate = self.gate(&id);
         let guard = gate.lock().await;
         let started = std::time::Instant::now();
-        // Metadata continues to arrive after an early user decision; terminal
-        // tasks ignore retries, while accepted tasks extend their target plan.
         let status = self.status_of(&id)?;
-        if !["waiting", "accepted", "transferring", "paused", "remote_paused"].contains(&status.as_str()) {
-            tracing::info!(task = %id, first, status = %status, "清单分片已到，但任务已处于终态，直接确认");
+        if ![
+            "waiting",
+            "accepted",
+            "transferring",
+            "paused",
+            "remote_paused",
+        ]
+        .contains(&status.as_str())
+        {
+            tracing::info!(task = %id, first, status = %status, "Manifest chunk arrived after the task ended; acknowledging it");
             return Ok(Response::ManifestAck);
         }
         let (
@@ -147,7 +204,7 @@ impl TransferService {
             let tasks = crate::locks::lock(&self.tasks);
             let task = tasks
                 .get(&id)
-                .ok_or_else(|| AppError::NotFound("接收任务不存在".into()))?;
+                .ok_or_else(|| AppError::NotFound("Receive task not found".into()))?;
             (
                 task.file_count,
                 task.total_size,
@@ -158,18 +215,18 @@ impl TransferService {
             )
         };
         if first < current && first.saturating_add(entries.len()) <= current {
-            tracing::debug!(task = %id, first, current, entries = entries.len(), "清单分片已收到过，直接确认");
+            tracing::debug!(task = %id, first, current, entries = entries.len(), "Manifest chunk was already received; acknowledging it");
             return Ok(Response::ManifestAck);
         }
         if first != current {
-            return Err(AppError::Conflict("清单分片顺序不连续".into()));
+            return Err(AppError::Conflict("Manifest chunks are out of order".into()));
         }
         if status != "waiting" {
             let destination = {
                 let tasks = crate::locks::lock(&self.tasks);
                 tasks.get(&id).and_then(|task| task.destination.clone())
             }
-            .ok_or_else(|| AppError::Conflict("接收目标尚未确定".into()))?;
+            .ok_or_else(|| AppError::Conflict("Receive target has not been selected".into()))?;
             let additional_size = entries.iter().map(|entry| entry.size).sum::<u64>();
             // 可用空间查询是同步调用，且每个清单分片都会走一次：放到阻塞线程池，
             // 否则慢盘/网络盘会把 tokio 工作线程占住。
@@ -180,7 +237,7 @@ impl TransferService {
             .map_err(|error| AppError::Other(error.to_string()))??;
             if free < additional_size {
                 return Err(AppError::Conflict(
-                    "接收目录剩余空间不足，已暂停后续数据".into(),
+                    "Insufficient space remains in the receive directory; later data was paused".into(),
                 ));
             }
         }
@@ -188,11 +245,11 @@ impl TransferService {
             let mut map = crate::locks::lock(&self.tasks);
             let task = map
                 .get_mut(&id)
-                .ok_or_else(|| AppError::NotFound("接收任务不存在".into()))?;
+                .ok_or_else(|| AppError::NotFound("Receive task not found".into()))?;
             let destination = PathBuf::from(
                 task.destination
                     .as_deref()
-                    .ok_or_else(|| AppError::Conflict("接收目标尚未确定".into()))?,
+                    .ok_or_else(|| AppError::Conflict("Receive target has not been selected".into()))?,
             );
             let roots = task
                 .manifest
@@ -207,6 +264,10 @@ impl TransferService {
                     )
                 })
                 .collect::<Vec<_>>();
+            // 稳定缓存名称在条目落库前分配并随行持久化：后续任何阶段
+            // （写入、转写、恢复、取消）都只按文件索引读取这份映射。
+            let node_id = task.peer_id.clone();
+            paths::assign_cache_names(&mut entries, &node_id, &mut task.cache_name_seq);
             // 顶层目标数量很少：这里保留完整校验（含符号链接/重解析点），
             // 子条目的逐条校验改用词法检查，避免每帧数千次 canonicalize。
             for (_, root_target) in &roots {
@@ -219,13 +280,13 @@ impl TransferService {
             let mut target_rows = Vec::new();
             for entry in &entries {
                 let (top, tail) = entry.path.split_once('/').ok_or_else(|| {
-                    AppError::Conflict("扫描期间收到非顶层条目，清单顺序非法".into())
+                    AppError::Conflict("Received a non-root entry while scanning; manifest order is invalid".into())
                 })?;
                 let root_target = roots
                     .iter()
                     .find(|(name, _)| name == top)
                     .and_then(|(_, target)| target.clone());
-                let mut target = root_target.map(|path| {
+                let target = root_target.map(|path| {
                     let mut path = PathBuf::from(path);
                     path.push(tail);
                     path
@@ -234,23 +295,11 @@ impl TransferService {
                     // 一帧最多 5000 条，这里不能做 canonicalize 之类的重活：
                     // 词法校验 + 仅在策略需要时探测文件系统。
                     paths::ensure_relative_safe(&entry.path)?;
-                    let probe = entry.directory
-                        || matches!(
-                            task.conflict,
-                            ConflictPolicy::Skip | ConflictPolicy::Overwrite
-                        );
-                    if probe {
-                        if path.exists()
-                            && !entry.directory
-                            && matches!(task.conflict, ConflictPolicy::Skip)
-                        {
-                            target = None;
-                        } else if path.exists() && entry.directory != path.is_dir() {
-                            return Err(AppError::Conflict(format!(
-                                "路径类型冲突：{}",
-                                entry.path
-                            )));
-                        }
+                    if path.exists() && entry.directory != path.is_dir() {
+                        return Err(AppError::Conflict(format!(
+                            "Path type conflicts with {}",
+                            entry.path
+                        )));
                     }
                 }
                 let file_index = task.file_count;
@@ -308,7 +357,7 @@ impl TransferService {
             // 因此"持连接再取连接"这种非重入死锁在这里写不出来。
             self.app.db.with_transaction(|tx| {
                 {
-                    let mut stmt = tx.prepare("INSERT OR REPLACE INTO task_entries(task_id,index_no,path,size,modified_ms,directory) VALUES(?1,?2,?3,?4,?5,?6)")?;
+                    let mut stmt = tx.prepare("INSERT OR REPLACE INTO task_entries(task_id,index_no,path,size,modified_ms,directory,name,cache_name) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?;
                     for (offset, entry) in entries.iter().enumerate() {
                         stmt.execute(rusqlite::params![
                             id,
@@ -316,7 +365,9 @@ impl TransferService {
                             entry.path,
                             entry.size as i64,
                             entry.modified_ms as i64,
-                            entry.directory as i64
+                            entry.directory as i64,
+                            entry.name,
+                            entry.cache_name
                         ])?;
                     }
                 }
@@ -340,6 +391,7 @@ impl TransferService {
             log_manifest_chunk(&id, first, entries.len(), started.elapsed(), true);
             return Ok(Response::ManifestAck);
         }
+        self.assign_entry_cache_names(&id, &mut entries)?;
         self.append_entries(&id, first, &entries)?;
         for entry in &entries {
             total_size = total_size.saturating_add(entry.size);
@@ -372,15 +424,19 @@ impl TransferService {
                 task = %id,
                 accepted = decided,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "顶层清单处理完毕并已回执"
+                "Top-level manifest processing completed and was acknowledged"
             );
         }
         Ok(Response::ManifestAck)
     }
 
     pub(crate) fn remote_state(&self, id: &str) -> AppResult<Response> {
-        let (status, completed) = self.status_and_completed(id)?;
-        Ok(Response::State { status, completed })
+        let (status, completed, revision) = self.status_and_completed(id)?;
+        Ok(Response::State {
+            status,
+            completed,
+            revision,
+        })
     }
     pub(crate) async fn receive_chunk(
         &self,
@@ -388,30 +444,44 @@ impl TransferService {
         index: usize,
         data: Vec<u8>,
         hash: Option<String>,
+        file_version: Option<String>,
         transport: &str,
     ) -> AppResult<Response> {
         let chunk = self
             .chunk_at(id, index)?
-            .ok_or_else(|| AppError::BadRequest("Chunk 编号越界".into()))?;
-        // Routing is based only on the fixed per-file threshold. The relay
-        // publishes completed files as it goes, so cache capacity is not used
-        // to reclassify later files or block oversized direct writes.
+            .ok_or_else(|| AppError::BadRequest("Chunk index is out of range".into()))?;
+        self.admit_cached_file(id, chunk.file).await?;
         let gate = self.gate(id);
         let lock = gate.lock().await;
         let status = self.status_of(id)?;
         if !["accepted", "transferring"].contains(&status.as_str()) {
             return self.remote_state(id);
         }
+        {
+            let tasks = crate::locks::lock(&self.tasks);
+            let task = tasks
+                .get(id)
+                .ok_or_else(|| AppError::NotFound("Receive task not found".into()))?;
+            let expected =
+                super::model::file_version(chunk.file, &task.manifest.entries[chunk.file]);
+            if file_version.as_ref().is_some_and(|v| v != &expected)
+                || file_version.is_none() && !task.repair_files.is_empty()
+            {
+                return Err(AppError::Conflict(
+                    "The received file version does not match the active manifest repair".into(),
+                ));
+            }
+        }
         if self.is_skipped(id, chunk.file) {
             return Ok(Response::Ack);
         }
         if data.len() != chunk.length {
-            return Err(AppError::BadRequest("Chunk 长度不匹配".into()));
+            return Err(AppError::BadRequest("Chunk length mismatch".into()));
         }
         if self.verify_hash_of(id)?
             && hash.as_deref() != Some(format!("{:x}", Sha256::digest(&data)).as_str())
         {
-            return Err(AppError::Conflict("Chunk SHA-256 校验失败".into()));
+            return Err(AppError::Conflict("Chunk SHA-256 verification failed".into()));
         }
         let runtime = self.runtime(id);
         // 已完成，或已入队但尚未落盘：重复块直接确认，不重复入队。
@@ -445,20 +515,20 @@ impl TransferService {
             Ok(Ok(())) => Ok(Response::Ack),
             Ok(Err(_)) => {
                 crate::locks::lock(&runtime.write_pending).remove(&index);
-                Err(AppError::Other("接收写入队列已关闭".into()))
+                Err(AppError::Other("Receive write queue is closed".into()))
             }
             Err(_) => {
                 crate::locks::lock(&runtime.write_pending).remove(&index);
-                tracing::warn!(task = %id, index, "写入队列长时间无空间，放弃本次入队");
+                tracing::warn!(task = %id, index, "Write queue had no space for too long; abandoning this enqueue attempt");
                 Err(AppError::Conflict(
-                    "接收写入队列长时间无空间，请检查目标磁盘写入速度".into(),
+                    "Receive write queue has no space for too long; check the target disk write speed".into(),
                 ))
             }
         }
     }
     /// 等待本任务所有已入队块完成「写入 + sync_data + 记录完成」。
     /// 超时说明写入任务异常或存在长期缺口，改由调用方报错，避免永久阻塞。
-    async fn await_writes(&self, id: &str) -> AppResult<()> {
+    pub(crate) async fn await_writes(&self, id: &str) -> AppResult<()> {
         let deadline = tokio::time::Instant::now() + crate::tuning::AWAIT_WRITES_TIMEOUT;
         let runtime = self.runtime(id);
         loop {
@@ -468,7 +538,7 @@ impl TransferService {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(AppError::Conflict(
-                    "仍有未落盘的 Chunk，请稍后重试提交".into(),
+                    "Some chunks are still being written; retry the commit shortly".into(),
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -485,22 +555,28 @@ impl TransferService {
         let mut stalled_since = tokio::time::Instant::now();
         loop {
             let state = self.relay_state(id)?;
-            if relay::relay_done(&state) {
+            if relay::relay_done(&state) || state.completed_count < state.chunk_count {
                 return Ok(());
             }
             if let Some(err) = state.error {
                 return Err(AppError::Other(err));
             }
-            if !["accepted", "transferring"].contains(&state.status.as_str()) {
-                return Err(AppError::Conflict("转写已停止，请稍后重试提交".into()));
+            if !super::recovery::processing(&state.status) || state.status == "finishing" {
+                return Err(AppError::Conflict(
+                    "Relay was stopped; retry the commit shortly".into(),
+                ));
             }
-            let progress = state.relayed_total;
+            let progress = state.relayed_total.saturating_add(
+                self.runtime(id)
+                    .relay_progress
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             if progress > last {
                 last = progress;
                 stalled_since = tokio::time::Instant::now();
             } else if stalled_since.elapsed() >= crate::tuning::RELAY_STALL_TIMEOUT {
                 return Err(AppError::Conflict(
-                    "转写长时间无进展，请稍后重试提交".into(),
+                    "Relay made no progress for too long; retry the commit shortly".into(),
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -514,11 +590,13 @@ impl TransferService {
             if task.status == "completed" {
                 return Ok(Response::Ack);
             }
-            if !["accepted", "transferring", "interrupted"].contains(&task.status.as_str()) {
+            if !super::recovery::processing(&task.status) {
                 return self.remote_state(id);
             }
             if !task.scan_complete {
-                return Err(AppError::Conflict("发送方仍在扫描清单，暂不能提交".into()));
+                return Err(AppError::Conflict(
+                    "Sender is still scanning the manifest; submission is not available yet".into(),
+                ));
             }
             // 提交是本任务最长的收尾步骤（等落盘、等转写、逐文件 rename，
             // 几十万文件时可达数十分钟）。绝不能占着任务锁：否则同一任务的
@@ -536,14 +614,31 @@ impl TransferService {
     async fn commit_files(&self, id: &str) -> AppResult<Response> {
         // 先等队列排空并记录完成，再做完整性判断与提交。
         self.await_writes(id).await?;
+        // 已发布缓存文件若在提交前被删除，必须先让发送端补传；否则转写等待会一直
+        // 等一个不会再运行的缓存项，后面的缺失文件检查永远到不了。
+        let cached_missing = self.repair_missing_published_cache_files(id).await?;
+        if !cached_missing.is_empty() {
+            return Ok(Response::Repair {
+                files: cached_missing,
+            });
+        }
         // 缓存中转模式：目标盘临时文件由转写任务连续写，需等转写完成后再 rename。
         self.await_relay(id).await?;
         let task = self.record(id)?;
-        // Older builds may persist a completed counter that is higher than the
-        // manifest count. The per-file size checks below remain authoritative;
-        // reject only when the durable completed count is short.
         if task.completed_count < task.chunk_count {
-            return Err(AppError::Conflict("仍有未提交 Chunk".into()));
+            let files = task
+                .manifest
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(file, entry)| {
+                    let base = task.manifest.file_base(file);
+                    let count = entry.size.div_ceil(task.chunk_size) as usize;
+                    (!entry.directory && !(base..base + count).all(|i| task.completed.contains(&i)))
+                        .then_some(file)
+                })
+                .collect();
+            return Ok(Response::Repair { files });
         }
         #[cfg(target_os = "android")]
         if self.is_android_direct_receive(&task) {
@@ -553,8 +648,7 @@ impl TransferService {
                 .iter()
                 .enumerate()
                 .filter(|(file, entry)| {
-                    !entry.directory
-                        && task.targets.get(*file).and_then(Option::as_ref).is_some()
+                    !entry.directory && task.targets.get(*file).and_then(Option::as_ref).is_some()
                 })
                 .map(|(file, _)| self.android_download_request(&task, file))
                 .collect::<AppResult<Vec<_>>>()?;
@@ -570,50 +664,110 @@ impl TransferService {
             self.edit(id, |t| {
                 t.status = "completed".into();
                 t.error = None;
-                t.event("所有文件已持久化并提交，发送完成回执");
+                t.event("All files were saved and committed. Transfer completion was acknowledged");
             })?;
             self.release_files(id);
             if let Ok(stage) = paths::stage(&task) {
                 let _ = std::fs::remove_dir_all(stage);
             }
+            self.cleanup_cache_dirs(&task);
             self.release_runtime(id);
             return Ok(Response::Ack);
+        }
+        let cached_missing: Vec<_> = self
+            .missing_published_files(id)
+            .await?
+            .into_iter()
+            .filter(|file| task.cache_files.contains(file) && task.manifest.entries[*file].size > 0)
+            .collect();
+        if !cached_missing.is_empty() {
+            for file in &cached_missing {
+                self.invalidate_file(id, *file)?;
+            }
+            return Ok(Response::Repair {
+                files: cached_missing,
+            });
         }
         let root = PathBuf::from(task.destination.as_ref().unwrap());
         let stage = paths::stage(&task)?;
         // 逐文件提交全是同步文件系统调用（create_dir_all / rename / exists /
         // sync_all）：几十万个文件会把 tokio 工作线程阻塞很久，因此整体丢到
         // 阻塞线程池执行；这里也统一为"只用同步 API"，不再同步异步混用。
-        {
+        let broken = {
             let task = task.clone();
             let root = root.clone();
             let stage = stage.clone();
-            tokio::task::spawn_blocking(move || Self::commit_staged_files(&task, &root, &stage))
-                .await
-                .map_err(|error| AppError::Other(error.to_string()))??;
+            tokio::task::spawn_blocking(move || {
+                let mut broken = Vec::new();
+                for file in 0..task.manifest.entries.len() {
+                    match Self::commit_staged_file(&task, &root, &stage, file) {
+                        Ok(()) => {}
+                        Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                            broken.push(file)
+                        }
+                        Err(AppError::Conflict(_)) => broken.push(file),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok::<_, AppError>(broken)
+            })
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))??
+        };
+        if !broken.is_empty() {
+            for file in &broken {
+                self.invalidate_file(id, *file)?;
+            }
+            return Ok(Response::Repair { files: broken });
+        }
+        let missing = self.missing_published_files(id).await?;
+        if !missing.is_empty() {
+            for file in &missing {
+                self.invalidate_file(id, *file)?;
+            }
+            return Ok(Response::Repair { files: missing });
         }
         #[cfg(target_os = "android")]
         if let Err(error) = crate::android_import::export_received(task.clone()).await {
             self.edit(id, |t| {
                 t.error = Some(error.clone());
-                t.event("保存到所选目录失败，文件仍保留在应用内，可重新保存");
+                t.event("Saving to the selected folder failed. Files remain in the app and can be saved again");
             })?;
             return Err(AppError::Other(error));
         }
         self.edit(id, |t| {
             t.status = "completed".into();
             t.error = None;
-            t.event("所有文件已持久化并提交，发送完成回执");
+            t.event("All files were saved and committed. Transfer completion was acknowledged");
         })?;
         // 传输已结束：释放本任务登记的目标盘句柄，避免最终文件被长时间占用。
         self.release_files(id);
-        // Only generated staging files inside this task directory are cleaned.
         if paths::ensure_under(&root, &stage).is_ok() {
             let _ = std::fs::remove_dir_all(&stage);
         }
+        self.cleanup_cache_dirs(&task);
         // 任务已终态：整体释放运行期资源（门锁、句柄、标志）。
         self.release_runtime(id);
         Ok(Response::Ack)
+    }
+
+    fn cleanup_cache_dirs(&self, task: &super::model::TaskRecord) {
+        if !task.use_cache {
+            return;
+        }
+        let Some(cache_root) = self.cache_root_for_task(&task.id) else {
+            return;
+        };
+        for dir in paths::cache_task_dirs(&cache_root, task) {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(dir = %dir.display(), %error, "Failed to clean the receive cache directory");
+                    relay::record_pending_cleanup(self, &dir);
+                }
+            }
+        }
     }
 }
 
@@ -633,7 +787,7 @@ fn log_manifest_chunk(
             entries,
             accepted,
             elapsed_ms = elapsed.as_millis() as u64,
-            "清单分片处理耗时较长（落库与目标规划）"
+            "Manifest chunk processing is taking a long time (database write and target planning)"
         );
     } else {
         // INFO 级：确认接收后每个分片是否真的在推进，需要能从默认日志看出来。
@@ -643,7 +797,7 @@ fn log_manifest_chunk(
             entries,
             accepted,
             elapsed_ms = elapsed.as_millis() as u64,
-            "清单分片已处理"
+            "Manifest chunk processed"
         );
     }
 }

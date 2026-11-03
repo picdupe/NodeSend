@@ -1,4 +1,3 @@
-//! Receive-side offer and manifest lifecycle.
 use super::super::{
     model::{incoming_id, ConflictPolicy, Manifest, OfferSummary, TaskRecord},
     TransferService,
@@ -20,7 +19,9 @@ impl TransferService {
         transport: &str,
     ) -> AppResult<Response> {
         if wire.len() != 32 || !wire.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AppError::BadRequest("任务 ID 非法".into()));
+            return Err(AppError::BadRequest(
+                "Invalid task ID".into(),
+            ));
         }
         let id = incoming_id(peer, wire);
         if self.status_of(&id).is_ok() {
@@ -30,22 +31,26 @@ impl TransferService {
             if (!summary.streaming && digest != summary.digest)
                 || existing.top_level_fingerprint != summary.top_level_fingerprint
             {
-                return Err(AppError::Conflict("已创建的任务内容不能变更".into()));
+                return Err(AppError::Conflict("Created task contents cannot be changed".into()));
             }
-            // A previously accepted receive task may have been interrupted by
-            // an application update/restart. Resume it automatically only if
-            // its destination was already chosen; an intentional `paused`
-            // state is never overridden here.
             if existing_status == "interrupted" && existing.destination.is_some() {
                 self.edit(&id, |task| {
                     task.status = "accepted".into();
                     task.error = None;
-                    task.event("重新连接后自动恢复已确认的接收任务");
+                    task.event("The accepted receive task resumed after reconnecting");
                 })?;
                 existing_status = "accepted".into();
             }
             if !received {
-                if ["accepted", "transferring", "paused", "remote_paused", "interrupted"].contains(&existing_status.as_str()) {
+                if [
+                    "accepted",
+                    "transferring",
+                    "paused",
+                    "remote_paused",
+                    "interrupted",
+                ]
+                .contains(&existing_status.as_str())
+                {
                     let recovered_count = existing.manifest.entries.len();
                     if recovered_count != existing.file_count {
                         self.update_scan_progress(
@@ -83,7 +88,7 @@ impl TransferService {
             .count()
             >= crate::tuning::MAX_PENDING_REQUESTS
         {
-            return Err(AppError::Forbidden("待处理请求已满".into()));
+            return Err(AppError::Forbidden("Pending request limit reached".into()));
         }
         let now = chrono::Utc::now().to_rfc3339();
         let task = TaskRecord {
@@ -91,6 +96,7 @@ impl TransferService {
             wire_id: wire.into(),
             peer_id: peer.into(),
             peer_name: name.into(),
+            file_name: String::new(),
             peer_device_type: device_type.into(),
             preferred_address: None,
             direction: "receive".into(),
@@ -101,7 +107,7 @@ impl TransferService {
             transport: Some(transport.into()),
             error: None,
             events: vec![format!(
-                "{} 已验证发送方身份，正在接收文件清单",
+                "{} Sender identity verified. Receiving the file manifest",
                 chrono::Local::now().to_rfc3339()
             )],
             updated_at: now.clone(),
@@ -112,10 +118,13 @@ impl TransferService {
             verify_hash: summary.verify_hash,
             android_media_library: false,
             receive_directories: BTreeSet::new(),
-            file_count: summary.file_count,
-            directory_count: summary.directory_count,
-            total_size: summary.total_size,
-            chunk_count: summary.chunk_count,
+            // 清单分片到达前这四个字段是「已收到条目」的游标，必须从 0 开始：
+            // 用摘要里的总量做初值会让第一页被误判为「已收到过」而整份清单丢失。
+            // 接收对话框里的总量随清单分页到达而增长（`top_level_count` 仍是摘要值）。
+            file_count: 0,
+            directory_count: 0,
+            total_size: 0,
+            chunk_count: 0,
             top_level_count: summary.top_level_count,
             completed_count: 0,
             completed_bytes: 0,
@@ -125,6 +134,12 @@ impl TransferService {
             skipped_paths: vec![],
             cache_files: std::collections::BTreeSet::new(),
             resume_requested: false,
+            source_issue: None,
+            recovery_epoch: 0,
+            remote_recovery_epoch: 0,
+            checked_epoch: 0,
+            abandoned_files: std::collections::BTreeSet::new(),
+            repair_files: std::collections::BTreeSet::new(),
             state_revision: 0,
             remote_state_revision: 0,
             digest: summary.digest,
@@ -135,6 +150,7 @@ impl TransferService {
             scan_progress_count: 0,
             scan_progress_directories: 0,
             manifest: Manifest::default(),
+            cache_name_seq: std::collections::HashMap::new(),
             completed: BTreeSet::new(),
             targets: vec![],
             relayed: vec![],
@@ -144,7 +160,6 @@ impl TransferService {
         Ok(Response::Ready)
     }
 
-    /// Apply trusted-device auto-accept policy once the top-level manifest arrives.
     pub(crate) async fn auto_accept_if_trusted(&self, peer: &str, id: &str) -> bool {
         if !matches!(self.status_of(id).as_deref(), Ok("waiting")) {
             return false;
@@ -168,7 +183,7 @@ impl TransferService {
         let trusted = match crate::registry::list(&self.app.db) {
             Ok(nodes) => nodes.iter().any(|node| node.node_id == peer),
             Err(error) => {
-                tracing::warn!(%peer, %error, "读取信任设备列表失败，自动接收已安全降级为手动确认");
+                tracing::warn!(%peer, %error, "Failed to read trusted devices; automatic receive safely fell back to manual confirmation");
                 return false;
             }
         };
@@ -177,7 +192,7 @@ impl TransferService {
         }
         let destination = self.default_destination();
         if let Err(error) = std::fs::create_dir_all(&destination) {
-            tracing::warn!(%peer, %error, "信任设备自动接收：创建接收目录失败，保留手动确认");
+            tracing::warn!(%peer, %error, "Could not create the trusted-device receive directory; keeping manual confirmation enabled");
             return false;
         }
         match self
@@ -185,17 +200,16 @@ impl TransferService {
             .await
         {
             Ok(()) => {
-                tracing::info!(%peer, task = %id, "信任设备顶层清单已到齐，自动接收");
+                tracing::info!(%peer, task = %id, "Manifest received from trusted device; accepting automatically");
                 true
             }
             Err(error) => {
-                tracing::warn!(%peer, task = %id, %error, "信任策略自动接收失败，保留手动确认");
+                tracing::warn!(%peer, task = %id, %error, "Automatic receive from a trusted device failed; keeping manual confirmation enabled");
                 false
             }
         }
     }
 
-    /// Validate the completed manifest and apply the final receive policy.
     pub(crate) async fn manifest_done(
         &self,
         peer: &str,
@@ -206,7 +220,15 @@ impl TransferService {
     ) -> AppResult<Response> {
         let id = incoming_id(peer, wire);
         let initial_status = self.status_of(&id)?;
-        if !["waiting", "accepted", "transferring", "paused", "remote_paused"].contains(&initial_status.as_str()) {
+        if ![
+            "waiting",
+            "accepted",
+            "transferring",
+            "paused",
+            "remote_paused",
+        ]
+        .contains(&initial_status.as_str())
+        {
             return self.remote_state(&id);
         }
         let task = self.record(&id)?;
@@ -214,31 +236,25 @@ impl TransferService {
         let actual_total_size = task.manifest.total();
         let actual_digest = task.manifest.digest();
         if file_count != actual_file_count || total_size != actual_total_size {
-            // Streaming senders may finish the scan while the durable sender
-            // snapshot still contains the top-level summary. The received
-            // entries are already persisted and their digest is checked below,
-            // so use those authoritative values instead of aborting cache
-            // planning on a stale count/size frame.
             tracing::warn!(
                 task = %id,
                 announced_files = file_count,
                 actual_files = actual_file_count,
                 announced_bytes = total_size,
                 actual_bytes = actual_total_size,
-                "清单结束帧摘要落后于已接收清单，使用接收端实际值"
+                "Manifest end-frame summary lags behind the received manifest; using the receiver's actual values"
             );
         }
         if digest != actual_digest || (!task.digest.is_empty() && task.digest != digest) {
-            return Err(AppError::Conflict("文件清单校验失败（指纹不一致）".into()));
+            return Err(AppError::Conflict(
+                "File manifest validation failed (fingerprint mismatch)".into(),
+            ));
         }
         task.manifest.validate()?;
-        // Build the final per-file cache route before publishing scan_complete.
-        // The writer uses scan_complete to stop its temporary cache fallback;
-        // flipping it first creates a race where new files open destination
-        // .part files while refresh_cache_plan is still pending.
         self.refresh_cache_plan(&id)?;
         self.edit(&id, |record| {
             record.file_count = actual_file_count;
+            record.refresh_file_name();
             record.directory_count = record
                 .manifest
                 .entries
@@ -254,7 +270,7 @@ impl TransferService {
             // 自动接收与手动接收下日志不一致。
             if !record.scan_complete {
                 record.event(format!(
-                    "清单扫描完成：{} 个文件 · {} 个目录",
+                    "Manifest scan complete: {} files · {} folders",
                     actual_file_count, record.directory_count
                 ));
             }

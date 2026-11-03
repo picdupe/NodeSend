@@ -13,19 +13,26 @@ pub mod android_import;
 #[cfg(target_os = "android")]
 pub mod android_updater;
 pub mod browser;
+#[cfg(desktop)]
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod error;
 pub mod httpapi;
 pub mod identity;
 pub mod ipc;
+pub mod locale;
 pub(crate) mod locks;
 pub mod network;
+#[cfg(desktop)]
+pub mod process_host;
 pub mod registry;
 pub mod service;
+#[cfg(desktop)]
+pub mod service_rpc;
+pub mod share;
 #[cfg(target_os = "windows")]
 pub mod single_instance;
-pub mod share;
 pub mod transfer;
 #[cfg(desktop)]
 pub mod tray;
@@ -35,14 +42,33 @@ pub mod update_sources;
 #[cfg(desktop)]
 pub mod updater;
 
+#[cfg(mobile)]
 use std::sync::Arc;
 
+#[cfg(mobile)]
 use service::AppService;
 use tauri::Manager;
 
 /// 构建标记：每个修复批次递增。两端日志都会打印，用来确认"哪台跑的是哪版"
 /// —— 排查"发送端已修、接收端还是旧构建"这类问题时必不可少。
 pub const BUILD_TAG: &str = "2026-10-11.dl-fix";
+
+#[tauri::command]
+async fn service_invoke(
+    app: tauri::AppHandle,
+    command: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    #[cfg(desktop)]
+    {
+        cli::service_invoke(app, command, args).await
+    }
+    #[cfg(mobile)]
+    {
+        let _ = (app, command, args);
+        Ok(serde_json::json!({"handled":false}))
+    }
+}
 
 /// Tauri 桌面应用启动入口（main.rs 调用）。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -51,8 +77,6 @@ pub fn run() {
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default();
-    // The deep-link plugin currently generates a desktop-only Android helper
-    // project. Keep the native plugin on desktop.
     #[cfg(not(target_os = "android"))]
     {
         builder = builder.plugin(tauri_plugin_deep_link::init());
@@ -61,6 +85,7 @@ pub fn run() {
     {
         builder = builder.plugin(tauri_plugin_clipboard_manager::init());
     }
+    builder = builder.plugin(tauri_plugin_os::init());
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -72,52 +97,118 @@ pub fn run() {
     }
     builder
         .setup(|app| {
-            // 数据根目录：Tauri 管理的 app_data_dir（基线 §45/§21）。
-            let data_dir = app.path().app_data_dir()?;
-            let data_dir = config::app_data_dir(data_dir)?;
-            tracing::info!(dir = %data_dir.display(), "应用数据目录");
-            let paths = config::AppPaths::new(data_dir);
-
+            #[cfg(all(desktop, unix))]
+            cli::local_unix::start_gui_listener(app.handle().clone());
             #[cfg(desktop)]
-            if let Err(error) = update_sources::initialize(app.handle()) {
-                tracing::warn!(%error, "初始化更新源配置失败；应用仍将继续启动");
+            {
+                tracing::info!("Starting desktop GUI setup");
+                app.manage(updater::PendingUpdateState::default());
+                if let Err(error) = update_sources::initialize(app.handle()) {
+                    tracing::warn!(%error, "Update source initialization failed; continuing startup");
+                }
+                #[cfg(target_os = "windows")]
+                single_instance::start_listener(app.handle().clone());
+                if let Err(error) = tray::init(app) {
+                    tracing::warn!(%error, "System tray initialization failed; continuing without tray");
+                }
+                process_host::start_gui_entry(app.handle().clone());
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Err(error) = window.show() {
+                        tracing::error!(%error, "Failed to show the main window");
+                    }
+                    if let Err(error) = window.set_focus() {
+                        tracing::warn!(%error, "Failed to focus the main window");
+                    }
+                    tracing::info!(visible = ?window.is_visible(), "Main window visibility after setup");
+                } else {
+                    tracing::error!("The main window was not created");
+                }
+                let app_handle = app.handle().clone();
+                if let Err(error) = app.run_on_main_thread(move || {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        #[cfg(target_os = "windows")]
+                        if let Err(error) = set_native_window_icon(&window) {
+                            tracing::warn!(%error, "Failed to set the native window icon");
+                        }
+                        if let Err(error) = window.show() {
+                            tracing::error!(%error, "Failed to show the main window on the UI thread");
+                        }
+                        if let Err(error) = window.set_focus() {
+                            tracing::warn!(%error, "Failed to focus the main window on the UI thread");
+                        }
+                        tracing::info!(visible = ?window.is_visible(), "Main window visibility on the UI thread");
+                    }
+                }) {
+                    tracing::error!(%error, "Failed to schedule main window display");
+                }
+                tracing::info!("Desktop GUI setup finished");
+                return Ok(());
             }
+            #[cfg(mobile)]
+            {
+                // 数据根目录：Tauri 管理的 app_data_dir（基线 §45/§21）。
+                let data_dir = app.path().app_data_dir()?;
+                let data_dir = config::app_data_dir(data_dir)?;
+                tracing::info!(dir = %data_dir.display(), "Application data directory initialized");
+                let paths = config::AppPaths::new(data_dir);
 
-            let service = AppService::init(paths)?;
+                #[cfg(desktop)]
+                if let Err(error) = update_sources::initialize(app.handle()) {
+                    tracing::warn!(%error, "Failed to initialize update sources; continuing startup");
+                }
 
-            let http_manager = Arc::new(httpapi::HttpManager::new());
-            let share_link_manager = Arc::new(httpapi::ShareLinkManager::new());
-            let protocol_manager = Arc::new(share::servers::ProtocolManager::default());
-            tauri::async_runtime::block_on(protocol_manager.restore(service.clone()))?;
-            let network_manager =
-                tauri::async_runtime::block_on(network::NetworkManager::start(service.clone()))?;
-            #[cfg(target_os = "windows")]
-            single_instance::start_listener(app.handle().clone());
-            tracing::info!(
-                build = BUILD_TAG,
-                node_id = %service.identity.node_id,
-                tcp = network_manager.tcp_port,
-                quic = network_manager.quic_port,
-                discovery = ?network_manager.status().discovery,
-                "NodeSend 原生服务已启动"
-            );
-            let browser_manager = Arc::new(
-                browser::BrowserManager::new(service.clone())?
-                    .with_peers(network_manager.peers.clone()),
-            );
+                let service = AppService::init(paths)?;
 
-            app.manage(service);
-            app.manage(http_manager);
-            app.manage(share_link_manager);
-            app.manage(protocol_manager);
-            app.manage(browser_manager);
-            app.manage(network_manager);
-            #[cfg(desktop)]
-            app.manage(updater::PendingUpdateState::default());
-            // 桌面端常驻系统托盘：关闭窗口后进程继续接收与传输。
-            #[cfg(desktop)]
-            tray::init(app)?;
-            Ok(())
+                let http_manager = Arc::new(httpapi::HttpManager::new());
+                let share_link_manager = Arc::new(httpapi::ShareLinkManager::new());
+                let protocol_manager = Arc::new(share::servers::ProtocolManager::default());
+                tauri::async_runtime::block_on(protocol_manager.restore(service.clone()))?;
+                let network_manager = tauri::async_runtime::block_on(
+                    network::NetworkManager::start(service.clone()),
+                )?;
+                tracing::info!(
+                    build = BUILD_TAG,
+                    node_id = %service.identity.node_id,
+                    tcp = network_manager.tcp_port,
+                    quic = network_manager.quic_port,
+                    discovery = ?network_manager.status().discovery,
+                    "NodeSend native service started"
+                );
+                let browser_manager = Arc::new(
+                    browser::BrowserManager::new(service.clone())?
+                        .with_peers(network_manager.peers.clone()),
+                );
+
+                #[cfg(desktop)]
+                let backend = Arc::new(service_rpc::Backend {
+                    service: service.clone(),
+                    network: network_manager.clone(),
+                    http: http_manager.clone(),
+                    links: share_link_manager.clone(),
+                    protocol: protocol_manager.clone(),
+                    browser: browser_manager.clone(),
+                });
+                app.manage(service);
+                app.manage(http_manager);
+                app.manage(share_link_manager);
+                app.manage(protocol_manager);
+                app.manage(browser_manager);
+                #[cfg(desktop)]
+                tauri::async_runtime::block_on(async {
+                    cli::start_server(network_manager.clone(), backend.clone())
+                })?;
+                #[cfg(desktop)]
+                app.manage(backend);
+                app.manage(network_manager);
+                #[cfg(target_os = "windows")]
+                single_instance::start_listener(app.handle().clone());
+                #[cfg(desktop)]
+                app.manage(updater::PendingUpdateState::default());
+                // 桌面端常驻系统托盘：关闭窗口后进程继续接收与传输。
+                #[cfg(desktop)]
+                tray::init(app)?;
+                Ok(())
+            }
         })
         .on_window_event(|_window, _event| {
             // 桌面端把关闭窗口变成隐藏窗口；退出只能走托盘菜单。
@@ -126,6 +217,9 @@ pub fn run() {
             tray::on_window_event(_window, _event);
         })
         .invoke_handler(tauri::generate_handler![
+            service_invoke,
+            ipc::commands::get_ui_language,
+            ipc::commands::set_ui_language,
             ipc::commands::get_node_info,
             ipc::commands::start_share_link,
             ipc::commands::set_http_config,
@@ -193,7 +287,55 @@ pub fn run() {
             updater::open_update_url,
         ])
         .run(tauri::generate_context!())
-        .expect("NodeSend 启动失败");
+        .expect("Failed to start NodeSend");
+}
+
+#[cfg(target_os = "windows")]
+fn set_native_window_icon(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, WM_SETICON,
+            },
+        },
+    };
+
+    let instance = HINSTANCE(
+        unsafe { GetModuleHandleW(PCWSTR::null()) }
+            .map_err(|error| error.to_string())?
+            .0,
+    );
+    let load_icon = |size| unsafe {
+        LoadImageW(
+            Some(instance),
+            PCWSTR::from_raw(32_512usize as *const u16),
+            IMAGE_ICON,
+            size,
+            size,
+            LR_SHARED,
+        )
+    };
+    let small_icon = load_icon(16).map_err(|error| error.to_string())?;
+    let large_icon = load_icon(32).map_err(|error| error.to_string())?;
+    let hwnd = HWND(window.hwnd().map_err(|error| error.to_string())?.0);
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(small_icon.0 as isize)),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(large_icon.0 as isize)),
+        );
+    }
+    Ok(())
 }
 
 /// 初始化日志（tracing）。RUST_LOG 环境变量可覆盖级别，默认 info。
@@ -201,14 +343,11 @@ pub fn run() {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
-    // Use the machine's local timezone and a compact, human-readable timestamp.
-    // The default formatter emits UTC RFC3339 timestamps ending in `Z`.
     let timer = || fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string());
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
 
-    // Keep live output in the console window when running a debug build.
     #[cfg(debug_assertions)]
     {
         let _ = fmt().with_timer(timer()).with_env_filter(filter).try_init();
@@ -232,7 +371,10 @@ fn init_tracing() {
                         .with_timer(timer())
                         .with_env_filter(filter)
                         .with_ansi(false)
-                        .with_writer(move || file.try_clone().expect("克隆 NodeSend 日志文件句柄失败"))
+                        .with_writer(move || {
+                            file.try_clone()
+                                .expect("Failed to clone the NodeSend log file handle")
+                        })
                         .try_init();
                     return;
                 }

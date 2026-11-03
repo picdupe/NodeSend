@@ -18,23 +18,19 @@ pub fn modified(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// Incremental, deterministic directory scanner for streaming transfers.
 ///
-/// The selected roots are emitted first (so the receiver can present the
-/// top-level decision without waiting for recursive traversal). Subsequent
-/// calls walk each root in depth-first, filename-sorted order. This iterator
-/// deliberately does not build a full `Vec<FileEntry` before yielding data.
 pub struct SourceScanner {
     roots: Vec<SourceRoot>,
     next_root: usize,
     stack: Vec<(PathBuf, String, usize, bool)>,
     roots_expanded: bool,
+    cutoff_ms: u64,
 }
 
 impl SourceScanner {
     pub fn new(selected: Vec<String>) -> AppResult<Self> {
         if selected.is_empty() {
-            return Err(AppError::BadRequest("请选择文件或目录".into()));
+            return Err(AppError::BadRequest("Select files or directories".into()));
         }
         let mut roots = Vec::with_capacity(selected.len());
         for raw in selected {
@@ -43,12 +39,12 @@ impl SourceScanner {
             let meta = std::fs::symlink_metadata(path)?;
             paths::ensure_plain_meta(&meta)?;
             if !meta.is_file() && !meta.is_dir() {
-                return Err(AppError::BadRequest("只支持普通文件和目录".into()));
+                return Err(AppError::BadRequest("Only regular files and directories are supported".into()));
             }
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .ok_or_else(|| AppError::BadRequest("不能直接发送磁盘根目录".into()))?
+                .ok_or_else(|| AppError::BadRequest("Cannot send a disk root directly".into()))?
                 .to_string();
             roots.push(SourceRoot {
                 name: name.clone(),
@@ -64,48 +60,48 @@ impl SourceScanner {
             next_root: 0,
             stack: Vec::new(),
             roots_expanded: false,
+            cutoff_ms: std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
         })
+    }
+
+    pub(crate) fn set_cutoff(&mut self, cutoff_ms: u64) {
+        self.cutoff_ms = cutoff_ms;
     }
 
     pub fn roots(&self) -> &[SourceRoot] {
         &self.roots
     }
 
-    /// Rebuild a deterministic scan position after restart without serializing
-    /// the OS directory iterator/DFS stack. `last_seq` is the number of entries
-    /// already committed to the manifest (1-based for a non-empty cursor), and
-    /// `last_path` is the path of that final committed entry. We deliberately
-    /// rescan from the beginning and verify the cursor rather than trusting a
-    /// stale filesystem iterator position.
     pub fn resume_after(&mut self, last_seq: usize, last_path: &str) -> AppResult<()> {
         if last_seq == 0 {
             if !last_path.is_empty() {
-                return Err(AppError::BadRequest("空扫描游标不能包含路径".into()));
+                return Err(AppError::BadRequest("An empty scan cursor cannot include a path".into()));
             }
             return Ok(());
         }
         if last_path.is_empty() {
-            return Err(AppError::BadRequest("扫描游标缺少最后路径".into()));
+            return Err(AppError::BadRequest("Scan cursor is missing its last path".into()));
         }
         for seq in 1..=last_seq {
             let entry = self
                 .next_entry()?
-                .ok_or_else(|| AppError::Conflict("源目录已变化，无法恢复清单扫描位置".into()))?;
+                .ok_or_else(|| AppError::Conflict("Source directory changed; cannot restore the manifest scan position".into()))?;
             if seq == last_seq && entry.path != last_path {
                 return Err(AppError::Conflict(
-                    "源目录的确定性扫描顺序已变化，无法恢复清单扫描位置".into(),
+                    "Deterministic scan order of the source directory changed; cannot restore the manifest scan position".into(),
                 ));
             }
         }
         Ok(())
     }
 
-    /// Read at most `limit` entries without materializing the rest of the tree.
-    /// The caller can persist/send each batch before asking for the next one.
     pub fn next_batch(&mut self, limit: usize) -> AppResult<Vec<FileEntry>> {
         if limit == 0 || limit > 5000 {
             return Err(AppError::BadRequest(
-                "清单批次大小必须在 1 到 5000 之间".into(),
+                "Manifest batch size must be between 1 and 5000".into(),
             ));
         }
         let mut batch = Vec::with_capacity(limit);
@@ -118,7 +114,6 @@ impl SourceScanner {
         Ok(batch)
     }
 
-    /// Returns the next entry, or `None` when the traversal is complete.
     pub fn next_entry(&mut self) -> AppResult<Option<FileEntry>> {
         if self.next_root < self.roots.len() {
             let root = &self.roots[self.next_root];
@@ -128,11 +123,11 @@ impl SourceScanner {
                 size: if root.directory { 0 } else { root.size },
                 modified_ms: root.modified_ms,
                 directory: root.directory,
+                ..Default::default()
             }));
         }
 
         if !self.roots_expanded {
-            // Reverse-push so the first selected root is traversed first.
             for root in self.roots.iter().rev() {
                 if root.directory {
                     self.stack
@@ -144,7 +139,7 @@ impl SourceScanner {
 
         while let Some((path, relative, depth, emit)) = self.stack.pop() {
             if depth > 64 {
-                return Err(AppError::BadRequest("目录层级超出限制".into()));
+                return Err(AppError::BadRequest("Directory nesting exceeds the limit".into()));
             }
             if !emit {
                 let mut children = std::fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
@@ -153,7 +148,7 @@ impl SourceScanner {
                     let name = child
                         .file_name()
                         .into_string()
-                        .map_err(|_| AppError::BadRequest("文件名不是 UTF-8".into()))?;
+                        .map_err(|_| AppError::BadRequest("Filename is not valid UTF-8".into()))?;
                     self.stack
                         .push((child.path(), format!("{relative}/{name}"), depth + 1, true));
                 }
@@ -164,8 +159,11 @@ impl SourceScanner {
             paths::validate_component(name)?;
             let meta = std::fs::symlink_metadata(&path)?;
             paths::ensure_plain_meta(&meta)?;
+            if meta.is_file() && modified(&meta) > self.cutoff_ms {
+                continue;
+            }
             if !meta.is_file() && !meta.is_dir() {
-                return Err(AppError::BadRequest("只支持普通文件和目录".into()));
+                return Err(AppError::BadRequest("Only regular files and directories are supported".into()));
             }
             if meta.is_dir() {
                 self.stack
@@ -176,13 +174,13 @@ impl SourceScanner {
                 size: if meta.is_file() { meta.len() } else { 0 },
                 modified_ms: modified(&meta),
                 directory: meta.is_dir(),
+                ..Default::default()
             }));
         }
         Ok(None)
     }
 }
 
-/// Fingerprint selected top-level items only. Directory contents are deliberately not traversed.
 pub fn top_level_fingerprint(roots: &[SourceRoot]) -> String {
     let mut hasher = Sha256::new();
     for root in roots {
@@ -197,10 +195,8 @@ pub fn top_level_fingerprint(roots: &[SourceRoot]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Re-read only each selected root's own metadata; never enumerate descendants.
 pub fn verify_top_level_fingerprint(task: &TaskRecord) -> AppResult<()> {
     if task.top_level_fingerprint.is_empty() {
-        // Compatibility for tasks persisted before the top-level fingerprint existed.
         return Ok(());
     }
     let mut current = Vec::with_capacity(task.sources.len());
@@ -219,7 +215,7 @@ pub fn verify_top_level_fingerprint(task: &TaskRecord) -> AppResult<()> {
     }
     if top_level_fingerprint(&current) != task.top_level_fingerprint {
         return Err(AppError::Conflict(
-            "选中的顶层文件或目录已变化，不能从旧清单继续；请重新选择并发送".into(),
+            "Selected top-level files or directories changed. The old manifest cannot be resumed; select them again and resend.".into(),
         ));
     }
     Ok(())
@@ -231,7 +227,7 @@ pub fn verify_top_level_fingerprint(task: &TaskRecord) -> AppResult<()> {
 /// 分块大小统一取 [`CHUNK_SIZE`]，不再各自维护一套策略。
 pub fn collect(selected: Vec<String>, verify_hash: bool) -> AppResult<(Manifest, Vec<SourceRoot>)> {
     if selected.is_empty() {
-        return Err(AppError::BadRequest("请选择文件或目录".into()));
+        return Err(AppError::BadRequest("Select files or directories".into()));
     }
     let started = Instant::now();
     let mut scanner = SourceScanner::new(selected)?;
@@ -249,7 +245,7 @@ pub fn collect(selected: Vec<String>, verify_hash: bool) -> AppResult<(Manifest,
     tracing::info!(
         entries = manifest.entries.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "已采集完整发送清单"
+        "Collected the complete send manifest"
     );
     Ok((manifest, roots))
 }
@@ -266,7 +262,7 @@ pub fn source_path_from_roots(
     let root = roots
         .iter()
         .find(|r| relative == r.name || relative.starts_with(&format!("{}/", r.name)))
-        .ok_or_else(|| AppError::Other(format!("源文件位置缺失：{relative}")))?;
+        .ok_or_else(|| AppError::Other(format!("Source file location is missing: {relative}")))?;
     let mut path = PathBuf::from(&root.path);
     for part in relative[root.name.len()..]
         .split('/')
@@ -294,14 +290,17 @@ pub async fn read_entry_chunk_with(
         let meta = tokio::fs::symlink_metadata(&path).await?;
         paths::ensure_plain_meta(&meta)?;
         if meta.len() != entry.size || modified(&meta) != entry.modified_ms {
-            return Err(AppError::Conflict(format!("源文件已变化：{}", entry.path)));
+            return Err(AppError::Conflict(format!(
+                "Source file changed: {}",
+                entry.path
+            )));
         }
     }
     let mut data = vec![0; length];
     let short_read = |error: std::io::Error| -> AppResult<Vec<u8>> {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
             Err(AppError::Conflict(format!(
-                "读取期间源文件变化：{}",
+                "Source file changed while being read: {}",
                 entry.path
             )))
         } else {
@@ -324,11 +323,13 @@ pub async fn read_entry_chunk_with(
             }
         }
     }
-    // Check mutations at file boundaries, not after every intermediate chunk.
     if offset + length as u64 == entry.size {
         let meta = tokio::fs::metadata(&path).await?;
         if meta.len() != entry.size || modified(&meta) != entry.modified_ms {
-            return Err(AppError::Conflict(format!("读取期间源文件变化：{}", entry.path)));
+            return Err(AppError::Conflict(format!(
+                "Source file changed while being read: {}",
+                entry.path
+            )));
         }
     }
     Ok(data)
@@ -437,9 +438,9 @@ mod fingerprint_tests {
         assert_eq!(
             suffix,
             expected[2..],
-            "从已落库游标恢复后，剩余清单必须与完整扫描的后缀逐项一致"
+            "After resuming from the persisted cursor, the remaining manifest must match the suffix of a full scan"
         );
-        assert_eq!(2 + suffix.len(), expected.len(), "恢复扫描不得漏项或多项");
+        assert_eq!(2 + suffix.len(), expected.len(), "Recovery scan must not omit or add entries");
 
         let mut invalid = SourceScanner::new(vec![first.to_string_lossy().into_owned()]).unwrap();
         assert!(invalid.resume_after(2, "first/not-a.txt").is_err());

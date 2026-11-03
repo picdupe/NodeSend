@@ -1,4 +1,5 @@
 import { invoke } from './runtime';
+import i18next from 'i18next';
 import type { ConflictPolicy, NetworkStatus, Peer, PreviewStatus, TaskEntriesPage } from '../types/network';
 export const getNetworkStatus = () => invoke<NetworkStatus>('get_network_status');
 export const chooseSendFiles = (directory = false, kind: 'files' | 'media' | 'apps' = 'files') => invoke<string[]>('choose_send_files', { directory, kind });
@@ -22,14 +23,27 @@ export const setAndroidMediaLibraryEnabled = (enabled: boolean) => invoke<void>(
 export const requestMediaLibraryPermission = () => invoke<boolean>('request_media_library_permission');
 export function errorText(error: unknown): string {
   const raw = typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error);
-  if (/10051|无法连接的网络|network is unreachable/i.test(raw)) {
-    return '暂时无法连接这台设备。请确认对方已打开 NodeSend，并且两台设备连接到同一网络。';
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  if (/10051|network is unreachable/i.test(raw)) {
+    return i18next.t('transfer.connectionUnreachable', { ns: 'errors' });
   }
-  if (/10061|connection refused|拒绝连接/i.test(raw)) {
-    return '对方设备没有接受连接。请确认 NodeSend 正在运行，并检查防火墙设置。';
+  if (/10061|connection refused/i.test(raw)) {
+    return i18next.t('transfer.connectionRefused', { ns: 'errors' });
   }
-  if (/timed? out|超时/i.test(raw)) {
-    return '连接设备超时。请确认对方在线，并检查网络和防火墙。';
+  if (/timed? out/i.test(raw)) {
+    return i18next.t('transfer.timedOut', { ns: 'errors' });
+  }
+  const categories: Record<string, string> = {
+    DB_ERROR: 'database', IO_ERROR: 'io', CRYPTO_ERROR: 'crypto', CERT_ERROR: 'certificate',
+    BAD_REQUEST: 'invalidRequest', NOT_FOUND: 'notFound', FORBIDDEN: 'forbidden',
+    CONFLICT: 'conflict', INTERNAL: 'unknown',
+  };
+  const category = categories[code];
+  if (category) {
+    return i18next.t(`generic.${category}`, { ns: 'errors' });
+  }
+  if (/[\u3400-\u9fff]/.test(raw) && !i18next.language.startsWith('zh-CN')) {
+    return i18next.t('generic.unknown', { ns: 'errors' });
   }
   return raw;
 }

@@ -37,9 +37,8 @@ pub fn list(db: &Db) -> AppResult<Vec<TrustedNode>> {
 
 /// 添加 Trust（已存在则更新显示名称）。
 pub fn add(db: &Db, node_id: &str, display_name: Option<String>) -> AppResult<()> {
-    if node_id.trim().is_empty() {
-        return Err(AppError::BadRequest("node_id 不能为空".into()));
-    }
+    let node_id = crate::identity::node_identity::normalize_node_id(node_id)
+        .ok_or_else(|| AppError::BadRequest("node_id cannot be empty".into()))?;
     let now = Utc::now().to_rfc3339();
     db.with_conn(|conn| {
         conn.execute(
@@ -54,13 +53,17 @@ pub fn add(db: &Db, node_id: &str, display_name: Option<String>) -> AppResult<()
 
 /// 移除 Trust。
 pub fn remove(db: &Db, node_id: &str) -> AppResult<()> {
+    let node_id = crate::identity::node_identity::normalize_node_id(node_id)
+        .ok_or_else(|| AppError::BadRequest("Invalid Node ID".into()))?;
     db.with_conn(|conn| {
         let affected = conn.execute(
             "DELETE FROM trusted_nodes WHERE node_id=?1",
             params![node_id],
         )?;
         if affected == 0 {
-            return Err(AppError::NotFound(format!("未信任的 Node: {node_id}")));
+            return Err(AppError::NotFound(format!(
+                "Untrusted Node: {node_id}"
+            )));
         }
         conn.execute(
             "DELETE FROM settings WHERE key=?1",

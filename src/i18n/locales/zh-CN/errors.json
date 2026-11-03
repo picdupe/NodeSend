@@ -1,0 +1,37 @@
+{
+  "generic": {
+    "unexpected": "发生意外错误，请重试。",
+    "invalidResponse": "服务返回了无效响应。",
+    "operationFailed": "操作未成功：{{reason}}",
+    "database": "数据库操作失败。",
+    "io": "文件操作失败。",
+    "crypto": "身份或密钥操作失败。",
+    "certificate": "证书验证失败。",
+    "invalidRequest": "请求参数无效。",
+    "notFound": "找不到请求的内容。",
+    "forbidden": "此操作不被允许。",
+    "conflict": "操作与当前状态冲突。",
+    "unknown": "操作失败，请重试。"
+  },
+  "transfer": {
+    "connectionFailed": "无法连接到设备 {{device}}",
+    "sendFailed": "传输失败：{{reason}}",
+    "sourceChanged": "源文件已被修改：{{file}}",
+    "noFiles": "没有可发送的文件。",
+    "connectionUnreachable": "暂时无法连接这台设备。请确认对方已打开 NodeSend，并且两台设备连接到同一网络。",
+    "connectionRefused": "对方设备没有接受连接。请确认 NodeSend 正在运行，并检查防火墙设置。",
+    "timedOut": "连接设备超时。请确认对方在线，并检查网络和防火墙。"
+  },
+  "settings": {
+    "saveFailed": "保存设置失败：{{reason}}",
+    "favoriteSaveFailed": "无法保存收藏夹，请检查应用存储空间后重试。",
+    "invalidLanguage": "不支持所选语言。"
+  },
+  "update": {
+    "desktopOnly": "更新功能仅在桌面应用中可用。",
+    "manifestIncomplete": "Android 更新清单内容不完整。"
+  },
+  "preview": {
+    "nativeRequired": "当前为界面预览，此操作需要原生服务；不会连接设备或读写真实文件。"
+  }
+}

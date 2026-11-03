@@ -1,4 +1,3 @@
-//! Apply the same canonical path boundary to every DAV filesystem operation.
 use dav_server::{
     davpath::DavPath,
     fs::{

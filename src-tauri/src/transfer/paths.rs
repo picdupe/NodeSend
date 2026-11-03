@@ -1,5 +1,4 @@
-//! Reject traversal, ADS, symlinks/reparse points and Windows device names on all OSes.
-use super::model::{ConflictPolicy, TaskRecord};
+use super::model::{ConflictPolicy, FileEntry, TaskRecord};
 use crate::error::{AppError, AppResult};
 use std::{
     collections::HashMap,
@@ -25,8 +24,18 @@ pub fn android_media_directory(path: &str) -> &'static str {
         .to_ascii_lowercase();
     if matches!(
         extension.as_str(),
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "avif"
-            | "dng" | "tif" | "tiff"
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "heic"
+            | "heif"
+            | "avif"
+            | "dng"
+            | "tif"
+            | "tiff"
     ) {
         "Pictures/NodeSend"
     } else if matches!(
@@ -36,8 +45,7 @@ pub fn android_media_directory(path: &str) -> &'static str {
         "Movies/NodeSend"
     } else if matches!(
         extension.as_str(),
-        "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "opus" | "wma" | "amr"
-            | "mid" | "midi"
+        "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "opus" | "wma" | "amr" | "mid" | "midi"
     ) {
         "Music/NodeSend"
     } else {
@@ -77,7 +85,7 @@ pub fn validate_component(part: &str) -> AppResult<()> {
     Ok(())
 }
 fn invalid() -> AppError {
-    AppError::BadRequest("文件路径包含越界、保留名称或非法字符".into())
+    AppError::BadRequest("File path contains traversal, a reserved name, or invalid characters".into())
 }
 /// 判定一份**未跟随符号链接**的元数据是否为普通项：拒绝符号链接与 Windows 重解析点。
 ///
@@ -85,13 +93,13 @@ fn invalid() -> AppError {
 /// 从而避免对同一路径重复发起一次 stat（遍历路径上每条目省一次文件系统调用）。
 pub fn ensure_plain_meta(meta: &std::fs::Metadata) -> AppResult<()> {
     if meta.file_type().is_symlink() {
-        return Err(AppError::Forbidden("不允许符号链接".into()));
+        return Err(AppError::Forbidden("Symbolic links are not allowed".into()));
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         if meta.file_attributes() & 0x400 != 0 {
-            return Err(AppError::Forbidden("不允许重解析点".into()));
+            return Err(AppError::Forbidden("Reparse points are not allowed".into()));
         }
     }
     Ok(())
@@ -145,7 +153,7 @@ pub fn ensure_under(root: &Path, path: &Path) -> AppResult<()> {
 pub fn validate_destination(raw: &str) -> AppResult<()> {
     let path = Path::new(raw);
     if raw.trim().is_empty() || !path.is_absolute() || raw.contains('\0') {
-        return Err(AppError::BadRequest("接收目录必须是绝对路径".into()));
+        return Err(AppError::BadRequest("Receive directory must be an absolute path".into()));
     }
     Ok(())
 }
@@ -161,13 +169,9 @@ pub fn destination_for_use(raw: &str) -> AppResult<PathBuf> {
 pub fn destination(raw: &str) -> AppResult<PathBuf> {
     let path = Path::new(raw);
     if !path.is_absolute() || !path.is_dir() {
-        return Err(AppError::BadRequest("请选择已存在的接收目录".into()));
+        return Err(AppError::BadRequest("Select an existing receive directory".into()));
     }
-    // Android's shared-storage paths (for example /storage/emulated/0) may
-    // contain platform-owned aliases. Resolve the user-selected directory
-    // first, then apply the symlink/reparse-point checks to the real path.
-    // This keeps the transfer boundary enforced while avoiding a false
-    // rejection of Android's storage mount aliases.
+    // 解析规范路径，并检查其祖先路径是否为符号链接或 Windows 重解析点。
     let real = path.canonicalize()?;
     for part in real.ancestors() {
         ensure_plain(part)?;
@@ -198,6 +202,11 @@ pub fn plan_targets(
         used.insert(candidate.to_lowercase());
         roots.insert(top.to_string(), candidate);
     }
+    let skipped_roots: std::collections::HashSet<_> = roots
+        .iter()
+        .filter(|(_, name)| matches!(policy, ConflictPolicy::Skip) && root.join(name).exists())
+        .map(|(top, _)| top.clone())
+        .collect();
     let mut result = Vec::new();
     for entry in &task.manifest.entries {
         let included = selected.is_none_or(|s| {
@@ -212,17 +221,20 @@ pub fn plan_targets(
             continue;
         }
         let (top, tail) = entry.path.split_once('/').unwrap_or((&entry.path, ""));
+        if skipped_roots.contains(top) {
+            result.push(None);
+            continue;
+        }
         let mut target = root.join(&roots[top]);
         if !tail.is_empty() {
             target.push(tail);
         }
         ensure_under(root, &target)?;
-        if target.exists() && !entry.directory && matches!(policy, ConflictPolicy::Skip) {
-            result.push(None);
-            continue;
-        }
         if target.exists() && (entry.directory != target.is_dir()) {
-            return Err(AppError::Conflict(format!("路径类型冲突：{}", entry.path)));
+            return Err(AppError::Conflict(format!(
+                "Path type conflicts with {}",
+                entry.path
+            )));
         }
         result.push(Some(target.to_string_lossy().into_owned()));
     }
@@ -232,16 +244,13 @@ pub fn stage(task: &TaskRecord) -> AppResult<PathBuf> {
     let root = PathBuf::from(
         task.destination
             .as_deref()
-            .ok_or_else(|| AppError::Forbidden("任务尚未接受".into()))?,
+            .ok_or_else(|| AppError::Forbidden("Task has not been accepted".into()))?,
     );
     let stage = root.join(".nodesend-partials").join(&task.id);
     ensure_under(&root, &stage)?;
     Ok(stage)
 }
 
-/// Remove only the partial directory owned by this task. The task destination
-/// and the generated task id are both validated before removal so cancelling a
-/// transfer can never broaden cleanup to the receive root.
 pub fn cleanup_stage(task: &TaskRecord) -> AppResult<()> {
     let stage = stage(task)?;
     if stage.exists() {
@@ -264,22 +273,276 @@ pub fn safe_component(raw: &str) -> String {
         .collect()
 }
 
-/// 某任务在缓存盘上的根目录（`<cache_root>/<safe task id>`）。
-pub fn cache_task(cache_root: &Path, task_id: &str) -> PathBuf {
+/// 缓存名称中的 Node ID 前缀：统一使用带连字符、带校验位的规范 Node ID。
+/// 旧记录（64 位十六进制）无法规整时退化为安全化截断，保证仍可构造路径。
+fn node_prefix(node_id: &str) -> String {
+    if let Some(canonical) = crate::identity::node_identity::normalize_node_id(node_id) {
+        return canonical;
+    }
+    let compact: String = node_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(24)
+        .collect();
+    if compact.is_empty() {
+        "node".into()
+    } else {
+        compact
+    }
+}
+
+/// 拆分文件名与扩展名（不处理多段压缩扩展名：缓存名称只要求稳定与唯一）。
+fn split_extension(name: &str) -> (String, String) {
+    match name.rfind('.') {
+        Some(position) if position > 0 && name.len() - position <= 17 => {
+            (name[..position].to_string(), name[position..].to_string())
+        }
+        _ => (name.to_string(), String::new()),
+    }
+}
+
+/// 清理单个文件名：控制字符、路径分隔符与 Windows 非法字符替换为 `_`，
+/// 去掉结尾的 `.`/空格，规避 Windows 保留名称，并按字符数限长（保留扩展名）。
+pub fn sanitize_file_name(raw: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            cleaned.push('_');
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    let cleaned = cleaned
+        .trim_end_matches(|c: char| c == '.' || c == ' ')
+        .to_string();
+    let mut cleaned = if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    };
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        cleaned.insert(0, '_');
+    }
+    const MAX_CHARS: usize = 120;
+    if cleaned.chars().count() > MAX_CHARS {
+        let (name, extension) = split_extension(&cleaned);
+        let room = MAX_CHARS.saturating_sub(extension.chars().count());
+        let head: String = name.chars().take(room).collect();
+        cleaned = format!("{head}{extension}");
+    }
+    cleaned
+}
+
+/// 单个文件在缓存盘上的名称：`<NodeID>-<文件名>`，同名条目追加稳定序号：
+/// `duplicate` 是同一基名在本任务清单中已分配的条目数（0 表示首个）。
+pub fn cache_name(node_id: &str, display_name: &str, duplicate: usize) -> String {
+    let prefix = node_prefix(node_id);
+    let part = sanitize_file_name(display_name);
+    if duplicate == 0 {
+        return format!("{prefix}-{part}");
+    }
+    let (stem, extension) = split_extension(&part);
+    format!("{prefix}-{stem}-{}{extension}", duplicate + 1)
+}
+
+/// 按清单顺序为条目分配稳定缓存名称。
+///
+/// `seq` 为「基名 → 已分配数量」的计数器，调用方跨页复用，
+/// 因此同一份清单分多页到达时序号依然连续，且重启后可由清单重建。
+pub fn assign_cache_names(
+    entries: &mut [FileEntry],
+    node_id: &str,
+    seq: &mut std::collections::HashMap<String, usize>,
+) {
+    for entry in entries.iter_mut() {
+        if entry.directory {
+            entry.cache_name.clear();
+            continue;
+        }
+        if entry.name.is_empty() {
+            entry.name = display_name(entry);
+        }
+        let key = sanitize_file_name(&entry.name).to_ascii_lowercase();
+        let duplicate = {
+            let counter = seq.entry(key).or_insert(0);
+            let assigned = *counter;
+            *counter += 1;
+            assigned
+        };
+        let top = entry.path.split('/').next().unwrap_or(&entry.name);
+        let expected_prefix = format!("{}-{}--", node_id, sanitize_file_name(top));
+        if !entry.cache_name.starts_with(&expected_prefix) {
+            let top = sanitize_file_name(top);
+            let inner = cache_name(node_id, &entry.name, duplicate);
+            entry.cache_name = format!("{node_id}-{top}--{inner}");
+        }
+    }
+}
+
+/// 任务缓存目录：`<cache_root>/<safe task id>`。
+pub fn cache_task(cache_root: &Path, task: &TaskRecord) -> PathBuf {
+    task.manifest
+        .entries
+        .iter()
+        .find(|entry| !entry.directory && !entry.cache_name.is_empty())
+        .map(|entry| cache_dir_named(cache_root, &task.id, Some(&entry.cache_name)))
+        .unwrap_or_else(|| cache_task_dir(cache_root, &task.id))
+}
+
+pub fn cache_task_dirs(cache_root: &Path, task: &TaskRecord) -> Vec<PathBuf> {
+    let mut dirs = std::collections::BTreeSet::new();
+    for entry in &task.manifest.entries {
+        if entry.directory || entry.cache_name.is_empty() {
+            continue;
+        }
+        dirs.insert(cache_dir_named(
+            cache_root,
+            &task.id,
+            Some(&entry.cache_name),
+        ));
+    }
+    if dirs.is_empty() {
+        dirs.insert(cache_task_dir(cache_root, &task.id));
+    }
+    dirs.into_iter().collect()
+}
+
+/// 只依赖任务 ID 的缓存目录路径（热路径与目录清理使用，不触碰清单）。
+pub fn cache_task_dir(cache_root: &Path, task_id: &str) -> PathBuf {
     cache_root.join(safe_component(task_id))
 }
 
-/// 缓存分段文件：`<cache_root>/<task>/<file>.<segment>.seg`。
-/// 分段是为了在 Windows 上能「从头部」回收已转写的数据（Windows 无法截断文件头部）。
-pub fn cache_segment(cache_root: &Path, task_id: &str, file: usize, segment: u64) -> PathBuf {
-    cache_task(cache_root, task_id).join(format!("{file}.{segment}.seg"))
+/// 由已持久化的清单重建「基名 → 已分配数量」计数器。
+///
+/// 重启后新到达的清单分页要继续分配序号，不能从 0 重来；由于清单本身
+/// 已保存每条的缓存名称，按清单顺序重新计数即可得到与首次分配一致的计数。
+pub fn rebuild_cache_name_seq(entries: &[FileEntry]) -> HashMap<String, usize> {
+    let mut seq = HashMap::new();
+    for entry in entries {
+        if entry.directory || entry.cache_name.is_empty() {
+            continue;
+        }
+        let key = sanitize_file_name(&display_name(entry)).to_ascii_lowercase();
+        *seq.entry(key).or_insert(0) += 1;
+    }
+    seq
 }
 
-/// Completed file assembled on the cache volume before it is copied to the
-/// destination volume. Keeping this separate from the destination `.part`
-/// prevents the mechanical disk from seeing network-sized writes.
-pub fn cache_file(cache_root: &Path, task_id: &str, file: usize) -> PathBuf {
-    cache_task(cache_root, task_id).join(format!("{file}.file"))
+/// 条目显示名：优先使用清单中持久化的 `name`，旧清单回退到路径最后一段。
+pub fn display_name(entry: &FileEntry) -> String {
+    if !entry.name.is_empty() {
+        return entry.name.clone();
+    }
+    entry
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&entry.path)
+        .to_string()
+}
+
+/// 该文件持久化的稳定缓存名称；`None` 表示任务没有可用的缓存映射。
+pub fn cache_name_of(task: &TaskRecord, file: usize) -> Option<&str> {
+    task.manifest
+        .entries
+        .get(file)
+        .map(|entry| entry.cache_name.as_str())
+        .filter(|name| !name.is_empty())
+}
+
+/// 缓存分段文件：`<cache_root>/<task>/<缓存名>.<segment>.seg`。
+/// 分段是为了在 Windows 上能「从头部」回收已转写的数据（Windows 无法截断文件头部）。
+pub fn cache_segment(cache_root: &Path, task: &TaskRecord, file: usize, segment: u64) -> PathBuf {
+    cache_segment_named(
+        cache_root,
+        &task.id,
+        file,
+        cache_name_of(task, file),
+        segment,
+        task.manifest.entries[file].size,
+    )
+}
+
+pub fn cache_file(cache_root: &Path, task: &TaskRecord, file: usize) -> PathBuf {
+    cache_file_named(cache_root, &task.id, file, cache_name_of(task, file))
+}
+
+/// 已解析缓存名称的分段路径（热路径用，避免为每个块克隆清单）。
+pub fn cache_segment_named(
+    cache_root: &Path,
+    task_id: &str,
+    file: usize,
+    cache_name: Option<&str>,
+    segment: u64,
+    size: u64,
+) -> PathBuf {
+    let dir = cache_dir_named(cache_root, task_id, cache_name);
+    if size <= super::relay::SEG_BYTES {
+        return match cache_name {
+            Some(name) => dir.join(format!("{}.seg", cache_file_stem(name))),
+            None => dir.join(format!("{file}.seg")),
+        };
+    }
+    match cache_name {
+        Some(name) => dir.join(format!("{}.{}.seg", cache_file_stem(name), segment)),
+        None => dir.join(format!("{file}.{segment}.seg")),
+    }
+}
+
+/// 已解析缓存名称的组装文件路径（热路径用）。
+pub fn cache_file_named(
+    cache_root: &Path,
+    task_id: &str,
+    file: usize,
+    cache_name: Option<&str>,
+) -> PathBuf {
+    let dir = cache_dir_named(cache_root, task_id, cache_name);
+    match cache_name {
+        Some(name) => dir.join(cache_file_name(name)),
+        None => dir.join(format!("{file}.file")),
+    }
+}
+
+/// 缓存文件的发布日志路径：与缓存文件同名，扩展改为 `.journal`。
+pub fn cache_journal_named(
+    cache_root: &Path,
+    task_id: &str,
+    file: usize,
+    cache_name: Option<&str>,
+) -> PathBuf {
+    let dir = cache_dir_named(cache_root, task_id, cache_name);
+    match cache_name {
+        Some(name) => dir.join(format!("{}.journal", cache_file_name(name))),
+        None => dir.join(format!("{file}.journal")),
+    }
+}
+
+fn cache_dir_named(cache_root: &Path, task_id: &str, cache_name: Option<&str>) -> PathBuf {
+    let key = cache_name
+        .and_then(|name| name.split_once("--").map(|(dir, _)| dir))
+        .or(cache_name)
+        .unwrap_or(task_id);
+    cache_root.join(safe_component(key))
+}
+
+fn cache_file_name(cache_name: &str) -> String {
+    if let Some((_, inner)) = cache_name.split_once("--") {
+        return cache_file_name(inner);
+    }
+    cache_name
+        .splitn(6, '-')
+        .nth(5)
+        .map(str::to_string)
+        .unwrap_or_else(|| cache_name.to_string())
+}
+
+fn cache_file_stem(cache_name: &str) -> String {
+    cache_file_name(cache_name)
 }
 
 /// 两个路径是否位于同一卷（同卷说明缓存与目标共用一块盘，中转只会加倍 I/O，
@@ -312,8 +575,6 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
 
 fn numbered_name(name: &str, directory: bool, number: usize) -> String {
     if !directory {
-        // Treat a tar archive and its compression suffix as one extension.
-        // Compare case-insensitively while preserving the original spelling.
         let lower = name.to_ascii_lowercase();
         for suffix in [
             ".tar.gz",
@@ -349,9 +610,133 @@ fn numbered_name(name: &str, directory: bool, number: usize) -> String {
 mod tests {
     use super::numbered_name;
 
+    const NODE: &str = "7K3M-9Q2V-XB5N-4T8H-R6";
+
+    #[test]
+    fn cache_names_use_node_prefix_and_stable_duplicates() {
+        assert_eq!(
+            super::cache_name(NODE, "photo.jpg", 0),
+            "7K3M-9Q2V-XB5N-4T8H-R6-photo.jpg"
+        );
+        assert_eq!(
+            super::cache_name(NODE, "photo.jpg", 1),
+            "7K3M-9Q2V-XB5N-4T8H-R6-photo-2.jpg"
+        );
+        assert_eq!(
+            super::cache_name(NODE, "CON.txt", 0),
+            "7K3M-9Q2V-XB5N-4T8H-R6-_CON.txt"
+        );
+        assert_eq!(
+            super::cache_name(NODE, "bad:name?.txt", 0),
+            "7K3M-9Q2V-XB5N-4T8H-R6-bad_name_.txt"
+        );
+    }
+
+    #[test]
+    fn duplicate_numbers_continue_from_the_persisted_manifest() {
+        use crate::transfer::model::FileEntry;
+        let mut entries = vec![
+            FileEntry {
+                path: "a/photo.jpg".into(),
+                ..Default::default()
+            },
+            FileEntry {
+                path: "b/photo.jpg".into(),
+                ..Default::default()
+            },
+        ];
+        let mut seq = std::collections::HashMap::new();
+        super::assign_cache_names(&mut entries, NODE, &mut seq);
+        assert_eq!(
+            entries[0].cache_name,
+            "7K3M-9Q2V-XB5N-4T8H-R6-a--7K3M-9Q2V-XB5N-4T8H-R6-photo.jpg"
+        );
+        assert_eq!(
+            entries[1].cache_name,
+            "7K3M-9Q2V-XB5N-4T8H-R6-b--7K3M-9Q2V-XB5N-4T8H-R6-photo-2.jpg"
+        );
+        // 后续清单分页按已持久化清单重建序号，从 3 继续而非从 0 重来。
+        let mut page = vec![FileEntry {
+            path: "c/photo.jpg".into(),
+            ..Default::default()
+        }];
+        let mut seq = super::rebuild_cache_name_seq(&entries);
+        super::assign_cache_names(&mut page, NODE, &mut seq);
+        assert_eq!(
+            page[0].cache_name,
+            "7K3M-9Q2V-XB5N-4T8H-R6-c--7K3M-9Q2V-XB5N-4T8H-R6-photo-3.jpg"
+        );
+    }
+
+    #[test]
+    fn files_under_one_top_level_folder_share_cache_directory() {
+        use crate::transfer::model::FileEntry;
+        use std::path::Path;
+        let mut entries = vec![
+            FileEntry {
+                path: "CentOS-Stream-10/a.iso".into(),
+                name: "a.iso".into(),
+                ..Default::default()
+            },
+            FileEntry {
+                path: "CentOS-Stream-10/CHECKSUM".into(),
+                name: "CHECKSUM".into(),
+                ..Default::default()
+            },
+            FileEntry {
+                path: "other/b.iso".into(),
+                name: "b.iso".into(),
+                ..Default::default()
+            },
+        ];
+        super::assign_cache_names(&mut entries, NODE, &mut std::collections::HashMap::new());
+        let root = Path::new("D:/cache");
+        let first = super::cache_segment_named(
+            root,
+            "task",
+            0,
+            Some(&entries[0].cache_name),
+            0,
+            8 * 1024 * 1024,
+        );
+        let second =
+            super::cache_segment_named(root, "task", 1, Some(&entries[1].cache_name), 0, 4096);
+        let third =
+            super::cache_segment_named(root, "task", 2, Some(&entries[2].cache_name), 0, 4096);
+        assert_eq!(first.parent(), second.parent());
+        assert_ne!(first.parent(), third.parent());
+        assert_eq!(first.file_name().unwrap(), "a.iso.0.seg");
+        assert_eq!(second.file_name().unwrap(), "CHECKSUM.seg");
+        let boundary = super::cache_segment_named(
+            root,
+            "task",
+            0,
+            Some(&entries[0].cache_name),
+            0,
+            super::super::relay::SEG_BYTES,
+        );
+        assert_eq!(boundary.file_name().unwrap(), "a.iso.seg");
+        let next = super::cache_segment_named(
+            root,
+            "task",
+            0,
+            Some(&entries[0].cache_name),
+            1,
+            super::super::relay::SEG_BYTES + 1,
+        );
+        assert_eq!(next.file_name().unwrap(), "a.iso.1.seg");
+        assert_eq!(
+            first.parent().unwrap().file_name().unwrap(),
+            "7K3M-9Q2V-XB5N-4T8H-R6-CentOS-Stream-10"
+        );
+    }
+
     #[test]
     fn rename_preserves_file_extension_and_directory_names() {
-        assert_eq!(numbered_name("报告.pdf", false, 1), "报告 (1).pdf");
+        assert_eq!(
+            numbered_name("report.pdf", false, 1),
+            "report (1).pdf"
+        );
         assert_eq!(numbered_name("photo.JPG", false, 2), "photo (2).JPG");
         assert_eq!(
             numbered_name("archive.tar.gz", false, 1),
@@ -362,8 +747,8 @@ mod tests {
             "tar.br", "tar.Z", "TAR.GZ",
         ] {
             assert_eq!(
-                numbered_name(&format!("资料.v2.{suffix}"), false, 2),
-                format!("资料.v2 (2).{suffix}")
+                numbered_name(&format!("report.v2.{suffix}"), false, 2),
+                format!("report.v2 (2).{suffix}")
             );
         }
         assert_eq!(
@@ -376,6 +761,9 @@ mod tests {
         );
         assert_eq!(numbered_name("README", false, 1), "README (1)");
         assert_eq!(numbered_name(".gitignore", false, 1), ".gitignore (1)");
-        assert_eq!(numbered_name("资料.v2", true, 1), "资料.v2 (1)");
+        assert_eq!(
+            numbered_name("report.v2", true, 1),
+            "report.v2 (1)"
+        );
     }
 }

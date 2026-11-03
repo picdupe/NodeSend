@@ -1,21 +1,24 @@
 import type { NetworkStatus, TransferTask } from '../types/network';
 import type { BrowserConnection, BrowserListing } from '../types/browser';
+import i18next from 'i18next';
 
 const remote = 'b'.repeat(64);
-const entries = [{ path: '设计稿.pdf', size: 2400000, modified_ms: 0, directory: false }, { path: '封面.png', size: 850000, modified_ms: 0, directory: false }];
-const task: TransferTask = { id: 'preview-incoming', peer_id: remote, peer_name: '示例笔记本', direction: 'receive', status: 'waiting', scan_complete: true, top_level_count: entries.length, file_count: entries.length, directory_count: 0, total_bytes: 3250000, completed_bytes: 0, transport: 'quic', error: null, destination: null, events: ['示例接收请求'], created_at: new Date().toISOString(), verify_hash: false, android_media_library: false, receive_directories: [] };
+const entries = [{ path: 'design.pdf', size: 2400000, modified_ms: 0, directory: false }, { path: 'cover.png', size: 850000, modified_ms: 0, directory: false }];
+const task: TransferTask = { id: 'preview-incoming', peer_id: remote, peer_name: 'Sample laptop', direction: 'receive', status: 'waiting', scan_complete: true, top_level_count: entries.length, file_count: entries.length, directory_count: 0, total_bytes: 3250000, completed_bytes: 0, transport: 'quic', error: null, destination: null, events: ['Sample receive request'], created_at: new Date().toISOString(), verify_hash: false, android_media_library: false, receive_directories: [] };
 const state: NetworkStatus = {
-  node_id: 'a'.repeat(64), display_name: '界面预览', tcp_port: 58082, quic_port: 58082,
+  node_id: 'a'.repeat(64), display_name: 'Preview device', tcp_port: 58082, quic_port: 58082,
   addresses: ['192.0.2.1'], receive_directory: 'Downloads/NodeSend', cache_directory: '', receive_policy: 'ask', media_library_enabled: false,
   discovery: { mdns: false, udp: false, warnings: [] },
-  peers: ['示例笔记本', '示例手机', '示例离线设备'].map((display_name, i) => ({ node_id: [remote, 'c'.repeat(64), 'd'.repeat(64)][i], display_name, endpoints: [{ address: `192.0.2.${i + 2}`, tcp_port: 58082, quic_port: 58082, source: 'preview', last_seen: Date.now() / 1000, error: null }], online: i < 2, trusted: i === 0, verified: true })),
-  tasks: [task, { ...task, id: 'preview-history', direction: 'send', status: 'completed', completed_bytes: 3250000, events: ['示例传输记录'] }],
+  peers: ['Sample laptop', 'Sample phone', 'Sample offline device'].map((display_name, i) => ({ node_id: [remote, 'c'.repeat(64), 'd'.repeat(64)][i], display_name, endpoints: [{ address: `192.0.2.${i + 2}`, tcp_port: 58082, quic_port: 58082, source: 'preview', last_seen: Date.now() / 1000, error: null }], online: i < 2, trusted: i === 0, verified: true })),
+  tasks: [task, { ...task, id: 'preview-history', direction: 'send', status: 'completed', completed_bytes: 3250000, events: ['Sample transfer record'] }],
 };
-const connections: BrowserConnection[] = [{ id: 'preview-files', name: '示例文件', protocol: 'webdav', address: 'https://example.invalid', username: null, read_only: true, connected: true }];
+const connections: BrowserConnection[] = [{ id: 'preview-files', name: 'Sample files', protocol: 'webdav', address: 'https://example.invalid', username: null, read_only: true, connected: true }];
+let uiLanguage = 'system';
 
-// Memory-only fixtures. Refreshing the page resets all preview changes.
 export async function previewInvoke(command: string, args: Record<string, unknown>): Promise<unknown> {
   switch (command) {
+    case 'get_ui_language': return uiLanguage;
+    case 'set_ui_language': uiLanguage = String(args.language); return;
     case 'get_network_status': return state;
     case 'get_node_info': return { node_id: state.node_id, http_enabled: false, http_listen: '' };
     case 'list_shares': return [];
@@ -32,7 +35,7 @@ export async function previewInvoke(command: string, args: Record<string, unknow
     case 'remove_peer': state.peers = state.peers.filter(p => p.node_id !== args.nodeId); return;
     case 'send_files': {
       const id = `preview-${Date.now()}`;
-      state.tasks.unshift({ ...task, id, direction: 'send', peer_id: String(args.peerId), peer_name: state.peers.find(p => p.node_id === args.peerId)?.display_name ?? '示例设备', events: ['界面预览：未实际发送文件'] }); return id;
+      state.tasks.unshift({ ...task, id, direction: 'send', peer_id: String(args.peerId), peer_name: state.peers.find(p => p.node_id === args.peerId)?.display_name ?? 'Sample device', events: ['Preview only; no files were sent'] }); return id;
     }
     case 'decide_incoming_transfer': {
       const item = state.tasks.find(t => t.id === args.id);
@@ -45,6 +48,6 @@ export async function previewInvoke(command: string, args: Record<string, unknow
     case 'list_browser_connections': return connections;
     case 'browse_browser': return { connection_id: String(args.id), path: String(args.path), can_write: false, entries: entries.map(e => ({ name: e.path, path: e.path, is_dir: false, size: e.size, modified: task.created_at, can_write: false })) } satisfies BrowserListing;
     case 'close_browser': { const item = connections.find(c => c.id === args.id); if (item) item.connected = false; return; }
-    default: throw new Error('当前为界面预览，此操作需要原生服务；不会连接设备或读写真实文件。');
+    default: throw new Error(i18next.t('preview.nativeRequired', { ns: 'errors' }));
   }
 }

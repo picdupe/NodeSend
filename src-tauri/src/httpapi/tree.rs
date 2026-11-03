@@ -78,7 +78,7 @@ fn collect_children(
     let entries = match std::fs::read_dir(real_dir) {
         Ok(entries) => entries,
         Err(err) => {
-            tracing::warn!(dir = %real_dir.display(), "目录读取失败，已跳过: {err}");
+            tracing::warn!(dir = %real_dir.display(), "Failed to read directory; skipped: {err}");
             return Ok(());
         }
     };
@@ -91,7 +91,7 @@ fn collect_children(
             Err(_) => continue,
         };
         if !child_real.starts_with(base_real) {
-            tracing::warn!(path = %child_real.display(), "检测到越界路径（可能为符号链接），已跳过");
+            tracing::warn!(path = %child_real.display(), "Detected a path traversal (possibly a symbolic link); skipped");
             continue;
         }
         let child_name = match entry.file_name().into_string() {

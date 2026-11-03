@@ -3,8 +3,6 @@ import { errorText, previewCancel, previewStatus, previewTransfer } from '../api
 import type { PreviewStatus } from '../types/network';
 
 /**
- * Send selection and preview scanning belong to the app lifetime, not to the
- * SendPanel lifetime. Navigating to another page must not stop the scan.
  */
 export function useSendSelection() {
   const [paths, setPaths] = useState<string[]>([]);
@@ -46,8 +44,6 @@ export function useSendSelection() {
       }
     }
 
-    // Start or reuse the backend scan for this exact selection, then poll it
-    // from App-owned state so navigation never tears down this lifecycle.
     void previewTransfer(paths).then(status => {
       if (!alive) return;
       setManifest(status);

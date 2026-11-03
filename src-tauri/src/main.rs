@@ -1,15 +1,33 @@
-//! 文件功能：NodeSend 可执行程序入口。
-//!
-//! - 只负责调用 lib 中的 run()，不写任何业务逻辑（基线 §53：
-//!   Root/main 文件只负责组合、注册、启动）；
-//! - 桌面端（Windows/Linux/macOS）由本入口启动 Tauri UI + Service；
-//!   Android/iOS 由 Tauri 移动端构建直接使用 lib，不走本文件。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 fn main() {
-    #[cfg(target_os = "windows")]
-    if !nodesend_lib::single_instance::acquire() {
-        return;
+    match std::env::args().nth(1).as_deref() {
+        Some("--service-host") => std::process::exit(nodesend_lib::process_host::run_service()),
+        Some("--cli-entry") => std::process::exit(nodesend_lib::process_host::run_cli_entry()),
+        Some("--gui-client") => {
+            nodesend_lib::process_host::init_gui_log();
+            tracing::info!(pid = std::process::id(), "GUI entry process started");
+            #[cfg(windows)]
+            if !nodesend_lib::single_instance::acquire_gui() {
+                tracing::info!("Another GUI instance owns the GUI lock");
+                return;
+            }
+            #[cfg(unix)]
+            if !nodesend_lib::cli::local_unix::acquire_gui().unwrap_or(false) {
+                tracing::info!("Another GUI instance owns the GUI lock");
+                return;
+            }
+            tracing::info!("GUI instance lock acquired");
+            nodesend_lib::run();
+        }
+        _ if nodesend_lib::cli::is_cli_invocation() => {
+            std::process::exit(nodesend_lib::cli::run(false))
+        }
+        _ => {
+            if !nodesend_lib::cli::has_gui_environment() {
+                eprintln!("{}", nodesend_lib::cli::cli_translate("noGuiEnvironment"));
+                std::process::exit(1);
+            }
+            std::process::exit(nodesend_lib::process_host::launch_gui());
+        }
     }
-    nodesend_lib::run();
 }

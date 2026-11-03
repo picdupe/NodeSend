@@ -1,23 +1,23 @@
 {
-  "version": "0.1.5-build.128",
-  "notes": "Repair\n· Fix persistent transfer sessions and add pending receive notifications",
+  "version": "0.1.6-build.129",
+  "notes": "Added a shared background service and CLI commands.\nImproved transfer status synchronization, reconnection, cache publishing, and file retransmission.\nAdded partial completion manifests and support for empty files.\nUpdated the Node ID format and cache naming.\nAdded Chinese, English, and Japanese localization, including system tray language switching.",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0N3TzhHZnBzWUljV2NXMjdtM3lkZklPZ2gvb0F1SW82akJCUmRRYU4rWmJqRGtxYkFnaENnUUZCL04xMmdOV3R0Qit3S0ZXVllsY1kzZ2M2UjZjQXdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjUxNzg1CWZpbGU6Tm9kZVNlbmRfMC4xLjUtYnVpbGQuMTI4X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNS1idWlsZC4xMjgKdHFlVG5HYUdXSHhJZ0d3MXJJbGxTZkNscER2ZndTT0tkRFhWckZiRC9SRUpHMDh1dlQ2ZGVqTFRRNFNaTVpXT0pwa0dzK1RwbVNSR1VGUENwNEVDRGc9PQo=",
-      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_0.1.5.128_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR002Z1hSdjdHVWQ3YlpwaDdrSTZpSk1GajVkMzVKeU9abktJS01FRmhVbDA0ZDlDR2JnY0paQTUvQ3A1eTB6cm1XQSs4VFFKVHI2ZFlOSjI5Vkx3QVFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzIyOTI4CWZpbGU6Tm9kZVNlbmRfMC4xLjYtYnVpbGQuMTI5X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNi1idWlsZC4xMjkKNzFFckRvaHluTlZaZ0hMcHJyWEwwOUNETy9kcGY3bUdOMS9Pb2R4SHZMNkx1eVZuYTQybzRHQXgvZFhXbmlGSmk2M210Tk80NTlaa1RGcER3WW4rQ1E9PQo=",
+      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.6/NodeSend_0.1.6.129_x64-setup.exe",
       "fallback_urls": [
-        "https://github.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_0.1.5.128_x64-setup.exe"
+        "https://github.com/picdupe/NodeSend/releases/download/v0.1.6/NodeSend_0.1.6.129_x64-setup.exe"
       ]
     }
   },
   "release_page_url": "https://gitcode.com/picdupe/NodeSend/releases",
   "android": {
-    "version": "0.1.5.128",
-    "versionCode": 1050128,
-    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_v0.1.5.128-arm64-v8a-release.apk",
+    "version": "0.1.6.129",
+    "versionCode": 1060129,
+    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.6/NodeSend_v0.1.6.129-arm64-v8a-release.apk",
     "fallbackUrls": [
-      "https://github.com/picdupe/NodeSend/releases/download/v0.1.5/NodeSend_v0.1.5.128-arm64-v8a-release.apk"
+      "https://github.com/picdupe/NodeSend/releases/download/v0.1.6/NodeSend_v0.1.6.129-arm64-v8a-release.apk"
     ],
-    "sha256": "a61c197f696951a98d4a1dc84c8c207aed93fabcf198840181075bf4e98d29a4"
+    "sha256": "b74b98cbc47470039d7f42ecce73dc313f1210aff71638623797240a0a99ecab"
   }
 }

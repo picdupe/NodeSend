@@ -5,8 +5,6 @@
 //! - 后续按 §21 支持自定义各类存储位置，初版使用统一数据目录。
 use std::path::PathBuf;
 
-/// Windows uses %APPDATA%/NodeSend; other platforms use Tauri's data directory.
-/// This only resolves a path and never moves or copies existing profiles.
 pub fn app_data_dir(_tauri_dir: PathBuf) -> std::io::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {

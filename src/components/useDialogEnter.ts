@@ -1,6 +1,5 @@
 import { useEffect } from 'react';
 
-/** Only the top dialog handles Enter, including when its background has focus. */
 export function useDialogEnter(active: boolean, confirm: () => void) {
   useEffect(() => {
     if (!active) return;

@@ -3,7 +3,11 @@
     "createUpdaterArtifacts": false,
     "windows": {
       "nsis": {
-        "compression": "none"
+        "compression": "none",
+        "customLanguageFiles": {
+          "SimpChinese": "../scripts/nsis/SimpChinese.nsh",
+          "English": "../scripts/nsis/English.nsh"
+        }
       }
     }
   }

@@ -5,21 +5,22 @@ import { localDeviceIcon } from '../utils/device';
 import { frontendPreview } from '../api/runtime';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useReceiveDecision } from '../hooks/useReceiveDecision';
+import { useTranslation } from 'react-i18next';
 export type PageKey = 'send' | 'receive' | 'transfers' | 'dashboard' | 'shares' | 'trusted';
-const mainItems: { key: PageKey; label: string; icon: IconName }[] = [{ key: 'send', label: '发送', icon: 'send' }, { key: 'receive', label: '接收', icon: 'receive' }, { key: 'transfers', label: '传输记录', icon: 'tasks' }];
-const extraItems: { key: PageKey; label: string; icon: IconName }[] = [{ key: 'shares', label: '共享中心', icon: 'folder' }, { key: 'trusted', label: '信任设备', icon: 'shield' }];
-const settingsItem: { key: PageKey; label: string; icon: IconName } = { key: 'dashboard', label: '设置', icon: 'gear' };
+const mainItems: { key: PageKey; label: string; icon: IconName }[] = [{ key: 'send', label: 'nav.send', icon: 'send' }, { key: 'receive', label: 'nav.receive', icon: 'receive' }, { key: 'transfers', label: 'nav.transfers', icon: 'tasks' }];
+const extraItems: { key: PageKey; label: string; icon: IconName }[] = [{ key: 'shares', label: 'nav.shares', icon: 'folder' }, { key: 'trusted', label: 'nav.trusted', icon: 'shield' }];
+const settingsItem: { key: PageKey; label: string; icon: IconName } = { key: 'dashboard', label: 'nav.settings', icon: 'gear' };
 /** 移动端侧栏按钮由各页面放进 .page-heading-actions，与刷新、发现按钮处于同一操作区。 */
 const SidebarToggleContext = createContext<ReactNode>(null);
 export function SidebarToggle() { return <>{useContext(SidebarToggleContext)}</>; }
 export function AppLayout({ current, onNavigate, status, refresh, children }: { current: PageKey; onNavigate: (page: PageKey) => void; status: NetworkStatus | null; refresh: () => Promise<void>; children: ReactNode }) {
+  const { t } = useTranslation('common');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [dismissedRequest, setDismissedRequest] = useState<string | null>(null);
   const [visibleRequest, setVisibleRequest] = useState<TransferTask | null>(null);
   const receiveDecision = useReceiveDecision(refresh);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
-  // Horizontal swipes open or close the mobile drawer without blocking scrolling.
   useEffect(() => {
     const onStart = (event: TouchEvent) => {
       const touch = event.touches[0];
@@ -65,28 +66,25 @@ export function AppLayout({ current, onNavigate, status, refresh, children }: { 
   const cancelledByPeer = request?.status === 'cancelled' || request?.status === 'cancelling';
   async function answerRequest(accepted: boolean) {
     if (!request || !status || cancelledByPeer || receiveDecision.busy) return;
-    // Dismiss the operator's prompt immediately on rejection; the sender keeps
-    // its session open to display the rejected result.
     if (!accepted) setDismissedRequest(request.id);
     try {
       await receiveDecision.decide(request.id, accepted, status.receive_directory, 'rename', null, false);
       if (accepted) setDismissedRequest(request.id);
     } catch {
-      // Restore a failed rejection so its error remains visible and retryable.
       if (!accepted) setDismissedRequest(null);
     }
   }
-  const nav = (items: typeof mainItems) => items.map(item => <button key={item.key} className={'nav-item ' + (current === item.key ? 'active' : '')} onClick={() => { onNavigate(item.key); setSidebarOpen(false); }} aria-current={current === item.key ? 'page' : undefined}><Icon name={item.icon} /><span>{item.label}</span>{item.key === 'receive' && pending > 0 && <span className="nav-badge">{pending}</span>}</button>);
-  const sidebarToggle = <span className="sidebar-controls"><button type="button" className="icon-button mobile-sidebar-toggle" aria-controls="app-sidebar" aria-expanded={sidebarOpen} aria-label={sidebarOpen ? '关闭导航' : '打开导航'} onClick={() => setSidebarOpen(value => !value)}><Icon name={sidebarOpen ? 'close' : 'menu'} /></button></span>;
-  return <div className={'app-layout' + (sidebarCollapsed ? ' sidebar-collapsed' : '')}><header className="custom-titlebar" data-tauri-drag-region /><div className="app-shell"><aside id="app-sidebar" className={'sidebar ' + (sidebarOpen ? 'open' : '')}><div className="app-brand"><button type="button" className="brand-symbol rail-toggle" aria-controls="app-sidebar" aria-expanded={!sidebarCollapsed} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} onClick={() => setSidebarCollapsed(value => !value)}><i /><i /><i /><Icon name="panel-left" /></button><span className="brand-symbol brand-mark" aria-hidden="true"><i /><i /><i /></span><div>NodeSend</div></div><nav aria-label="主导航" className="nav-list">{nav(mainItems)}{nav(extraItems)}</nav><div className="sidebar-bottom">{nav([settingsItem])}<div className="sidebar-device"><span className="device-icon"><Icon name={localDeviceIcon()} /></span><div><strong>{status?.display_name ?? '本机设备'}</strong></div></div></div></aside>{sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} /> }<main className="content"><SidebarToggleContext.Provider value={sidebarToggle}><div className="page-scroll-region">{children}</div></SidebarToggleContext.Provider></main>{request && <div className="untrusted-receive-overlay" role="presentation"><section className="untrusted-receive-screen" role="alertdialog" aria-modal="true" aria-labelledby="global-receive-title"><div className="untrusted-receive-body"><div className="untrusted-device-icon"><Icon name={request.peer_device_type === 'android' || request.peer_device_type === 'ios' ? 'phone' : 'device'} size={74} /></div><div className="untrusted-receive-name">{request.peer_name}</div><div className="untrusted-receive-device-meta">{senderIp && <span>#{senderIp}</span>}{vendor && <span>{vendor}</span>}</div><p className="untrusted-receive-message">想给你发送 <strong>{request.directory_count > 0 ? '一个文件夹' : request.file_count === 1 ? '一个文件' : '多个文件'}</strong>{request.directory_count > 0 && <><br />共 {request.file_count - request.directory_count} 个文件</>}</p></div>
+  const nav = (items: typeof mainItems) => items.map(item => <button key={item.key} className={'nav-item ' + (current === item.key ? 'active' : '')} onClick={() => { onNavigate(item.key); setSidebarOpen(false); }} aria-current={current === item.key ? 'page' : undefined}><Icon name={item.icon} /><span>{t(item.label)}</span>{item.key === 'receive' && pending > 0 && <span className="nav-badge">{pending}</span>}</button>);
+  const sidebarToggle = <span className="sidebar-controls"><button type="button" className="icon-button mobile-sidebar-toggle" aria-controls="app-sidebar" aria-expanded={sidebarOpen} aria-label={sidebarOpen ? t('shell.closeNav') : t('shell.openNav')} onClick={() => setSidebarOpen(value => !value)}><Icon name={sidebarOpen ? 'close' : 'menu'} /></button></span>;
+  return <div className={'app-layout' + (sidebarCollapsed ? ' sidebar-collapsed' : '')}><header className="custom-titlebar" data-tauri-drag-region /><div className="app-shell"><aside id="app-sidebar" className={'sidebar ' + (sidebarOpen ? 'open' : '')}><div className="app-brand"><button type="button" className="brand-symbol rail-toggle" aria-controls="app-sidebar" aria-expanded={!sidebarCollapsed} aria-label={sidebarCollapsed ? t('shell.expandNav') : t('shell.collapseNav')} onClick={() => setSidebarCollapsed(value => !value)}><i /><i /><i /><Icon name="panel-left" /></button><span className="brand-symbol brand-mark" aria-hidden="true"><i /><i /><i /></span><div>NodeSend</div></div><nav aria-label={t('nav.main')} className="nav-list">{nav(mainItems)}{nav(extraItems)}</nav><div className="sidebar-bottom">{nav([settingsItem])}<div className="sidebar-device"><span className="device-icon"><Icon name={localDeviceIcon()} /></span><div><strong>{status?.display_name ?? t('device.local')}</strong></div></div></div></aside>{sidebarOpen && <button className="sidebar-backdrop" aria-label={t('shell.closeNav')} onClick={() => setSidebarOpen(false)} /> }<main className="content"><SidebarToggleContext.Provider value={sidebarToggle}><div className="page-scroll-region">{children}</div></SidebarToggleContext.Provider></main>{request && <div className="untrusted-receive-overlay" role="presentation"><section className="untrusted-receive-screen" role="alertdialog" aria-modal="true" aria-labelledby="global-receive-title"><div className="untrusted-receive-body"><div className="untrusted-device-icon"><Icon name={request.peer_device_type === 'android' || request.peer_device_type === 'ios' ? 'phone' : 'device'} size={74} /></div><div className="untrusted-receive-name">{request.peer_name}</div><div className="untrusted-receive-device-meta">{senderIp && <span>#{senderIp}</span>}{vendor && <span>{vendor}</span>}</div><p className="untrusted-receive-message">{t('shell.requestFiles')} <strong>{request.directory_count > 0 ? t('shell.oneFolder') : request.file_count === 1 ? t('shell.oneFile') : t('shell.manyFiles')}</strong>{request.directory_count > 0 && <><br />{t('shell.fileCount', { count: request.file_count - request.directory_count })}</>}</p></div>
         <div className="untrusted-receive-footer">
           {receiveDecision.error && <div className="notice error">{receiveDecision.error}</div>}
           {cancelledByPeer ? <>
-            <p className="untrusted-cancel-message" role="status">对方已取消发送</p>
-            <div className="untrusted-receive-actions cancelled"><button type="button" className="primary" onClick={() => setDismissedRequest(request.id)}><Icon name="close" size={17} />关闭</button></div>
+            <p className="untrusted-cancel-message" role="status">{t('shell.peerCancelled')}</p>
+            <div className="untrusted-receive-actions cancelled"><button type="button" className="primary" onClick={() => setDismissedRequest(request.id)}><Icon name="close" size={17} />{t('actions.close')}</button></div>
           </> : <>
-            <button type="button" className="untrusted-settings-button" onClick={() => { setDismissedRequest(request.id); onNavigate('receive'); }}><Icon name="settings" size={17} />设置</button>
-            <div className="untrusted-receive-actions"><button type="button" className="danger" disabled={receiveDecision.busy} onClick={() => void answerRequest(false)}><Icon name="close" size={17} />拒绝</button><button type="button" className="primary" disabled={receiveDecision.busy} onClick={() => void answerRequest(true)}><Icon name="check" size={17} />接受</button></div>
+            <button type="button" className="untrusted-settings-button" onClick={() => { setDismissedRequest(request.id); onNavigate('receive'); }}><Icon name="settings" size={17} />{t('shell.settings')}</button>
+            <div className="untrusted-receive-actions"><button type="button" className="danger" disabled={receiveDecision.busy} onClick={() => void answerRequest(false)}><Icon name="close" size={17} />{t('actions.decline')}</button><button type="button" className="primary" disabled={receiveDecision.busy} onClick={() => void answerRequest(true)}><Icon name="check" size={17} />{t('actions.accept')}</button></div>
           </>}
         </div></section></div>}</div></div>;
 }
@@ -94,10 +92,11 @@ export function AppLayout({ current, onNavigate, status, refresh, children }: { 
 /** 桌面窗口按钮：所有页面统一放在页头图标按钮区的最右侧。 */
 export function WindowControls() {
   if (frontendPreview) return null;
+  const { t } = useTranslation('common');
   return <>
-    <button type="button" className="icon-button window-control-button" aria-label="最小化" onClick={() => void getCurrentWindow().minimize()}><Icon name="window-minimize" /></button>
-    <button type="button" className="icon-button window-control-button" aria-label="最大化/还原" onClick={() => void getCurrentWindow().toggleMaximize()}><Icon name="window-maximize" /></button>
-    <button type="button" className="icon-button window-control-button window-close" aria-label="关闭" onClick={() => void getCurrentWindow().close()}><Icon name="close" /></button>
+    <button type="button" className="icon-button window-control-button" aria-label={t('shell.minimize')} onClick={() => void getCurrentWindow().minimize()}><Icon name="window-minimize" /></button>
+    <button type="button" className="icon-button window-control-button" aria-label={t('shell.maximize')} onClick={() => void getCurrentWindow().toggleMaximize()}><Icon name="window-maximize" /></button>
+    <button type="button" className="icon-button window-control-button window-close" aria-label={t('actions.close')} onClick={() => void getCurrentWindow().close()}><Icon name="close" /></button>
   </>;
 }
 

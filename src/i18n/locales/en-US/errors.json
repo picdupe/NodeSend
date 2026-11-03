@@ -1,0 +1,37 @@
+{
+  "generic": {
+    "unexpected": "Something went wrong. Please try again.",
+    "invalidResponse": "The service returned an invalid response.",
+    "operationFailed": "Operation failed: {{reason}}",
+    "database": "The database operation failed.",
+    "io": "The file operation failed.",
+    "crypto": "An identity or key operation failed.",
+    "certificate": "Certificate validation failed.",
+    "invalidRequest": "The request is invalid.",
+    "notFound": "The requested item was not found.",
+    "forbidden": "This operation is not allowed.",
+    "conflict": "The operation conflicts with the current state.",
+    "unknown": "The operation failed. Please try again."
+  },
+  "transfer": {
+    "connectionFailed": "Could not connect to {{device}}",
+    "sendFailed": "Transfer failed: {{reason}}",
+    "sourceChanged": "Source file changed: {{file}}",
+    "noFiles": "There are no files to send.",
+    "connectionUnreachable": "Could not reach this device. Make sure NodeSend is open on the other device and both devices are on the same network.",
+    "connectionRefused": "The other device refused the connection. Make sure NodeSend is running and check the firewall settings.",
+    "timedOut": "The connection timed out. Make sure the other device is online and check the network and firewall."
+  },
+  "settings": {
+    "saveFailed": "Could not save settings: {{reason}}",
+    "favoriteSaveFailed": "Could not save favorites. Check the app's available storage and try again.",
+    "invalidLanguage": "The selected language is not supported."
+  },
+  "update": {
+    "desktopOnly": "Updates are available only in the desktop app.",
+    "manifestIncomplete": "The Android update manifest is incomplete."
+  },
+  "preview": {
+    "nativeRequired": "This preview action requires the native service. It will not connect to devices or read or write real files."
+  }
+}

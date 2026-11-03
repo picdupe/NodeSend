@@ -17,8 +17,6 @@ export function useNetwork() {
       for (const task of data.tasks) {
         const previous = samples.current.get(task.id);
         const active = task.status === 'transferring';
-        // This is the rate of acknowledged completed-byte growth, not raw NIC
-        // throughput; storage sync and cache relay can affect the measurement.
         task.bytes_per_second = active && previous?.active && now > previous.time
           ? Math.max(0, task.completed_bytes - previous.bytes) * 1000 / (now - previous.time) : 0;
         next.set(task.id, { bytes: task.completed_bytes, time: now, active });
@@ -29,8 +27,6 @@ export function useNetwork() {
     catch (err) {
       if (mounted.current) {
         setError(errorText(err));
-        // Do not keep presenting an old rate as if it were current while the
-        // status endpoint is unavailable. Preserve task details for context.
         setStatus(previous => previous ? {
           ...previous,
           tasks: previous.tasks.map(task => ({ ...task, bytes_per_second: 0 })),

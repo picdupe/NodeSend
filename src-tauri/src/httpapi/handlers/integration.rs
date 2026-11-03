@@ -37,25 +37,24 @@ pub struct ShareUrlResponse {
     url: String,
 }
 
-/// GET /api/v1/integration/share-url
 pub async fn share_url(
     Host(host): Host,
     State(state): State<HttpState>,
     Query(query): Query<IntegrationQuery>,
     headers: HeaderMap,
 ) -> AppResult<Json<ShareUrlResponse>> {
-    let share_id = query
-        .share_id
-        .ok_or_else(|| AppError::BadRequest("缺少 share_id 参数".into()))?;
+    let share_id = query.share_id.ok_or_else(|| {
+        AppError::BadRequest("Missing share_id parameter".into())
+    })?;
 
     let share = share_repo::get_by_id(&state.db, &share_id)?;
     if share.protocol != crate::share::ShareProtocol::Nodesend {
-        return Err(AppError::NotFound("请使用该共享配置的协议访问".into()));
+        return Err(AppError::NotFound("Use the protocol configured for this share".into()));
     }
     if let Some(name) = &query.name {
         if name != &share.name {
             return Err(AppError::BadRequest(format!(
-                "name 与共享名称不匹配: 期望 {}，实际 {name}",
+                "name does not match the share name: expected {}, got {name}",
                 share.name
             )));
         }

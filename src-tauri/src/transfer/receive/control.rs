@@ -1,4 +1,3 @@
-//! Incoming transfer protocol control-message dispatch.
 use super::super::{model::incoming_id, paths, relay, TransferService};
 use crate::{
     error::{AppError, AppResult},
@@ -15,6 +14,56 @@ impl TransferService {
         transport: &str,
     ) -> AppResult<Response> {
         match request {
+            Request::PrepareFile { id, file } => {
+                let id = incoming_id(peer, &id);
+                self.admit_cached_file(&id, file).await?;
+                let status = self.status_of(&id)?;
+                if !["accepted", "transferring"].contains(&status.as_str()) {
+                    return self.remote_state(&id);
+                }
+                Ok(Response::Ack)
+            }
+            Request::RecoveryProbe { id, epoch } => {
+                let id = incoming_id(peer, &id);
+                self.edit(&id, |t| {
+                    if epoch > t.remote_recovery_epoch {
+                        t.remote_recovery_epoch = epoch;
+                        t.recovery_epoch = t.recovery_epoch.saturating_add(1);
+                    }
+                })?;
+                self.recovery_probe(&id).await
+            }
+            Request::RecoveryAck { id, epoch, repair } => {
+                let id = incoming_id(peer, &id);
+                let gate = self.gate(&id);
+                let _guard = gate.lock().await;
+                if self.record(&id)?.recovery_epoch != epoch {
+                    return Err(AppError::Conflict(
+                        "Recovery acknowledgement uses a stale epoch".into(),
+                    ));
+                }
+                for file in repair {
+                    self.invalidate_file(&id, file)?;
+                }
+                self.edit(&id, |t| {
+                    t.checked_epoch = epoch;
+                })?;
+                Ok(Response::Ack)
+            }
+            Request::SourceIssue { id, file, kind } => {
+                let id = incoming_id(peer, &id);
+                self.set_source_issue(&id, file, &kind)?;
+                Ok(Response::Ack)
+            }
+            Request::ReplaceFile { id, file, entry } => {
+                let id = incoming_id(peer, &id);
+                self.await_writes(&id).await?;
+                let _writer = self.destination_writer.lock().await;
+                let gate = self.gate(&id);
+                let _guard = gate.lock().await;
+                self.replace_file_entry(&id, file, entry)?;
+                Ok(Response::Ack)
+            }
             Request::SkipFile { id, file } => {
                 let id = incoming_id(peer, &id);
                 let gate = self.gate(&id);
@@ -28,7 +77,7 @@ impl TransferService {
                     .entries
                     .get(file)
                     .filter(|e| !e.directory)
-                    .ok_or_else(|| AppError::BadRequest("文件编号非法".into()))?;
+                    .ok_or_else(|| AppError::BadRequest("Invalid file index".into()))?;
                 let part = paths::stage(&task)?.join(format!("{file}.part"));
                 paths::ensure_plain(&part)?;
                 match tokio::fs::remove_file(&part).await {
@@ -40,7 +89,10 @@ impl TransferService {
                     if let Some(cache_root) = self.cache_root_for_task(&id) {
                         for segment in 0..entry.size.div_ceil(relay::SEG_BYTES) {
                             let _ = tokio::fs::remove_file(paths::cache_segment(
-                                &cache_root, &id, file, segment,
+                                &cache_root,
+                                &task,
+                                file,
+                                segment,
                             ))
                             .await;
                         }
@@ -52,20 +104,23 @@ impl TransferService {
                 }
                 Ok(Response::Ack)
             }
-            Request::Offer { id, summary } => self.offer(peer, name, device_type, &id, summary, transport).await,
+            Request::Offer { id, summary } => {
+                self.offer(peer, name, device_type, &id, summary, transport)
+                    .await
+            }
             Request::Reconnect { id } => {
                 let id = super::super::model::incoming_id(peer, &id);
                 let gate = self.gate(&id);
                 let _lock = gate.lock().await;
                 if self.status_of(&id).is_ok() {
                     let task = self.record(&id)?;
-                    // Never override a manual pause. Interrupted tasks with an
-                    // already selected destination can safely continue resuming.
-                    if task.status == "interrupted" && task.destination.is_some() {
+                    if ["interrupted", "manual_reconnecting"].contains(&task.status.as_str())
+                        && task.destination.is_some()
+                    {
                         self.edit(&id, |task| {
                             task.status = "accepted".into();
                             task.error = None;
-                            task.event("发送方已重连，接收任务已自动恢复");
+                            task.event("The sender reconnected. Receiving resumed automatically");
                         })?;
                     }
                     self.remote_state(&id)
@@ -95,11 +150,16 @@ impl TransferService {
                 self.action(&incoming_id(peer, &id), "resume").await?;
                 self.remote_state(&incoming_id(peer, &id))
             }
-            Request::TaskState { id, revision, status } => {
-                self.apply_remote_state(peer, &id, revision, &status).await?;
+            Request::TaskState {
+                id,
+                revision,
+                status,
+            } => {
+                self.apply_remote_state(peer, &id, revision, &status)
+                    .await?;
                 Ok(Response::Ack)
             }
-            _ => Err(AppError::BadRequest("错误的会话消息顺序".into())),
+            _ => Err(AppError::BadRequest("Invalid session message order".into())),
         }
     }
 }

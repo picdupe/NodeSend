@@ -13,8 +13,10 @@ import {
 } from '../api/ipc';
 import type { TrustedNode } from '../types';
 import { SidebarToggle, WindowControls } from '../components/AppLayout';
+import { useTranslation } from 'react-i18next';
 
 export function TrustedPage() {
+  const { t, i18n } = useTranslation('common');
   const [nodes, setNodes] = useState<TrustedNode[]>([]);
   const [message, setMessage] = useState('');
 
@@ -54,7 +56,7 @@ export function TrustedPage() {
       </header>
 
       <section className="card">
-        <h2>添加信任 Node</h2>
+        <h2>{t('trusted.addHeading')}</h2>
         <form
           className="share-form"
           onSubmit={(event) => {
@@ -62,21 +64,21 @@ export function TrustedPage() {
             onAdd(event.currentTarget);
           }}
         >
-          <input name="node_id" placeholder="对端 Node ID" required />
-          <input name="display_name" placeholder="显示名称（可选）" />
-          <button type="submit">添加</button>
+          <input name="node_id" placeholder={t('trusted.peerId')} required />
+          <input name="display_name" placeholder={t('trusted.displayNameOptional')} />
+          <button type="submit">{t('trusted.submit')}</button>
         </form>
       </section>
 
       <section className="card">
-        <h2>已信任 Node（{nodes.length}）</h2>
+        <h2>{t('trusted.list', { count: nodes.length })}</h2>
         <table className="table">
           <thead>
             <tr>
               <th>Node ID</th>
-              <th>显示名称</th>
-              <th>添加时间</th>
-              <th>操作</th>
+              <th>{t('trusted.displayName')}</th>
+              <th>{t('trusted.addedAt')}</th>
+              <th>{t('trusted.actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -84,14 +86,14 @@ export function TrustedPage() {
               <tr key={node.node_id}>
                 <td className="mono">{node.node_id}</td>
                 <td>{node.display_name ?? '-'}</td>
-                <td>{new Date(node.created_at).toLocaleString('zh-CN')}</td>
+                <td>{new Date(node.created_at).toLocaleString(i18n.language)}</td>
                 <td>
                   <button
                     type="button"
                     className="danger"
                     onClick={() => onRemove(node)}
                   >
-                    移除
+                    {t('trusted.remove')}
                   </button>
                 </td>
               </tr>

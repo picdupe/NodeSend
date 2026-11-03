@@ -48,6 +48,7 @@ def sync() -> None:
     replace_one(ROOT / "package-lock.json", r'("name": "nodesend",\s*"version": ")[^"]+', rf'\g<1>{semver}', "package-lock root version")
     replace_one(ROOT / "package-lock.json", r'("": \{\s*"name": "nodesend",\s*"version": ")[^"]+', rf'\g<1>{semver}', "package-lock package version")
     replace_one(ROOT / "src-tauri/tauri.conf.json", r'("version"\s*:\s*")[^"]+("\s*,)', rf'\g<1>{semver}\2', "Tauri version")
+    replace_one(ROOT / "scripts/nsis-hooks.nsh", r'(?m)^!define NODESEND_PUBLIC_VERSION "[^"]+"$', f'!define NODESEND_PUBLIC_VERSION "{version}"', "NSIS display version")
     replace_one(ROOT / "src-tauri/Cargo.toml", r'(?m)^(version\s*=\s*")[^"]+(")', rf'\g<1>{semver}\2', "Cargo package version")
     replace_one(ROOT / "src-tauri/Cargo.lock", r'(?m)(^name = "nodesend"\s+version = ")[^"]+(\")', rf'\g<1>{semver}\2', "Cargo lock package version")
     replace_one(ROOT / "src-tauri/gen/android/app/tauri.properties", r'(?m)^tauri\.android\.versionName=.*$', f"tauri.android.versionName={label}", "Android version name")

@@ -1,4 +1,3 @@
-//! Local-only native transfer commands. Private keys never cross IPC.
 use crate::{
     error::AppResult,
     network::{peers::Peer, NetworkManager, NetworkStatus},
@@ -19,6 +18,15 @@ pub struct TaskEntriesPage {
 #[tauri::command]
 pub async fn list_task_entries(
     network: State<'_, Arc<NetworkManager>>,
+    id: String,
+    offset: usize,
+    limit: usize,
+) -> AppResult<TaskEntriesPage> {
+    list_task_entries_service(network.inner().clone(), id, offset, limit).await
+}
+
+pub(crate) async fn list_task_entries_service(
+    network: Arc<NetworkManager>,
     id: String,
     offset: usize,
     limit: usize,
@@ -58,11 +66,32 @@ pub async fn request_media_library_permission(app: tauri::AppHandle) -> AppResul
 pub async fn get_network_status(
     network: State<'_, Arc<NetworkManager>>,
 ) -> AppResult<NetworkStatus> {
+    get_network_status_service(network.inner().clone()).await
+}
+
+pub(crate) async fn get_network_status_service(
+    network: Arc<NetworkManager>,
+) -> AppResult<NetworkStatus> {
     Ok(network.status())
 }
 #[tauri::command]
 pub async fn add_endpoint(
     network: State<'_, Arc<NetworkManager>>,
+    address: String,
+    expected_node_id: Option<String>,
+    allow_public: bool,
+) -> AppResult<Peer> {
+    add_endpoint_service(
+        network.inner().clone(),
+        address,
+        expected_node_id,
+        allow_public,
+    )
+    .await
+}
+
+pub(crate) async fn add_endpoint_service(
+    network: Arc<NetworkManager>,
     address: String,
     expected_node_id: Option<String>,
     allow_public: bool,
@@ -80,6 +109,25 @@ pub async fn send_files(
     allow_public: bool,
     preferred_address: Option<String>,
 ) -> AppResult<String> {
+    send_files_service(
+        network.inner().clone(),
+        peer_id,
+        paths,
+        verify_hash,
+        allow_public,
+        preferred_address,
+    )
+    .await
+}
+
+pub(crate) async fn send_files_service(
+    network: Arc<NetworkManager>,
+    peer_id: String,
+    paths: Vec<String>,
+    verify_hash: bool,
+    allow_public: bool,
+    preferred_address: Option<String>,
+) -> AppResult<String> {
     network
         .send(peer_id, paths, verify_hash, allow_public, preferred_address)
         .await
@@ -89,12 +137,40 @@ pub async fn cancel_send_preflight(
     network: State<'_, Arc<NetworkManager>>,
     peer_id: String,
 ) -> AppResult<()> {
+    cancel_send_preflight_service(network.inner().clone(), peer_id).await
+}
+
+pub(crate) async fn cancel_send_preflight_service(
+    network: Arc<NetworkManager>,
+    peer_id: String,
+) -> AppResult<()> {
     network.cancel_preflight(&peer_id);
     Ok(())
 }
 #[tauri::command]
 pub async fn decide_incoming_transfer(
     network: State<'_, Arc<NetworkManager>>,
+    id: String,
+    accepted: bool,
+    destination: Option<String>,
+    conflict: ConflictPolicy,
+    selected: Option<Vec<String>>,
+    trust_device: Option<bool>,
+) -> AppResult<()> {
+    decide_incoming_transfer_service(
+        network.inner().clone(),
+        id,
+        accepted,
+        destination,
+        conflict,
+        selected,
+        trust_device,
+    )
+    .await
+}
+
+pub(crate) async fn decide_incoming_transfer_service(
+    network: Arc<NetworkManager>,
     id: String,
     accepted: bool,
     destination: Option<String>,
@@ -116,6 +192,14 @@ pub async fn decide_incoming_transfer(
 #[tauri::command]
 pub async fn transfer_action(
     network: State<'_, Arc<NetworkManager>>,
+    id: String,
+    action: String,
+) -> AppResult<()> {
+    transfer_action_service(network.inner().clone(), id, action).await
+}
+
+pub(crate) async fn transfer_action_service(
+    network: Arc<NetworkManager>,
     id: String,
     action: String,
 ) -> AppResult<()> {
@@ -216,9 +300,9 @@ pub async fn read_clipboard_files(app: tauri::AppHandle) -> AppResult<Vec<String
 #[cfg(not(target_os = "android"))]
 pub async fn choose_send_files(directory: bool) -> AppResult<Vec<String>> {
     let picker = rfd::AsyncFileDialog::new().set_title(if directory {
-        "选择发送的目录"
+        "Select a directory to send"
     } else {
-        "选择发送的文件"
+        "Select files to send"
     });
     let files = if directory {
         picker.pick_folders().await
@@ -261,7 +345,7 @@ pub async fn take_shared_files() -> AppResult<Vec<String>> {
 #[cfg(not(target_os = "android"))]
 pub async fn choose_receive_directory() -> AppResult<Option<String>> {
     Ok(rfd::AsyncFileDialog::new()
-        .set_title("选择接收目录")
+        .set_title("Select a receive directory")
         .pick_folder()
         .await
         .map(|f| f.path().to_string_lossy().into_owned()))
@@ -282,6 +366,23 @@ pub async fn set_network_settings(
     cache_directory: String,
     policy: String,
 ) -> AppResult<()> {
+    set_network_settings_service(
+        network.inner().clone(),
+        name,
+        directory,
+        cache_directory,
+        policy,
+    )
+    .await
+}
+
+pub(crate) async fn set_network_settings_service(
+    network: Arc<NetworkManager>,
+    name: String,
+    directory: String,
+    cache_directory: String,
+    policy: String,
+) -> AppResult<()> {
     network.settings(name, directory, cache_directory, policy)
 }
 #[tauri::command]
@@ -289,11 +390,25 @@ pub fn set_android_media_library_enabled(
     network: State<'_, Arc<NetworkManager>>,
     enabled: bool,
 ) -> AppResult<()> {
+    set_android_media_library_enabled_service(network.inner().clone(), enabled)
+}
+
+pub(crate) fn set_android_media_library_enabled_service(
+    network: Arc<NetworkManager>,
+    enabled: bool,
+) -> AppResult<()> {
     network.set_android_media_library_enabled(enabled)
 }
 #[tauri::command]
 pub async fn remove_peer(
     network: State<'_, Arc<NetworkManager>>,
+    node_id: String,
+) -> AppResult<()> {
+    remove_peer_service(network.inner().clone(), node_id).await
+}
+
+pub(crate) async fn remove_peer_service(
+    network: Arc<NetworkManager>,
     node_id: String,
 ) -> AppResult<()> {
     network.cancel_preflight(&node_id);

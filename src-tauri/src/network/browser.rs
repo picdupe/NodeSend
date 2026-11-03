@@ -19,7 +19,7 @@ use tokio::{
 
 pub async fn connect(app: &AppService, peers: &PeerStore, node_id: &str) -> AppResult<Channel> {
     let peer = peers.get(node_id)?;
-    let mut last = String::from("NodeSend 设备没有可用地址");
+    let mut last = String::from("NodeSend device has no available address");
     for endpoint in &peer.endpoints {
         match transport::connect(app, endpoint, Some(node_id), false, false).await {
             Ok(mut channel) => match transport::hello(&mut channel, app).await {
@@ -50,7 +50,7 @@ pub async fn list(
         .await?
     {
         Response::Listing { entries } => Ok(entries),
-        _ => Err(AppError::Other("NodeSend 目录响应非法".into())),
+        _ => Err(AppError::Other("NodeSend directory response is invalid".into())),
     }
 }
 
@@ -63,9 +63,9 @@ pub async fn download(
     destination: &str,
 ) -> AppResult<()> {
     let (share_id, relative) = split_path(path);
-    let share_id = share_id.ok_or_else(|| AppError::BadRequest("请选择共享中的文件".into()))?;
+    let share_id = share_id.ok_or_else(|| AppError::BadRequest("Select a file in the share".into()))?;
     if relative.is_empty() {
-        return Err(AppError::BadRequest("请选择共享中的文件".into()));
+        return Err(AppError::BadRequest("Select a file in the share".into()));
     }
     let mut channel = connect(app, peers, node_id).await?;
     let length = match channel
@@ -77,12 +77,14 @@ pub async fn download(
         .await?
     {
         Response::File { length } => length,
-        _ => return Err(AppError::Other("NodeSend 文件响应非法".into())),
+        _ => return Err(AppError::Other("NodeSend file response is invalid".into())),
     };
     let mut file = fs::File::create(destination).await?;
     let copied = tokio::io::copy(&mut channel.reader.take(length), &mut file).await?;
     if copied != length {
-        return Err(AppError::Other("NodeSend 下载中断，文件不完整".into()));
+        return Err(AppError::Other(
+            "NodeSend download was interrupted; the file is incomplete".into(),
+        ));
     }
     file.flush().await?;
     Ok(())
@@ -97,9 +99,9 @@ pub async fn upload(
     local: &str,
 ) -> AppResult<()> {
     let (share_id, relative) = split_path(path);
-    let share_id = share_id.ok_or_else(|| AppError::BadRequest("请先进入目标共享".into()))?;
+    let share_id = share_id.ok_or_else(|| AppError::BadRequest("Enter the target share first".into()))?;
     if relative.is_empty() {
-        return Err(AppError::BadRequest("目标文件路径不能为空".into()));
+        return Err(AppError::BadRequest("Target file path cannot be empty".into()));
     }
     let mut file = fs::File::open(local).await?;
     let length = file.metadata().await?.len();
@@ -114,16 +116,16 @@ pub async fn upload(
         .await?
     {
         Response::Ready => {}
-        _ => return Err(AppError::Other("NodeSend 上传响应非法".into())),
+        _ => return Err(AppError::Other("NodeSend upload response is invalid".into())),
     }
     let copied = tokio::io::copy(&mut file, &mut channel.writer).await?;
     if copied != length {
-        return Err(AppError::Other("本地文件在上传过程中发生变化".into()));
+        return Err(AppError::Other("Local file changed during upload".into()));
     }
     channel.writer.flush().await?;
     match channel.response().await? {
         Response::Ack => Ok(()),
-        _ => Err(AppError::Other("NodeSend 上传确认非法".into())),
+        _ => Err(AppError::Other("NodeSend upload confirmation is invalid".into())),
     }
 }
 
@@ -143,7 +145,7 @@ fn checked_share(
 ) -> AppResult<ShareConfig> {
     let share = repository::get_by_id(&app.db, share_id)?;
     if share.protocol != crate::share::ShareProtocol::Nodesend {
-        return Err(AppError::NotFound("请使用该共享配置的协议访问".into()));
+        return Err(AppError::NotFound("Use the protocol configured for this share".into()));
     }
     authorize(
         &share,
@@ -184,7 +186,7 @@ pub fn browse(
     }
     let real = security::resolve_existing(share.path_ref(), &path)?;
     if !real.is_dir() {
-        return Err(AppError::BadRequest("请求路径不是目录".into()));
+        return Err(AppError::BadRequest("Request path is not a directory".into()));
     }
     let tree = crate::httpapi::tree::build_tree(&real, &path, 1)?;
     let entries = tree
@@ -215,7 +217,7 @@ pub async fn fetch(
     let file = fs::File::open(real).await?;
     let meta = file.metadata().await?;
     if !meta.is_file() {
-        return Err(AppError::BadRequest("下载目标不是文件".into()));
+        return Err(AppError::BadRequest("Download target is not a file".into()));
     }
     Ok((file, meta.len()))
 }

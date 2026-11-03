@@ -1,4 +1,3 @@
-//! Embedded protocol listeners. Each share owns its listener and credentials.
 use super::{AccessMode, ShareConfig, ShareProtocol};
 use crate::{
     error::{AppError, AppResult},
@@ -42,7 +41,7 @@ pub struct ProtocolManager {
 }
 
 fn failure(error: impl std::fmt::Display) -> AppError {
-    AppError::Other(format!("共享服务启动失败：{error}"))
+    AppError::Other(format!("Failed to start the sharing service: {error}"))
 }
 
 impl ProtocolManager {
@@ -105,7 +104,7 @@ impl ProtocolManager {
         }
         if share.access_mode == AccessMode::Trusted {
             return Err(AppError::BadRequest(
-                "第三方协议不支持 NodeSend 信任身份，请使用密码访问。".into(),
+                "Third-party protocols do not support NodeSend trusted identity; use password access.".into(),
             ));
         }
         let cancel = CancellationToken::new();
@@ -130,6 +129,7 @@ impl ProtocolManager {
                     dav,
                 };
                 let router = Router::new().fallback(any(webdav)).with_state(state);
+                let task_error = task_error.clone();
                 let task = tokio::spawn(async move {
                     if let Err(err) = axum::serve(listener, router)
                         .with_graceful_shutdown(signal.cancelled_owned())
@@ -142,7 +142,6 @@ impl ProtocolManager {
             }
             ShareProtocol::Smb => {
                 let backend = smb_server::LocalFsBackend::new(&share.path).map_err(failure)?;
-                // Stable wire share name also works when the display name contains punctuation.
                 let mut builder = smb_server::SmbServer::builder()
                     .listen(([0, 0, 0, 0], share.port).into())
                     .netbios_name("NODESEND");
@@ -169,8 +168,6 @@ impl ProtocolManager {
                 (port, task)
             }
             ShareProtocol::Ftp => {
-                // libunftp binds internally. Reserve/validate the port, then wait for its
-                // own greeting or task failure before reporting a successful start.
                 let reservation = TcpListener::bind(("0.0.0.0", share.port))
                     .await
                     .map_err(failure)?;
@@ -232,7 +229,7 @@ impl ProtocolManager {
                             .lock()
                             .await
                             .clone()
-                            .unwrap_or_else(|| "FTP 监听未就绪".into()),
+                            .unwrap_or_else(|| "FTP listener is not ready".into()),
                     ));
                 }
                 (port, task)
@@ -281,7 +278,7 @@ async fn webdav(State(state): State<DavState>, request: Request) -> Response {
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Basic realm=\"NodeSend\"")],
-            "共享已关闭或访问密码不正确",
+            "Sharing is disabled or the password is incorrect",
         )
             .into_response();
     }

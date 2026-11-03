@@ -3,7 +3,6 @@
 //! 命令分组：
 //! - 身份/服务状态：get_node_info、get_http_status、set_http_config
 //! - 共享管理：list_shares、create_share、update_share、delete_share、
-//!   toggle_share、rotate_share_token
 //! - Trust 管理：list_trusted_nodes、add_trusted_node、remove_trusted_node
 //!
 //! 约定：命令只做参数转发与 DTO 组装，不写业务规则。
@@ -28,11 +27,35 @@ pub struct NodeInfo {
     pub http_listen: String,
 }
 
+#[tauri::command]
+pub fn get_ui_language(state: State<'_, Arc<AppService>>) -> AppResult<String> {
+    Ok(state
+        .get_setting("ui_language")?
+        .unwrap_or_else(|| "system".to_string()))
+}
+
+#[tauri::command]
+pub fn set_ui_language(state: State<'_, Arc<AppService>>, language: String) -> AppResult<()> {
+    if !["system", "zh-CN", "zh-TW", "en-US", "ja-JP"].contains(&language.as_str()) {
+        return Err(crate::error::AppError::BadRequest(
+            "Unsupported UI language".into(),
+        ));
+    }
+    state.set_setting("ui_language", &language)
+}
+
 /// 查询本机 Node 身份与 HTTP 服务配置。
 #[tauri::command]
 pub async fn get_node_info(
     state: State<'_, Arc<AppService>>,
     http_manager: State<'_, Arc<crate::httpapi::HttpManager>>,
+) -> AppResult<NodeInfo> {
+    get_node_info_service(state.inner().clone(), http_manager.inner().clone()).await
+}
+
+pub(crate) async fn get_node_info_service(
+    state: Arc<AppService>,
+    http_manager: Arc<crate::httpapi::HttpManager>,
 ) -> AppResult<NodeInfo> {
     Ok(NodeInfo {
         node_id: state.identity.node_id.clone(),
@@ -46,6 +69,13 @@ pub async fn get_node_info(
 pub async fn start_share_link(
     state: State<'_, Arc<AppService>>,
     manager: State<'_, Arc<crate::httpapi::ShareLinkManager>>,
+) -> AppResult<u16> {
+    start_share_link_service(state.inner().clone(), manager.inner().clone()).await
+}
+
+pub(crate) async fn start_share_link_service(
+    state: Arc<AppService>,
+    manager: Arc<crate::httpapi::ShareLinkManager>,
 ) -> AppResult<u16> {
     manager.ensure(&state).await
 }
@@ -65,13 +95,19 @@ pub async fn set_http_config(
     http_manager: State<'_, Arc<crate::httpapi::HttpManager>>,
     config: HttpConfigInput,
 ) -> AppResult<()> {
+    set_http_config_service(state.inner().clone(), http_manager.inner().clone(), config).await
+}
+
+pub(crate) async fn set_http_config_service(
+    state: Arc<AppService>,
+    http_manager: Arc<crate::httpapi::HttpManager>,
+    config: HttpConfigInput,
+) -> AppResult<()> {
     let previous_enabled = state.http_enabled();
     let previous_listen = state.http_addr()?.to_string();
     let previous_running = http_manager.is_running().await;
 
     state.set_http_config(config.enabled, config.listen)?;
-    // Rebind on every explicit apply so changing the listen address takes
-    // effect immediately and never leaves a stale listener running.
     http_manager.stop().await;
     let result = if config.enabled {
         http_manager.apply(&state).await
@@ -91,12 +127,22 @@ pub async fn set_http_config(
 
 #[tauri::command]
 pub async fn list_shares(state: State<'_, Arc<AppService>>) -> AppResult<Vec<ShareConfig>> {
+    list_shares_service(state.inner().clone()).await
+}
+
+pub(crate) async fn list_shares_service(state: Arc<AppService>) -> AppResult<Vec<ShareConfig>> {
     share_repo::list_all(&state.db)
 }
 
 #[tauri::command]
 pub async fn share_protocol_status(
     manager: State<'_, Arc<ProtocolManager>>,
+) -> AppResult<Vec<ProtocolStatus>> {
+    share_protocol_status_service(manager.inner().clone()).await
+}
+
+pub(crate) async fn share_protocol_status_service(
+    manager: Arc<ProtocolManager>,
 ) -> AppResult<Vec<ProtocolStatus>> {
     Ok(manager.statuses().await)
 }
@@ -123,15 +169,23 @@ pub async fn create_share(
     manager: State<'_, Arc<ProtocolManager>>,
     input: CreateShareInput,
 ) -> AppResult<ShareConfig> {
+    create_share_service(state.inner().clone(), manager.inner().clone(), input).await
+}
+
+pub(crate) async fn create_share_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
+    input: CreateShareInput,
+) -> AppResult<ShareConfig> {
     let id = generate_id();
     if input.protocol != ShareProtocol::Nodesend && input.access_mode == AccessMode::Trusted {
         return Err(crate::error::AppError::BadRequest(
-            "第三方协议请选择密码或开放访问。".into(),
+            "Choose password or open access for third-party protocols.".into(),
         ));
     }
     share_repo::create(&state.db, &id, &input.name, &input.path, input.access_mode)?;
     let share = share_repo::set_protocol(&state.db, &id, input.protocol, input.port)?;
-    match manager.start(state.inner().clone(), &share).await {
+    match manager.start(state.clone(), &share).await {
         Ok(port) => share_repo::set_protocol(&state.db, &id, input.protocol, port),
         Err(err) => {
             let _ = share_repo::delete(&state.db, &id);
@@ -157,16 +211,25 @@ pub async fn update_share(
     id: String,
     input: UpdateShareInput,
 ) -> AppResult<ShareConfig> {
+    update_share_service(state.inner().clone(), manager.inner().clone(), id, input).await
+}
+
+pub(crate) async fn update_share_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
+    id: String,
+    input: UpdateShareInput,
+) -> AppResult<ShareConfig> {
     let previous = share_repo::get_by_id(&state.db, &id)?;
     if previous.protocol != ShareProtocol::Nodesend
         && input.access_mode == Some(AccessMode::Trusted)
     {
         return Err(crate::error::AppError::BadRequest(
-            "第三方协议不支持信任设备访问。".into(),
+            "Third-party protocols do not support trusted-device access.".into(),
         ));
     }
     let share = share_repo::update(&state.db, &id, input.name, input.path, input.access_mode)?;
-    restart_share(state.inner(), manager.inner(), share).await
+    restart_share(&state, &manager, share).await
 }
 
 #[tauri::command]
@@ -176,8 +239,17 @@ pub async fn toggle_share(
     id: String,
     enabled: bool,
 ) -> AppResult<ShareConfig> {
+    toggle_share_service(state.inner().clone(), manager.inner().clone(), id, enabled).await
+}
+
+pub(crate) async fn toggle_share_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
+    id: String,
+    enabled: bool,
+) -> AppResult<ShareConfig> {
     let share = share_repo::set_enabled(&state.db, &id, enabled)?;
-    restart_share(state.inner(), manager.inner(), share).await
+    restart_share(&state, &manager, share).await
 }
 
 #[tauri::command]
@@ -186,14 +258,30 @@ pub async fn rotate_share_token(
     manager: State<'_, Arc<ProtocolManager>>,
     id: String,
 ) -> AppResult<ShareConfig> {
+    rotate_share_token_service(state.inner().clone(), manager.inner().clone(), id).await
+}
+
+pub(crate) async fn rotate_share_token_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
+    id: String,
+) -> AppResult<ShareConfig> {
     let share = share_repo::rotate_token(&state.db, &id)?;
-    restart_share(state.inner(), manager.inner(), share).await
+    restart_share(&state, &manager, share).await
 }
 
 #[tauri::command]
 pub async fn delete_share(
     state: State<'_, Arc<AppService>>,
     manager: State<'_, Arc<ProtocolManager>>,
+    id: String,
+) -> AppResult<()> {
+    delete_share_service(state.inner().clone(), manager.inner().clone(), id).await
+}
+
+pub(crate) async fn delete_share_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
     id: String,
 ) -> AppResult<()> {
     manager.stop(&id).await;
@@ -204,12 +292,26 @@ pub async fn delete_share(
 pub async fn list_trusted_nodes(
     state: State<'_, Arc<AppService>>,
 ) -> AppResult<Vec<registry::TrustedNode>> {
+    list_trusted_nodes_service(state.inner().clone()).await
+}
+
+pub(crate) async fn list_trusted_nodes_service(
+    state: Arc<AppService>,
+) -> AppResult<Vec<registry::TrustedNode>> {
     registry::list(&state.db)
 }
 
 #[tauri::command]
 pub async fn add_trusted_node(
     state: State<'_, Arc<AppService>>,
+    node_id: String,
+    display_name: Option<String>,
+) -> AppResult<()> {
+    add_trusted_node_service(state.inner().clone(), node_id, display_name).await
+}
+
+pub(crate) async fn add_trusted_node_service(
+    state: Arc<AppService>,
     node_id: String,
     display_name: Option<String>,
 ) -> AppResult<()> {
@@ -221,12 +323,16 @@ pub async fn remove_trusted_node(
     state: State<'_, Arc<AppService>>,
     node_id: String,
 ) -> AppResult<()> {
+    remove_trusted_node_service(state.inner().clone(), node_id).await
+}
+
+pub(crate) async fn remove_trusted_node_service(
+    state: Arc<AppService>,
+    node_id: String,
+) -> AppResult<()> {
     registry::remove(&state.db, &node_id)
 }
 
-/// Restart a share listener after its persisted configuration changes.
-/// A failed restart disables the share in the database so UI state cannot
-/// claim that a listener is running when the bind/start operation failed.
 async fn restart_share(
     state: &Arc<AppService>,
     manager: &ProtocolManager,
@@ -237,28 +343,25 @@ async fn restart_share(
         Ok(port) => match share_repo::set_protocol(&state.db, &share.id, share.protocol, port) {
             Ok(updated) => Ok(updated),
             Err(error) => {
-                // The listener must not outlive a failed persistence step: the
-                // database is the source of truth for the advertised port and
-                // enabled state. Stop it and make a best-effort disable.
                 manager.stop(&share.id).await;
                 if let Err(disable_error) = share_repo::set_enabled(&state.db, &share.id, false) {
                     tracing::error!(
                         share_id = %share.id,
                         %error,
                         %disable_error,
-                        "共享监听已停止，但持久化端口失败且禁用状态写入也失败"
+                        "Sharing listener stopped, but persisting the port and disabled state also failed"
                     );
                     return Err(crate::error::AppError::Other(format!(
-                        "共享端口保存失败：{error}；禁用共享也失败：{disable_error}"
+                        "Failed to save the sharing port: {error}; disabling sharing also failed: {disable_error}"
                     )));
                 }
-                tracing::error!(share_id = %share.id, %error, "共享端口保存失败，已停止监听并禁用共享");
+                tracing::error!(share_id = %share.id, %error, "Failed to save the sharing port; listener stopped and sharing disabled");
                 Err(error)
             }
         },
         Err(error) => match share_repo::set_enabled(&state.db, &share.id, false) {
             Ok(_) => {
-                tracing::error!(share_id = %share.id, %error, "共享配置已保存，但监听重启失败；共享已禁用");
+                tracing::error!(share_id = %share.id, %error, "Share settings saved, but listener restart failed; sharing was disabled");
                 Err(error)
             }
             Err(disable_error) => {
@@ -266,10 +369,10 @@ async fn restart_share(
                     share_id = %share.id,
                     %error,
                     %disable_error,
-                    "共享监听重启失败，且无法持久化禁用状态"
+                    "Failed to restart the sharing listener and could not persist the disabled state"
                 );
                 Err(crate::error::AppError::Other(format!(
-                    "共享监听重启失败：{error}；禁用共享也失败：{disable_error}"
+                    "Failed to restart the sharing listener: {error}; disabling the share also failed: {disable_error}"
                 )))
             }
         },

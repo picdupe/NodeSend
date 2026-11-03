@@ -9,6 +9,19 @@ mod chunk_lookup_tests {
     use super::*;
 
     #[test]
+    fn file_name_summary_keeps_distinct_top_level_items() {
+        assert_eq!(
+            TaskRecord::file_name_from_paths([
+                "CentOS/a.iso",
+                "CentOS/CHECKSUM",
+                "readme.txt",
+                "third/file.bin",
+            ]),
+            "CentOS、readme.txt、third"
+        );
+    }
+
+    #[test]
     fn incremental_manifest_digest_matches_full_manifest_digest() {
         let manifest = Manifest::new(
             vec![
@@ -17,12 +30,14 @@ mod chunk_lookup_tests {
                     size: 0,
                     modified_ms: 1,
                     directory: true,
+                    ..Default::default()
                 },
                 FileEntry {
                     path: "root/a.bin".into(),
                     size: 123,
                     modified_ms: 2,
                     directory: false,
+                    ..Default::default()
                 },
             ],
             262144,
@@ -52,6 +67,7 @@ mod chunk_lookup_tests {
                     size,
                     directory,
                     modified_ms: 0,
+                    ..Default::default()
                 })
                 .collect(),
                 chunk_size,
@@ -71,13 +87,31 @@ mod chunk_lookup_tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileEntry {
     pub path: String,
     pub size: u64,
     pub modified_ms: u64,
     pub directory: bool,
+    /// 显示文件名（`path` 的最后一段），接收端在清单落库时写入。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// 稳定的缓存文件名（`<NodeID>-<文件名>`，冲突时追加序号）。
+    /// 只在接收端生成并持久化；发送端清单里为空，不参与指纹。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_name: String,
 }
+impl PartialEq for FileEntry {
+    /// 缓存名称属于接收端本地派生的元数据，不参与「条目是否变化」的比较；
+    /// 否则发送端（名称为空）与接收端（名称已生成）会被误判为源文件变更。
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.size == other.size
+            && self.modified_ms == other.modified_ms
+            && self.directory == other.directory
+    }
+}
+impl Eq for FileEntry {}
 impl FileEntry {
     /// 清单指纹的逐条编码：长度前缀 + 字段，跨端字节一致。
     /// 用于「分片传输后校验完整性」——两端各自按同一顺序增量哈希同一编码。
@@ -90,9 +124,6 @@ impl FileEntry {
     }
 }
 
-/// Incremental digest builder for a manifest that is scanned and sent in
-/// batches. The byte encoding is exactly the same as `Manifest::digest()` so
-/// a receiver can verify the completed stream without retaining a second copy.
 pub struct ManifestDigest(Sha256);
 
 impl ManifestDigest {
@@ -119,10 +150,8 @@ impl Default for ManifestDigest {
 /// 条目明细随后由 `ManifestChunk` 分片流式送达，`digest` 覆盖全部条目用于最终校验。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OfferSummary {
-    /// True when the sender is still scanning and totals are not known yet.
     #[serde(default)]
     pub streaming: bool,
-    /// Number of selected top-level items; these are the first manifest entries.
     #[serde(default)]
     pub top_level_count: usize,
     pub file_count: usize,
@@ -132,7 +161,6 @@ pub struct OfferSummary {
     pub chunk_size: u64,
     pub verify_hash: bool,
     pub digest: String,
-    /// Non-recursive fingerprint of selected top-level items; checked before resume.
     #[serde(default)]
     pub top_level_fingerprint: String,
 }
@@ -143,16 +171,12 @@ pub struct OfferSummary {
 pub struct SourceRoot {
     pub name: String,
     pub path: String,
-    /// Metadata of the selected item itself only; never derived from descendants.
     #[serde(default)]
     pub directory: bool,
     #[serde(default)]
     pub size: u64,
     #[serde(default)]
     pub modified_ms: u64,
-    /// Old releases persisted source roots as plain path strings. They can be
-    /// displayed for history, but lack the metadata required by the current
-    /// streaming/resume protocol.
     #[serde(skip)]
     pub legacy_format: bool,
 }
@@ -253,8 +277,6 @@ pub struct Chunk {
 /// 避免把整份清单（数十万条）经 IPC 传输并在前端解析。
 #[derive(Debug, Clone, Serialize)]
 pub struct ManifestSummary {
-    /// False when this is only a top-level preview; recursive scanning happens
-    /// in the actual send task and must never block the send button.
     pub scan_complete: bool,
     pub top_level_count: usize,
     pub file_count: usize,
@@ -338,10 +360,10 @@ impl Manifest {
     }
     pub fn validate(&self) -> AppResult<()> {
         if self.entries.is_empty() || ![262144, 1048576, 4194304].contains(&self.chunk_size) {
-            return Err(AppError::BadRequest("文件清单或 Chunk 大小非法".into()));
+            return Err(AppError::BadRequest(
+                "Invalid manifest or chunk size".into(),
+            ));
         }
-        // Manifest paths are case-insensitive on supported Windows receivers.
-        // Hash sets avoid O(n log n) tree operations for very large directories.
         let mut names = std::collections::HashSet::with_capacity(self.entries.len());
         let mut directories = std::collections::HashSet::new();
         let mut total = 0u64;
@@ -349,27 +371,21 @@ impl Manifest {
             super::paths::validate_relative(&e.path)?;
             let normalized = e.path.to_lowercase();
             if !names.insert(normalized.clone()) || (e.directory && e.size != 0) {
-                return Err(AppError::BadRequest("重复路径或目录大小非法".into()));
+                return Err(AppError::BadRequest("Duplicate path or invalid directory size".into()));
             }
             if e.directory {
                 directories.insert(normalized);
             }
             total = total
                 .checked_add(e.size)
-                .ok_or_else(|| AppError::BadRequest("文件大小溢出".into()))?;
+                .ok_or_else(|| AppError::BadRequest("File size overflow".into()))?;
         }
         // 条目数不设上限；只保留总量溢出检查（防止清单被构造成不可能的巨量总量）。
-        debug_assert_eq!(total, self.total(), "清单总量与条目汇总不一致");
+        debug_assert_eq!(total, self.total(), "Manifest totals do not match the entry summary");
         for e in &self.entries {
-            // Checking the immediate parent is sufficient: every directory
-            // entry is checked by this same loop, so its own parent is checked
-            // recursively through the manifest. This avoids walking every
-            // ancestor for every file (which is expensive in deep trees).
             if let Some((parent, _)) = e.path.rsplit_once('/') {
                 if !directories.contains(&parent.to_lowercase()) {
-                    return Err(AppError::BadRequest(
-                        "文件清单缺少父目录或路径类型冲突".into(),
-                    ));
+                    return Err(AppError::BadRequest("Manifest is missing a parent directory or has a path type conflict".into()));
                 }
             }
         }
@@ -467,6 +483,8 @@ pub struct TaskRecord {
     pub peer_id: String,
     pub peer_name: String,
     #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
     pub peer_device_type: String,
     #[serde(default)]
     pub preferred_address: Option<String>,
@@ -488,21 +506,14 @@ pub struct TaskRecord {
     #[serde(default)]
     pub use_cache: bool,
     /// 清单块大小与校验开关（原 `manifest` 内字段，移到标量以便不加载明细即可判块）。
-    /// Older records may predate this scalar; zero marks them as incompatible history.
     #[serde(default)]
     pub chunk_size: u64,
-    /// Missing in older persisted task formats; legacy records are display-only.
     #[serde(default)]
     pub verify_hash: bool,
-    /// Android task-level snapshot of the media-library routing choice.
     #[serde(default)]
     pub android_media_library: bool,
-    /// Actual public media directories used by this task, populated while the
-    /// manifest is received. Empty when media-library routing is disabled.
     #[serde(default)]
     pub receive_directories: BTreeSet<String>,
-    /// Summary counters were introduced after the original persisted task format.
-    /// Missing counters default to zero; chunk_size=0 still marks old tasks incompatible.
     #[serde(default)]
     pub file_count: usize,
     #[serde(default)]
@@ -512,7 +523,6 @@ pub struct TaskRecord {
     /// 全局块总数（清单汇总），用于不加载明细即可判定「是否全部收齐」。
     #[serde(default)]
     pub chunk_count: usize,
-    /// Number of selected top-level items, known before recursive scanning.
     #[serde(default)]
     pub top_level_count: usize,
     /// 已完成块数量（含被跳过文件的块），对应 `completed.len()`。
@@ -536,11 +546,20 @@ pub struct TaskRecord {
     /// 接受任务时选择使用 SSD 缓存的文件索引；未包含的文件直接写目标盘。
     #[serde(default)]
     pub cache_files: BTreeSet<usize>,
-    /// Sender explicitly requested resume; consumed by the next connected send run.
     #[serde(default)]
     pub resume_requested: bool,
-    /// Monotonic local/remote control-plane revisions prevent delayed retries
-    /// from rolling a task back to an older state.
+    #[serde(default)]
+    pub source_issue: Option<SourceIssue>,
+    #[serde(default)]
+    pub recovery_epoch: u64,
+    #[serde(default)]
+    pub remote_recovery_epoch: u64,
+    #[serde(default)]
+    pub checked_epoch: u64,
+    #[serde(default)]
+    pub abandoned_files: BTreeSet<usize>,
+    #[serde(default)]
+    pub repair_files: BTreeSet<usize>,
     #[serde(default)]
     pub state_revision: u64,
     #[serde(default)]
@@ -548,19 +567,14 @@ pub struct TaskRecord {
     /// 清单内容指纹（`Offer` 摘要携带）：用于重复请求的内容一致性与收完后校验。
     #[serde(default)]
     pub digest: String,
-    /// Non-recursive fingerprint of selected top-level source items.
     #[serde(default)]
     pub top_level_fingerprint: String,
-    /// Durable deterministic scanner cursor for pause/restart recovery.
     #[serde(default)]
     pub scan_last_seq: usize,
     #[serde(default)]
     pub scan_last_path: String,
     #[serde(default)]
     pub scan_complete: bool,
-    /// Sender scan counters for UI display. Persist these independently from
-    /// `file_count`: the latter is the durable manifest cursor and must never
-    /// advance beyond entries that have actually been saved to the database.
     #[serde(default)]
     pub scan_progress_count: usize,
     #[serde(default)]
@@ -568,6 +582,10 @@ pub struct TaskRecord {
     /// 运行期清单明细：启动时不加载，按需从 `task_entries` 载入（见 `TransferService`）。
     #[serde(skip)]
     pub manifest: Manifest,
+    /// 运行期缓存名称去重计数（清理后的基名 → 已分配数量）。
+    /// 只用于清单分页到达时保持序号连续；重启后由已持久化的清单重建。
+    #[serde(skip)]
+    pub cache_name_seq: std::collections::HashMap<String, usize>,
     /// 运行期完成块集合：来自 `task_chunks`。
     #[serde(skip)]
     pub completed: BTreeSet<usize>,
@@ -603,11 +621,36 @@ impl TaskRecord {
         self.total_size = manifest.total();
         self.chunk_count = manifest.chunk_count();
         self.manifest = manifest;
+        self.refresh_file_name();
+    }
+    pub fn refresh_file_name(&mut self) {
+        self.file_name = Self::file_name_from_paths(
+            self.manifest
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str()),
+        );
+    }
+    pub fn file_name_from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+        let mut names = Vec::new();
+        for path in paths {
+            let name = path.split('/').next().unwrap_or_default();
+            if !name.is_empty()
+                && !names.iter().any(|value: &String| value.as_str() == name)
+                && names.len() < 32
+            {
+                names.push(name.to_string());
+            }
+        }
+        names.join("、")
     }
     pub fn event(&mut self, text: impl Into<String>) {
         self.updated_at = chrono::Utc::now().to_rfc3339();
-        self.events
-            .push(format!("{} {}", chrono::Local::now().to_rfc3339(), text.into()));
+        self.events.push(format!(
+            "{} {}",
+            chrono::Local::now().to_rfc3339(),
+            text.into()
+        ));
         if self.events.len() > 100 {
             self.events.remove(0);
         }
@@ -627,10 +670,6 @@ impl TaskRecord {
     /// 任务快照（Stage 2 拆分）：只含计数、总量与进度，**不含清单明细**。
     /// 因此无需加载 bulk，也不会再把整份清单经 IPC 传到前端（明细走分页接口）。
     pub fn snapshot(&self) -> TaskSnapshot {
-        // Send-side live counters may be ahead of the last durable manifest
-        // cursor. Never replace a known count with zero just because a pause,
-        // resume, or snapshot happens between scan batches. `scan_last_seq`
-        // is also a durable lower bound for the number of scanned entries.
         let (file_count, directory_count) = if self.direction == "send" {
             (
                 self.file_count
@@ -641,23 +680,23 @@ impl TaskRecord {
         } else {
             (self.file_count, self.directory_count)
         };
-        let file_name = self
-            .manifest
-            .entries
-            .iter()
-            .filter_map(|entry| entry.path.split('/').next())
-            .fold(Vec::<String>::new(), |mut names, name| {
-                if !names.iter().any(|value| value == name) && names.len() < 32 {
-                    names.push(name.to_string());
-                }
-                names
-            })
-            .join("、");
+        let file_name = if !self.file_name.is_empty() {
+            self.file_name.clone()
+        } else {
+            Self::file_name_from_paths(
+                self.manifest
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.as_str()),
+            )
+        };
         TaskSnapshot {
+            source_issue: self.source_issue.clone(),
+            abandoned_count: self.abandoned_files.len(),
             warnings: self
                 .skipped_paths
                 .iter()
-                .map(|p| format!("源文件已变化，未发送：{p}"))
+                .map(|p| format!("Source file changed; not sent: {p}"))
                 .collect(),
             id: self.id.clone(),
             peer_id: self.peer_id.clone(),
@@ -680,19 +719,33 @@ impl TaskRecord {
             verify_hash: self.verify_hash,
             android_media_library: self.android_media_library,
             receive_directories: if self.android_media_library {
-                ["Pictures/NodeSend", "Movies/NodeSend", "Music/NodeSend", "Download/NodeSend"]
-                    .into_iter()
-                    .filter(|directory| self.receive_directories.contains(*directory))
-                    .map(str::to_string)
-                    .collect()
+                [
+                    "Pictures/NodeSend",
+                    "Movies/NodeSend",
+                    "Music/NodeSend",
+                    "Download/NodeSend",
+                ]
+                .into_iter()
+                .filter(|directory| self.receive_directories.contains(*directory))
+                .map(str::to_string)
+                .collect()
             } else {
                 Vec::new()
             },
         }
     }
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceIssue {
+    pub file: usize,
+    pub kind: String,
+    #[serde(default)]
+    pub accepted: bool,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskSnapshot {
+    pub source_issue: Option<SourceIssue>,
+    pub abandoned_count: usize,
     pub warnings: Vec<String>,
     pub id: String,
     pub peer_id: String,
@@ -721,4 +774,8 @@ pub fn random_id() -> String {
 }
 pub fn incoming_id(peer: &str, wire: &str) -> String {
     format!("in-{peer}-{wire}")
+}
+
+pub(crate) fn file_version(file: usize, entry: &FileEntry) -> String {
+    format!("{file}:{}:{}", entry.size, entry.modified_ms)
 }

@@ -1,4 +1,3 @@
-//! Independent mDNS and UDP discovery tasks; one failure never disables the other.
 use super::{
     peers::{address, valid_id, Endpoint, PeerStore},
     protocol::VERSION,
@@ -46,9 +45,6 @@ impl Announcement {
     }
 }
 
-/// Ask a NodeSend peer for its current TCP/QUIC ports. This is used when a
-/// user enters only an IP/hostname; the service port is discovered over the
-/// fixed UDP discovery channel and is never assumed to match our own port.
 pub async fn probe(
     target: SocketAddr,
     node_id: &str,
@@ -144,8 +140,8 @@ async fn mdns(
     ]);
     let info = ServiceInfo::new(
         SERVICE_TYPE,
-        &format!("ns-{}", &hello.node_id[..24]),
-        &format!("ns-{}.local.", &hello.node_id[..32]),
+        &format!("ns-{}", &hello.node_id[..16]),
+        &format!("ns-{}.local.", &hello.node_id[..16]),
         "",
         hello.port,
         props,
@@ -163,11 +159,13 @@ async fn mdns(
                 Ok(ServiceEvent::ServiceResolved(info))=>{
                     let props=info.get_properties();
                     if props.get("version").map(|v|v.val_str())!=Some("1"){continue;}
-                    let Some(id)=props.get("node_id").map(|v|v.val_str()) else{continue;};if !valid_id(id)||id==hello.node_id{continue;}
+                    let Some(raw_id)=props.get("node_id").map(|v|v.val_str()) else{continue;};
+                    let Some(id)=crate::identity::node_identity::normalize_node_id(raw_id) else{continue;};
+                    if id==hello.node_id{continue;}
                     let name=props.get("name").map(|v|v.val_str()).unwrap_or("NodeSend");
                     let quic=props.get("quic_port").and_then(|v|v.val_str().parse().ok()).unwrap_or(info.get_port());
                     let endpoints=info.get_addresses().iter().flat_map(|ip|scoped_addresses(*ip)).map(|address|Endpoint{address,tcp_port:info.get_port(),quic_port:quic,source:"mdns".into(),last_seen:chrono::Utc::now().timestamp(),error:None}).collect();
-                    let _=peers.upsert(id.into(),name.into(),endpoints,false);
+                    let _=peers.upsert(id,name.into(),endpoints,false);
                 },
                 Err(_)=>break,_=>{}
             }

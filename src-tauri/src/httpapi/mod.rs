@@ -46,13 +46,13 @@ pub async fn start(state: HttpState, addr: SocketAddr) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) => {
-            tracing::error!(%addr, "HTTP 共享服务启动失败: {err}");
+            tracing::error!(%addr, "Failed to start HTTP share server: {err}");
             return;
         }
     };
-    tracing::info!("HTTP 共享服务已启动: http://{addr}");
+    tracing::info!("HTTP share server started: http://{addr}");
     if let Err(err) = axum::serve(listener, app).await {
-        tracing::error!("HTTP 共享服务异常退出: {err}");
+        tracing::error!("HTTP share server exited unexpectedly: {err}");
     }
 }
 
@@ -106,7 +106,7 @@ impl ShareLinkManager {
                 let _ = shutdown_rx.await;
             });
             if let Err(err) = server.await {
-                tracing::error!("链接分享 HTTP 服务异常退出: {err}");
+                tracing::error!("Link sharing HTTP server exited unexpectedly: {err}");
             }
         });
         *guard = Some((port, shutdown_tx, task));
@@ -140,13 +140,13 @@ impl HttpManager {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tauri::async_runtime::spawn(async move {
-            tracing::info!("HTTP 共享服务已启动: http://{addr}");
+            tracing::info!("HTTP share server started: http://{addr}");
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
             match server.await {
-                Ok(()) => tracing::info!("HTTP 共享服务已停止"),
-                Err(err) => tracing::error!("HTTP 共享服务异常退出: {err}"),
+                Ok(()) => tracing::info!("HTTP share server stopped"),
+                Err(err) => tracing::error!("HTTP share server exited unexpectedly: {err}"),
             }
         });
 

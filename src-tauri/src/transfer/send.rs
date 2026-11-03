@@ -44,6 +44,81 @@ struct ScanStream {
     db_buffer_start: usize,
 }
 impl TransferService {
+    async fn prepare_remote_file(
+        &self,
+        channel: &mut Channel,
+        task: &TaskRecord,
+        file: usize,
+    ) -> AppResult<()> {
+        loop {
+            if !self.wait_remote_resume(&task.id).await? {
+                return Err(AppError::Conflict("Remote task ended before the file could be prepared".into()));
+            }
+            match channel
+                .request(&Request::PrepareFile {
+                    id: task.wire_id.clone(),
+                    file,
+                })
+                .await?
+            {
+                Response::Ack => return Ok(()),
+                Response::State {
+                    status, revision, ..
+                } if ["paused", "remote_paused"].contains(&status.as_str()) => {
+                    if status == "paused" {
+                        self.apply_remote_state(&task.peer_id, &task.wire_id, revision, "paused")
+                            .await?;
+                    }
+                }
+                _ => return Err(AppError::Conflict("Unexpected response while preparing the remote file".into())),
+            }
+        }
+    }
+
+    async fn source_read_failed(
+        &self,
+        control: &mut Channel,
+        task: &TaskRecord,
+        file: usize,
+        error: AppError,
+    ) -> AppError {
+        let kind = match &error {
+            AppError::Conflict(_) => "changed",
+            AppError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => "missing",
+            _ => "unavailable",
+        };
+        if let Err(e) = self.set_source_issue(&task.id, file, kind) {
+            return e;
+        }
+        let _ = control
+            .request(&Request::SourceIssue {
+                id: task.wire_id.clone(),
+                file,
+                kind: kind.into(),
+            })
+            .await;
+        let _ = self.wait_remote_resume(&task.id).await;
+        if self
+            .status_of(&task.id)
+            .is_ok_and(|s| s == "partial_completed")
+        {
+            let runtime = self.runtime(&task.id);
+            let mut updates = runtime.state_updates.subscribe();
+            let revision = self.record(&task.id).map(|t| t.state_revision).unwrap_or(0);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while runtime.state_sent_revision.load(Ordering::SeqCst) < revision
+                    && runtime.state_sessions.load(Ordering::SeqCst) > 0
+                {
+                    if updates.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        AppError::Conflict(error.to_string())
+    }
+
     fn flush_scan_buffer(
         &self,
         task: &TaskRecord,
@@ -81,9 +156,12 @@ impl TransferService {
         mut first: usize,
     ) -> AppResult<usize> {
         loop {
+            if ["paused", "remote_paused"].contains(&self.status_of(&task.id)?.as_str()) {
+                self.wait_remote_resume(&task.id).await?;
+            }
             if self.stopped(&task.id)? {
                 self.flush_scan_buffer(task, state, first)?;
-                self.notify_remote_stop(control, &task.id, &task.wire_id).await;
+
                 return Ok(first);
             }
             let batch = tokio::task::spawn_blocking(move || {
@@ -117,7 +195,7 @@ impl TransferService {
                         first = first + send_offset,
                         entries = page.len() - send_offset,
                         elapsed_ms = elapsed.as_millis() as u64,
-                        "接收端处理清单分片较慢"
+                        "Receiver is taking a long time to process manifest chunks"
                     );
                 } else {
                     tracing::info!(
@@ -125,7 +203,7 @@ impl TransferService {
                         first = first + send_offset,
                         entries = page.len() - send_offset,
                         elapsed_ms = elapsed.as_millis() as u64,
-                        "清单分片已确认"
+                        "Manifest chunk confirmed"
                     );
                 }
                 match response {
@@ -136,7 +214,7 @@ impl TransferService {
                         self.edit(&task.id, |t| t.status = status)?;
                         return Ok(first);
                     }
-                    _ => return Err(AppError::Other("接收方未确认清单分片".into())),
+                    _ => return Err(AppError::Other("Receiver did not confirm the manifest chunk".into())),
                 }
             }
             for (page_offset, entry) in page.iter().enumerate() {
@@ -155,8 +233,6 @@ impl TransferService {
             state.entries.extend(page.iter().cloned());
             state.db_buffer.extend(page.iter().cloned());
             first += page.len();
-            // Keep the sender UI responsive between durable 5000-entry batches.
-            // These counters are in-memory only; recovery still uses the durable cursor.
             self.update_live_scan_progress(&task.id, first, state.directories)?;
             // 扫满一个落库批次才写数据库：扫描/发送按 256 条小步推进，
             // 数据库按 5000 条摊销事务；两者互不阻塞。
@@ -175,16 +251,22 @@ impl TransferService {
                 // 每 4 个落库批次（约 2 万条）写一条任务事件：界面能直接看出清单在推进。
                 if (first / MANIFEST_PAGE).is_multiple_of(4) || first <= MANIFEST_PAGE {
                     self.edit(&task.id, |t| {
-                        t.event(format!("正在分段发送清单：已扫描 {first} 条"))
+                        t.event(format!(
+                            "Sending manifest in parts: {first} entries scanned"
+                        ))
                     })?;
                 }
             }
+            if ["paused", "remote_paused"].contains(&self.status_of(&task.id)?.as_str()) {
+                self.wait_remote_resume(&task.id).await?;
+            }
             if self.stopped(&task.id)? {
                 self.flush_scan_buffer(task, state, first)?;
-                self.notify_remote_stop(control, &task.id, &task.wire_id).await;
+
                 return Ok(first);
             }
             if state.send_data {
+                self.flush_scan_buffer(task, state, first)?;
                 self.send_streaming_ready_files(
                     control,
                     task,
@@ -237,6 +319,16 @@ impl TransferService {
                         Ok(()) if service.status_of(&id)? == "queued" => continue,
                         Ok(()) => return Ok(()),
                         Err(err) => {
+                            if matches!(err, AppError::Conflict(_))
+                                && service
+                                    .record(&id)?
+                                    .source_issue
+                                    .as_ref()
+                                    .is_some_and(|i| i.accepted)
+                            {
+                                service.edit(&id, |t| t.status = "queued".into())?;
+                                continue;
+                            }
                             if service.stopped(&id)? {
                                 return Ok(());
                             }
@@ -244,20 +336,18 @@ impl TransferService {
                             if !retry {
                                 return Err(err);
                             }
-                            // Once this run falls back to TCP, keep using TCP until
-                            // the user manually pauses and resumes the task. A new
-                            // start_task invocation creates a fresh cooldown (QUIC first).
                             cooldown.store(i64::MAX, Ordering::Relaxed);
                             attempt = attempt.saturating_add(1);
                             service.edit(&id, |t| {
-                                // Unexpected network failures are recoverable, not
-                                // user pauses. Keep this run alive so it reconnects
-                                // automatically; stopped() still exits immediately
-                                // when the user explicitly pauses or cancels.
-                                t.status = "interrupted".into();
+                                if t.status != "interrupted" {
+                                    t.recovery_epoch = t.recovery_epoch.saturating_add(1);
+                                }
+                                if t.status != "interrupted" {
+                                    t.status = "connecting".into();
+                                }
                                 t.error = Some(err.to_string());
                                 t.event(format!(
-                                    "连接中断，{:?} 后自动重试（第 {attempt} 次）",
+                                    "Transfer connection lost. Retrying in {:?} (attempt {attempt})",
                                     crate::tuning::SEND_RETRY_DELAY
                                 ));
                             })?;
@@ -272,7 +362,7 @@ impl TransferService {
                     if !["cancelled", "paused"].contains(&t.status.as_str()) {
                         t.status = "paused".into();
                         t.error = Some(err.to_string());
-                        t.event("设备暂时离线，已暂停；设备上线后点击继续");
+                        t.event("The device is temporarily offline. The task is paused; resume when it is online");
                     }
                 });
             }
@@ -281,7 +371,16 @@ impl TransferService {
             // 终态（完成/取消/被拒）时整体释放运行期资源；暂停保留，续传时复用。
             let terminal = service
                 .status_of(&id)
-                .map(|status| ["completed", "cancelled", "rejected"].contains(&status.as_str()))
+                .map(|status| {
+                    [
+                        "completed",
+                        "cancelled",
+                        "rejected",
+                        "partial_completed",
+                        "incompatible",
+                    ]
+                    .contains(&status.as_str())
+                })
                 .unwrap_or(false);
             if terminal {
                 service.release_runtime(&id);
@@ -291,19 +390,20 @@ impl TransferService {
         });
     }
     fn stopped(&self, id: &str) -> AppResult<bool> {
-        Ok(
-            ["paused", "remote_paused", "cancelling", "cancelled", "rejected", "completed"]
-                .contains(&self.status_of(id)?.as_str()),
-        )
-    }
-    async fn notify_remote_stop(&self, control: &mut Channel, id: &str, wire_id: &str) {
-        let request = match self.status_of(id).as_deref() {
-            Ok("paused") | Ok("remote_paused") => Some(Request::Pause { id: wire_id.to_string() }),
-            _ => None,
-        };
-        if let Some(request) = request {
-            let _ = control.request(&request).await;
-        }
+        Ok([
+            "paused",
+            "remote_paused",
+            "remote_offline",
+            "offline",
+            "cancelling",
+            "cancelled",
+            "rejected",
+            "completed",
+            "partial_completed",
+            "incompatible",
+            "finishing",
+        ]
+        .contains(&self.status_of(id)?.as_str()))
     }
     async fn channel(
         &self,
@@ -315,14 +415,14 @@ impl TransferService {
         let mut peer = peers.get(&task.peer_id)?;
         if prefer_requested_address {
             if let Some(address) = task.preferred_address.as_deref() {
-            peer.endpoints.sort_by_key(|endpoint| {
-                !(endpoint.address == address
-                    || address.starts_with(&format!("{}:", endpoint.address))
-                    || address.starts_with(&format!("[{}]", endpoint.address)))
-            });
+                peer.endpoints.sort_by_key(|endpoint| {
+                    !(endpoint.address == address
+                        || address.starts_with(&format!("{}:", endpoint.address))
+                        || address.starts_with(&format!("[{}]", endpoint.address)))
+                });
             }
         }
-        let mut last = "没有可用 Endpoint".to_string();
+        let mut last = "No usable Endpoint".to_string();
         for endpoint in &peer.endpoints {
             match transport::connect(
                 &self.app,
@@ -344,11 +444,8 @@ impl TransferService {
                             peer_id = %task.peer_id,
                             address = %endpoint.address,
                             error = %quic_error,
-                            "QUIC HELLO/读取失败，立即回退 TCP 重试"
+                            "QUIC HELLO/read failed; retry immediately over TCP"
                         );
-                        // Share the fallback decision with every worker and every
-                        // reconnect in this transfer run; do not let another worker
-                        // silently switch back to QUIC.
                         cooldown.store(i64::MAX, Ordering::Relaxed);
                         let mut tcp_channel = match transport::connect(
                             &self.app,
@@ -361,26 +458,27 @@ impl TransferService {
                         {
                             Ok(channel) => channel,
                             Err(tcp_error) => {
-                                last = format!("QUIC 读取失败：{quic_error}；TCP 回退失败：{tcp_error}");
+                                last = format!(
+                                    "QUIC read failed: {quic_error}; TCP fallback failed: {tcp_error}"
+                                );
                                 peers.failure(&task.peer_id, endpoint, last.clone());
                                 continue;
                             }
                         };
-                        if let Err(tcp_error) = transport::hello(&mut tcp_channel, &self.app).await {
-                            last = format!("QUIC 读取失败：{quic_error}；TCP HELLO 失败：{tcp_error}");
+                        if let Err(tcp_error) = transport::hello(&mut tcp_channel, &self.app).await
+                        {
+                            last =
+                                format!("QUIC read failed: {quic_error}; TCP HELLO failed: {tcp_error}");
                             peers.failure(&task.peer_id, endpoint, last.clone());
                             continue;
                         }
                         channel = tcp_channel;
                     }
                     peers.seen(&task.peer_id, endpoint);
-                    // Keep the TCP preference for the whole retry window. Clearing
-                    // it as soon as one worker connects via TCP lets other workers
-                    // (and later reconnects in the same transfer) jump back to QUIC.
                     self.edit(&task.id, |t| {
                         if t.transport.as_deref() != Some(channel.kind) {
                             t.event(format!(
-                                "使用 {} + TLS 1.3，经 {}",
+                                "Using {} + TLS 1.3 via {}",
                                 channel.kind.to_uppercase(),
                                 endpoint.address
                             ));
@@ -419,14 +517,18 @@ impl TransferService {
         let directories = task.directory_count;
         let total_size = task.total_size;
         let chunk_count = task.chunk_count;
-        tracing::info!(task = %id, cursor, "清单扫描未完成，继续扫描剩余条目");
+        tracing::info!(task = %id, cursor, "Manifest scan is incomplete; continuing with remaining entries");
         self.edit(id, |t| {
             t.event(format!(
-                "接收方已有该任务：从第 {cursor} 条继续扫描剩余清单"
+                "The receiver already has this task. Continuing the remaining manifest from entry {cursor}"
             ))
         })?;
+        let cutoff = chrono::DateTime::parse_from_rfc3339(&task.created_at)
+            .map(|t| t.timestamp_millis() as u64)
+            .unwrap_or(u64::MAX);
         let scanner = tokio::task::spawn_blocking(move || {
             let mut scanner = source::SourceScanner::new(selected)?;
+            scanner.set_cutoff(cutoff);
             scanner.resume_after(cursor, &last_path)?;
             Ok::<_, AppError>(scanner)
         })
@@ -461,11 +563,11 @@ impl TransferService {
             task = %id,
             files = complete.file_count,
             total = complete.total_size,
-            "清单扫描已补齐"
+            "Manifest scan completed with repaired entries"
         );
         self.edit(id, |t| {
             t.event(format!(
-                "清单扫描已补齐：{} 个文件 · {} 个目录",
+                "Manifest scan complete: {} files · {} folders",
                 t.file_count, t.directory_count
             ))
         })?;
@@ -494,14 +596,22 @@ impl TransferService {
             })
             .await?;
         let (status, completed) = match state {
-            Response::State { status, completed } => (status, completed),
-            _ => return Err(AppError::Other("接收方未返回清单扫描状态".into())),
+            Response::State {
+                status, completed, ..
+            } => (status, completed),
+            _ => return Err(AppError::Other("Receiver did not return the manifest scan status".into())),
         };
-        // Publish the receiver's actual decision during scanning as well as
-        // after it. Auto-accepted tasks never enter the sender's waiting UI.
         if ["waiting", "accepted", "transferring"].contains(&status.as_str()) {
             self.edit(&task.id, |record| {
-                if ["queued", "connecting", "waiting", "accepted", "transferring"].contains(&record.status.as_str()) {
+                if [
+                    "queued",
+                    "connecting",
+                    "waiting",
+                    "accepted",
+                    "transferring",
+                ]
+                .contains(&record.status.as_str())
+                {
                     record.status = status.clone();
                 }
             })?;
@@ -527,17 +637,21 @@ impl TransferService {
                 pending.push_front((file_index, first_chunk));
                 break;
             }
+            if ["paused", "remote_paused"].contains(&self.status_of(&task.id)?.as_str()) {
+                self.wait_remote_resume(&task.id).await?;
+            }
             if self.stopped(&task.id)? {
                 pending.push_front((file_index, first_chunk));
-                self.notify_remote_stop(control, &task.id, &task.wire_id).await;
+
                 return Ok(());
             }
             let Some(entry) = entries.get(file_index) else {
-                return Err(AppError::Conflict("扫描中的文件索引不连续".into()));
+                return Err(AppError::Conflict("File indices in the scan are not contiguous".into()));
             };
             if entry.directory || entry.size == 0 {
                 continue;
             }
+            self.prepare_remote_file(control, task, file_index).await?;
             handled += 1;
             let chunk_count = entry.size.div_ceil(task.chunk_size) as usize;
             let mut truncated = false;
@@ -550,9 +664,12 @@ impl TransferService {
                     truncated = true;
                     break;
                 }
+                if ["paused", "remote_paused"].contains(&self.status_of(&task.id)?.as_str()) {
+                    self.wait_remote_resume(&task.id).await?;
+                }
                 if self.stopped(&task.id)? {
                     pending.push_front((file_index, first_chunk));
-                    self.notify_remote_stop(control, &task.id, &task.wire_id).await;
+
                     return Ok(());
                 }
                 let index = first_chunk + local_index;
@@ -566,72 +683,72 @@ impl TransferService {
                     .await
                 {
                     Ok(bytes) => bytes,
-                    Err(AppError::Conflict(_)) => {
-                        match control
-                            .request(&Request::SkipFile {
-                                id: task.wire_id.clone(),
-                                file: file_index,
-                            })
-                            .await?
-                        {
-                            Response::Ack => {}
-                            _ => return Err(AppError::Other("接收方未确认跳过变化文件".into())),
-                        }
-                        self.mark_skipped(&task.id, file_index)?;
-                        for skipped in first_chunk..first_chunk + chunk_count {
-                            sent.insert(skipped);
-                        }
-                        break;
+                    Err(error) => {
+                        return Err(self
+                            .source_read_failed(control, task, file_index, error)
+                            .await)
                     }
-                    Err(error) => return Err(error),
                 };
                 let sha256 = task
                     .verify_hash
                     .then(|| format!("{:x}", Sha256::digest(&bytes)));
-                match control
-                    .chunk(
-                        &Request::Chunk {
-                            id: task.wire_id.clone(),
-                            index,
-                            length: bytes.len(),
-                            sha256,
-                        },
-                        &bytes,
-                    )
-                    .await?
-                {
-                    Response::Ack => {
-                        self.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
-                        sent.insert(index);
-                        sent_chunks_now += 1;
-                        // 数据一开始流动就把状态从"正在连接"切到"传输中"，
-                        // 否则界面会在整个清单/数据阶段一直显示正在连接。
-                        if sent_chunks_now == 1 {
-                            self.edit(&task.id, |record| {
-                                if ["queued", "connecting", "waiting"]
-                                    .contains(&record.status.as_str())
-                                {
-                                    record.status = "transferring".into();
-                                    record.event("已开始发送文件数据");
-                                }
-                            })?;
-                        }
-                    }
-                    Response::State { status, .. } if status == "paused" => {
-                        self.edit(&task.id, |record| {
-                            record.status = "remote_paused".into();
-                            record.event("接收方已暂停，等待恢复");
-                        })?;
-                        pending.push_front((file_index, first_chunk));
-                        return Ok(());
-                    }
-                    Response::State { status, .. }
-                        if ["cancelled", "rejected"].contains(&status.as_str()) =>
+                loop {
+                    match control
+                        .chunk(
+                            &Request::VersionedChunk {
+                                id: task.wire_id.clone(),
+                                index,
+                                file_version: super::model::file_version(file_index, entry),
+                                length: bytes.len(),
+                                sha256: sha256.clone(),
+                            },
+                            &bytes,
+                        )
+                        .await?
                     {
-                        self.edit(&task.id, |record| record.status = status)?;
-                        return Ok(());
+                        Response::Ack => {
+                            self.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
+                            sent.insert(index);
+                            sent_chunks_now += 1;
+                            // 数据一开始流动就把状态从"正在连接"切到"传输中"，
+                            // 否则界面会在整个清单/数据阶段一直显示正在连接。
+                            if sent_chunks_now == 1 {
+                                self.edit(&task.id, |record| {
+                                    if ["queued", "connecting", "waiting"]
+                                        .contains(&record.status.as_str())
+                                    {
+                                        record.status = "transferring".into();
+                                        record.event("File data transfer started");
+                                    }
+                                })?;
+                            }
+                        }
+                        Response::State {
+                            status, revision, ..
+                        } if ["paused", "remote_paused"].contains(&status.as_str()) => {
+                            if status == "paused" {
+                                self.apply_remote_state(
+                                    &task.peer_id,
+                                    &task.wire_id,
+                                    revision,
+                                    "paused",
+                                )
+                                .await?;
+                            }
+                            if !self.wait_remote_resume(&task.id).await? {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Response::State { status, .. }
+                            if ["cancelled", "rejected"].contains(&status.as_str()) =>
+                        {
+                            self.edit(&task.id, |record| record.status = status)?;
+                            return Ok(());
+                        }
+                        _ => return Err(AppError::Other("Unexpected response while waiting for the receiver".into())),
                     }
-                    _ => return Err(AppError::Other("接收方未确认流式数据块".into())),
+                    break;
                 }
             }
             if truncated {
@@ -640,37 +757,20 @@ impl TransferService {
         }
         Ok(())
     }
-    async fn wait_remote_event(&self, control: &mut Channel, id: &str) -> AppResult<String> {
-        let task = self.record(id)?;
-        if !matches!(
-            control
-                .request(&Request::WatchTask {
-                    id: task.wire_id.clone(),
-                    revision: task.remote_state_revision,
-                })
-                .await?,
-            Response::Ack
-        ) {
-            return Err(AppError::Other("接收方未确认任务状态等待".into()));
-        }
-        let Response::TaskEvent { revision, status } =
-            crate::network::protocol::read_event(&mut *control.reader).await?
-        else {
-            return Err(AppError::Other("接收方未返回任务状态事件".into()));
-        };
-        self.apply_remote_state(&task.peer_id, &task.wire_id, revision, &status)
-            .await?;
-        self.status_of(id)
-    }
-    async fn wait_remote_resume(&self, control: &mut Channel, id: &str) -> AppResult<bool> {
+    async fn wait_remote_resume(&self, id: &str) -> AppResult<bool> {
+        let runtime = self.runtime(id);
+        let mut updates = runtime.state_updates.subscribe();
         loop {
+            match self.status_of(id)?.as_str() {
+                "paused" | "remote_paused" | "waiting" | "finishing" => {}
+                "interrupted" => return Err(AppError::Other("Transfer task was interrupted".into())),
+                "offline" | "remote_offline" | "cancelled" | "cancelling" | "rejected"
+                | "completed" | "partial_completed" | "incompatible" => return Ok(false),
+                _ => return Ok(true),
+            }
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Ok(false),
-                status = self.wait_remote_event(control, id) => match status?.as_str() {
-                    "queued" => return Ok(true),
-                    "cancelled" | "rejected" | "completed" => return Ok(false),
-                    _ => {}
-                }
+                changed = updates.changed() => { changed.map_err(|_| AppError::Other("Task state event stream closed".into()))?; }
             }
         }
     }
@@ -684,77 +784,32 @@ impl TransferService {
             t.status = "connecting".into();
             t.error = None;
         })?;
-        // Resume guard: if a selected top-level item changed, discard this task's
-        // old manifest/chunk state and begin a fresh scan under a new wire ID.
-        let mut stale_wire = None;
-        if let Err(error) = source::verify_top_level_fingerprint(&task) {
-            if !matches!(&error, AppError::Conflict(_)) {
-                return Err(error);
-            }
-            let old_wire = task.wire_id.clone();
-            let selected = task.sources.iter().map(|root| root.path.clone()).collect();
-            let verify_hash = task.verify_hash;
-            let (sources, roots) = tokio::task::spawn_blocking(move || {
-                let mut scanner = source::SourceScanner::new(selected)?;
-                let sources = scanner.roots().to_vec();
-                let roots = scanner.next_batch(sources.len().max(1))?;
-                Ok::<_, AppError>((sources, roots))
-            })
-            .await
-            .map_err(|e| AppError::Other(e.to_string()))??;
-            let top_level_count = sources.len();
-            let fingerprint = source::top_level_fingerprint(&sources);
-            self.clear_entries(id)?;
-            self.app.db.with_conn(|conn| {
-                for table in ["task_chunks", "task_targets", "task_skipped", "task_relay"] {
-                    conn.execute(&format!("DELETE FROM {table} WHERE task_id=?1"), [id])?;
-                }
-                Ok(())
-            })?;
-            task = self.edit(id, |record| {
-                record.wire_id = super::model::random_id();
-                record.sources = sources;
-                record.top_level_count = top_level_count;
-                record.top_level_fingerprint = fingerprint;
-                record.attach_manifest(Manifest::new(roots, super::CHUNK_SIZE, verify_hash));
-                record.digest.clear();
-                record.scan_last_seq = record.file_count;
-                record.scan_last_path = record
-                    .manifest
-                    .entries
-                    .last()
-                    .map(|entry| entry.path.clone())
-                    .unwrap_or_default();
-                record.scan_complete = false;
-                record.completed.clear();
-                record.completed_count = 0;
-                record.completed_bytes = 0;
-                record.targets.clear();
-                record.relayed.clear();
-                record.skipped_files.clear();
-                record.skipped_bytes = 0;
-                record.skipped_paths.clear();
-                record.relayed_total = 0;
-                record.relay_target_bytes = 0;
-                record.status = "connecting".into();
-                record.error = None;
-                record.event("顶层项目元数据变化，已清除旧恢复状态并重新扫描");
-            })?;
-            // The old manifest was cleared above; persist the replacement
-            // roots through the incremental manifest writer.
-            self.append_entries(&task.id, 0, &task.manifest.entries)?;
-            stale_wire = Some(old_wire);
-        }
         let mut control = self.channel(&peers, &task, &cooldown, true).await?;
-        if let Some(old_wire) = stale_wire {
-            let _ = control
-                .request(&Request::TaskState {
-                    id: old_wire,
-                    revision: task.state_revision,
-                    status: "cancelled".into(),
+        if let Some(issue) = task
+            .source_issue
+            .clone()
+            .filter(|issue| issue.accepted && issue.kind == "changed")
+        {
+            let mut entry = task.manifest.entries[issue.file].clone();
+            let path = source::source_path_from_roots(&task.sources, &entry.path)?;
+            let meta = std::fs::metadata(path)?;
+            entry.size = meta.len();
+            entry.modified_ms = source::modified(&meta);
+            match control
+                .request(&Request::ReplaceFile {
+                    id: task.wire_id.clone(),
+                    file: issue.file,
+                    entry: entry.clone(),
                 })
-                .await;
+                .await?
+            {
+                Response::Ack => {}
+                _ => return Err(AppError::Conflict("Receiver did not acknowledge the replacement file manifest".into())),
+            }
+            self.replace_file_entry(id, issue.file, entry)?;
+            task = self.record(id)?;
         }
+
         // 先用摘要 + 指纹建立接收任务：重复 Offer 返回当前状态，`Ready` 表示需继续发分片清单。
         let mut offer_summary = task.manifest.offer_summary();
         offer_summary.streaming = true;
@@ -770,21 +825,100 @@ impl TransferService {
                 summary: offer_summary,
             })
             .await?;
-        // Explicitly notify the receiver that this is an automatic reconnect.
-        // The receiver resumes interrupted tasks, but preserves intentional pauses.
         if let Err(err) = control
             .request(&Request::Reconnect {
                 id: task.wire_id.clone(),
             })
             .await
         {
-            tracing::warn!(task = %task.wire_id, error = %err, "自动恢复信号发送失败，将继续通过 Offer/续传握手恢复");
+            tracing::warn!(task = %task.wire_id, error = %err, "Failed to send automatic recovery signal; will continue recovery through the Offer/resume handshake");
         }
         if self.record(id)?.resume_requested {
-            let _ = control.request(&Request::Resume { id: task.wire_id.clone() }).await;
-            state = control.request(&Request::Poll { id: task.wire_id.clone() }).await?;
+            let _ = control
+                .request(&Request::Resume {
+                    id: task.wire_id.clone(),
+                })
+                .await;
+            state = control
+                .request(&Request::Poll {
+                    id: task.wire_id.clone(),
+                })
+                .await?;
             self.edit(id, |record| record.resume_requested = false)?;
         }
+        let mut state_channel = self.channel(&peers, &task, &cooldown, true).await?;
+        if !matches!(
+            state_channel
+                .request(&Request::WatchTask {
+                    id: task.wire_id.clone(),
+                    revision: task.remote_state_revision,
+                })
+                .await?,
+            Response::Ack
+        ) {
+            return Err(AppError::Other("Receiver did not acknowledge the task state subscription".into()));
+        }
+        let _state_session = crate::network::state::spawn(
+            state_channel,
+            self.clone(),
+            peers.clone(),
+            id.to_string(),
+            0,
+        );
+        if let Response::RecoveryFiles { epoch, files } = control
+            .request(&Request::RecoveryProbe {
+                id: task.wire_id.clone(),
+                epoch: task.recovery_epoch,
+            })
+            .await?
+        {
+            let mut repair = Vec::new();
+            for (file, remote_hash) in files {
+                let entry = task
+                    .manifest
+                    .entries
+                    .get(file)
+                    .ok_or_else(|| AppError::BadRequest("Invalid file index in recovery response".into()))?;
+                let path = source::source_path_from_roots(&task.sources, &entry.path)?;
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        return Err(self
+                            .source_read_failed(&mut control, &task, file, e.into())
+                            .await)
+                    }
+                };
+                if meta.len() != entry.size || source::modified(&meta) != entry.modified_ms {
+                    return Err(self
+                        .source_read_failed(
+                            &mut control,
+                            &task,
+                            file,
+                            AppError::Conflict("Source file changed since the manifest was created".into()),
+                        )
+                        .await);
+                }
+                let hash = tokio::task::spawn_blocking(move || super::recovery::hash_file(&path))
+                    .await
+                    .map_err(|e| AppError::Other(e.to_string()))??;
+                if remote_hash.as_ref() != Some(&hash) {
+                    repair.push(file);
+                }
+            }
+            if !matches!(
+                control
+                    .request(&Request::RecoveryAck {
+                        id: task.wire_id.clone(),
+                        epoch,
+                        repair
+                    })
+                    .await?,
+                Response::Ack
+            ) {
+                return Err(AppError::Conflict("Receiver did not acknowledge the recovery response".into()));
+            }
+        }
+
         let mut resume_manifest_at = 0usize;
         state = match state {
             Response::ManifestResume { next_index } => {
@@ -796,14 +930,11 @@ impl TransferService {
         // 任务事件直接显示在任务详情里：不翻日志也能看出停在哪一步。
         self.edit(id, |t| {
             t.event(match &state {
-                Response::Ready => "接收方已就绪：开始扫描并把清单分段发给对方",
-                _ => "接收方已有该任务：先同步状态，再补齐剩余清单",
+                Response::Ready => "The receiver is ready. Scanning and sending the manifest in parts",
+                _ => "The receiver already has this task. Synchronizing status before completing the manifest",
             })
         })?;
         if matches!(state, Response::Ready) {
-            // The Offer is sent before recursive traversal. Send selected roots
-            // first, then walk and acknowledge bounded manifest batches as they
-            // are discovered instead of building the full tree up front.
             let mut entries = task.manifest.entries.clone();
             let mut digest = ManifestDigest::new();
             let mut total_size = 0u64;
@@ -842,7 +973,7 @@ impl TransferService {
                         first,
                         entries = page.len(),
                         elapsed_ms = elapsed.as_millis() as u64,
-                        "接收端处理清单分片较慢"
+                        "Receiver is taking a long time to process manifest chunks"
                     );
                 } else {
                     tracing::info!(
@@ -850,7 +981,7 @@ impl TransferService {
                         first,
                         entries = page.len(),
                         elapsed_ms = elapsed.as_millis() as u64,
-                        "清单分片已确认"
+                        "Manifest chunk confirmed"
                     );
                 }
                 match response {
@@ -861,7 +992,7 @@ impl TransferService {
                         self.edit(id, |t| t.status = status)?;
                         return Ok(());
                     }
-                    _ => return Err(AppError::Other("接收方未确认顶层清单".into())),
+                    _ => return Err(AppError::Other("Receiver did not confirm the top-level manifest".into())),
                 }
             }
 
@@ -873,13 +1004,10 @@ impl TransferService {
                 &mut sent_chunks,
             )
             .await?;
+            if ["paused", "remote_paused"].contains(&self.status_of(id)?.as_str()) {
+                self.wait_remote_resume(id).await?;
+            }
             if self.stopped(id)? {
-                if self.status_of(id)? == "remote_paused" {
-                    if self.wait_remote_resume(&mut control, id).await? {
-                        return Ok(());
-                    }
-                }
-                self.notify_remote_stop(&mut control, id, &task.wire_id).await;
                 return Ok(());
             }
             let selected = task.sources.iter().map(|root| root.path.clone()).collect();
@@ -888,15 +1016,19 @@ impl TransferService {
                 .last()
                 .map(|entry| entry.path.clone())
                 .unwrap_or_default();
-            tracing::info!(task = %task.wire_id, roots = roots_count, "清单阶段：顶层已发送，准备继续扫描目录");
+            tracing::info!(task = %task.wire_id, roots = roots_count, "Manifest phase: top-level entries sent; continuing directory scan");
+            let cutoff = chrono::DateTime::parse_from_rfc3339(&task.created_at)
+                .map(|t| t.timestamp_millis() as u64)
+                .unwrap_or(u64::MAX);
             let scanner = tokio::task::spawn_blocking(move || {
                 let mut scanner = source::SourceScanner::new(selected)?;
+                scanner.set_cutoff(cutoff);
                 scanner.resume_after(roots_count, &last_root)?;
                 Ok::<_, AppError>(scanner)
             })
             .await
             .map_err(|e| AppError::Other(e.to_string()))??;
-            tracing::info!(task = %task.wire_id, "清单阶段：扫描器已就绪，开始逐批扫描");
+            tracing::info!(task = %task.wire_id, "Manifest phase: scanner is ready; starting batched scan");
             // 与"补齐剩余扫描"共用同一段循环：这里 send_data=true（边扫边传）。
             let mut stream = ScanStream {
                 resume_manifest_at,
@@ -914,12 +1046,10 @@ impl TransferService {
             let first = self
                 .stream_scan(&mut control, &task, &mut stream, scanner, roots_count)
                 .await?;
+            if ["paused", "remote_paused"].contains(&self.status_of(id)?.as_str()) {
+                self.wait_remote_resume(id).await?;
+            }
             if self.stopped(id)? {
-                if self.status_of(id)? == "remote_paused" {
-                    if self.wait_remote_resume(&mut control, id).await? {
-                        return Ok(());
-                    }
-                }
                 return Ok(());
             }
             let ScanStream {
@@ -929,11 +1059,11 @@ impl TransferService {
             let manifest = Manifest::new(entries, task.chunk_size, task.verify_hash);
             manifest.validate()?;
             drop(manifest);
-            tracing::info!(task = %task.wire_id, entries = first, "清单阶段：扫描结束，发送清单结束帧");
+            tracing::info!(task = %task.wire_id, entries = first, "Manifest phase: scan ended; sending manifest end frame");
             self.finish_source_scan(id, final_digest)?;
             self.edit(id, |t| {
                 t.event(format!(
-                    "清单扫描完成：{} 个文件 · {} 个目录",
+                    "Manifest scan complete: {} files · {} folders",
                     t.file_count, t.directory_count
                 ))
             })?;
@@ -950,10 +1080,6 @@ impl TransferService {
                 .await?;
         }
         loop {
-            // On Offer reconnect, the peer can already have thousands of
-            // committed chunks while this sender still has only the top-level
-            // roots in memory. Finish and announce the local manifest before
-            // comparing the peer's chunk ranges against it.
             if !task.scan_complete
                 && matches!(
                     &state,
@@ -970,17 +1096,27 @@ impl TransferService {
                     .await?;
                 continue;
             }
+            if ["paused", "remote_paused"].contains(&self.status_of(id)?.as_str()) {
+                if !self.wait_remote_resume(id).await? {
+                    return Ok(());
+                }
+                state = control
+                    .request(&Request::Poll {
+                        id: task.wire_id.clone(),
+                    })
+                    .await?;
+            }
             if self.stopped(id)? {
                 return Ok(());
             }
             match state {
-                Response::State { status, completed }
-                    if ["accepted", "transferring", "completed"].contains(&status.as_str()) =>
-                {
-            let count = task.manifest.chunk_count().max(task.chunk_count);
-            if let Some(last) = completed.max().filter(|last| *last >= count) {
-                return Err(AppError::BadRequest(format!(
-                    "对端返回的已完成分块超出本地清单（最大分块 {last}，清单分块数 {count}）"
+                Response::State {
+                    status, completed, ..
+                } if ["accepted", "transferring", "completed"].contains(&status.as_str()) => {
+                    let count = task.manifest.chunk_count().max(task.chunk_count);
+                    if let Some(last) = completed.max().filter(|last| *last >= count) {
+                        return Err(AppError::BadRequest(format!(
+                    "Peer reported completed chunks beyond the local manifest (maximum chunk {last}, manifest chunks {count})"
                 )));
                     }
                     self.edit(id, |t| {
@@ -1018,9 +1154,9 @@ impl TransferService {
                             let cancelled = status == "cancelled";
                             t.status = status;
                             t.event(if cancelled {
-                                "接收方已取消任务"
+                                "The receiver cancelled the task"
                             } else {
-                                "接收方已拒绝任务"
+                                "The receiver declined the task"
                             });
                         }
                     })?;
@@ -1039,71 +1175,39 @@ impl TransferService {
                             .into();
                         }
                         t.event(if status == "paused" {
-                            "接收方已暂停，等待恢复"
+                            "The receiver paused the task. Waiting for it to resume"
                         } else {
-                            "等待接收方继续"
+                            "Waiting for the receiver to continue"
                         });
                     })?;
-                    loop {
-                        tokio::select! {
-                            _ = self.shutdown.cancelled() => return Ok(()),
-                            result = self.wait_remote_event(&mut control, id) => {
-                                match result? .as_str() {
-                                    "queued" => {
-                                        self.edit(id, |task| task.resume_requested = false)?;
-                                        state = control.request(&Request::Poll { id: task.wire_id.clone() }).await?;
-                                        break;
-                                    }
-                                    "cancelled" | "rejected" | "completed" => return Ok(()),
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => return Err(AppError::Other("接收方未返回有效接收状态".into())),
-            }
-        }
-        let mut creation_control = control;
-        let mut control = self.channel(&peers, &task, &cooldown, true).await?;
-        let state = control
-            .request(&Request::Poll {
-                id: task.wire_id.clone(),
-            })
-            .await?;
-        match state {
-            Response::State { status, completed }
-                if ["accepted", "transferring", "completed"].contains(&status.as_str()) =>
-            {
-                self.edit(id, |record| {
-                    record.completed = completed.iter().collect();
-                    record.completed_count = record.completed.len();
-                    record.completed_bytes = record.completed.iter()
-                        .filter_map(|index| record.manifest.chunk(*index))
-                        .filter(|chunk| !record.skipped_files.contains(&chunk.file))
-                        .map(|chunk| chunk.length as u64)
-                        .sum();
-                    record.status = if status == "completed" {
-                        "completed"
+                    if self.wait_remote_resume(id).await? {
+                        self.edit(id, |task| task.resume_requested = false)?;
+                        state = control
+                            .request(&Request::Poll {
+                                id: task.wire_id.clone(),
+                            })
+                            .await?;
                     } else {
-                        "transferring"
+                        return Ok(());
                     }
-                    .into();
-                })?;
-                if status == "completed" {
-                    return Ok(());
                 }
+                // 接收端仍停留在"发送方已暂停"的旧认知，而本地已经在传输：
+                // 直接重新下发 Resume 让对端回到接收态。这里不能报错，也不能
+                // 等对端的状态事件——事件可能已在这次重连中丢失。
+                Response::State { status, .. } if status == "remote_paused" => {
+                    self.edit(id, |t| {
+                        t.event(
+                            "The receiver has not received the resume notice. Synchronizing again",
+                        )
+                    })?;
+                    state = control
+                        .request(&Request::Resume {
+                            id: task.wire_id.clone(),
+                        })
+                        .await?;
+                }
+                _ => return Err(AppError::Other("Unexpected receiver state response".into())),
             }
-            Response::State { status, .. } if status == "paused" => {
-                self.edit(id, |record| record.status = "remote_paused".into())?;
-                let _ = self.wait_remote_resume(&mut creation_control, id).await?;
-                return Ok(());
-            }
-            Response::State { status, .. } if ["cancelled", "rejected"].contains(&status.as_str()) => {
-                self.edit(id, |record| record.status = status)?;
-                return Ok(());
-            }
-            _ => return Err(AppError::Other("接收方未就绪，无法建立传输会话".into())),
         }
         let chunks = task.manifest.chunks();
         let pending = chunks
@@ -1125,8 +1229,6 @@ impl TransferService {
         let concurrency = pending.len().clamp(1, per_task_workers);
         let queue = Arc::new(Mutex::new(pending));
         let mut workers = tokio::task::JoinSet::new();
-        // Keep the creation connection open for receiver state events while the
-        // task connection and chunk streams carry transfer traffic.
         for _ in 0..concurrency {
             let service = self.clone();
             let peers = peers.clone();
@@ -1135,8 +1237,9 @@ impl TransferService {
             let queue = queue.clone();
             workers.spawn(async move {
                 let mut channel = service.channel(&peers, &task, &cooldown, false).await?;
+                let mut prepared_file = None;
                 loop {
-                    if service.stopped(&task.id)? {
+                    if !service.wait_remote_resume(&task.id).await? {
                         return Ok::<_, AppError>(());
                     }
                     let Some((index, chunk)) = queue.lock().await.pop_front() else {
@@ -1145,41 +1248,37 @@ impl TransferService {
                     if service.is_skipped(&task.id, chunk.file) {
                         continue;
                     }
+                    if prepared_file != Some(chunk.file) {
+                        service
+                            .prepare_remote_file(&mut channel, &task, chunk.file)
+                            .await?;
+                        prepared_file = Some(chunk.file);
+                    }
                     let bytes = match service.read_chunk_cached(&task, chunk).await {
                         Ok(bytes) => bytes,
-                        Err(AppError::Conflict(_)) => {
-                            match channel
-                                .request(&Request::SkipFile {
-                                    id: task.wire_id.clone(),
-                                    file: chunk.file,
-                                })
-                                .await?
-                            {
-                                Response::Ack => {}
-                                _ => {
-                                    return Err(AppError::Other(
-                                        "接收方未确认跳过变化文件，请更新两端软件后重试".into(),
-                                    ))
-                                }
-                            }
-                            service.mark_skipped(&task.id, chunk.file)?;
-                            continue;
+                        Err(e) => {
+                            return Err(service
+                                .source_read_failed(&mut channel, &task, chunk.file, e)
+                                .await)
                         }
-                        Err(e) => return Err(e),
                     };
                     let sha256 = task
                         .manifest
                         .verify_hash
                         .then(|| format!("{:x}", Sha256::digest(&bytes)));
                     loop {
-                        if service.stopped(&task.id)? {
+                        if !service.wait_remote_resume(&task.id).await? {
                             return Ok(());
                         }
                         match channel
                             .chunk(
-                                &Request::Chunk {
+                                &Request::VersionedChunk {
                                     id: task.wire_id.clone(),
                                     index,
+                                    file_version: super::model::file_version(
+                                        chunk.file,
+                                        &task.manifest.entries[chunk.file],
+                                    ),
                                     length: bytes.len(),
                                     sha256: sha256.clone(),
                                 },
@@ -1191,26 +1290,34 @@ impl TransferService {
                                 service.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
                                 break;
                             }
-                            Response::State { status, .. } if status == "paused" => {
-                                service.edit(&task.id, |t| {
-                                    if !["cancelled", "completed"].contains(&t.status.as_str()) {
-                                        t.status = "remote_paused".into();
-                                        t.event("接收方已暂停，等待状态同步恢复或取消");
-                                    }
-                                })?;
-                                return Ok(());
+                            Response::State {
+                                status, revision, ..
+                            } if ["paused", "remote_paused"].contains(&status.as_str()) => {
+                                if status == "paused" {
+                                    service
+                                        .apply_remote_state(
+                                            &task.peer_id,
+                                            &task.wire_id,
+                                            revision,
+                                            "paused",
+                                        )
+                                        .await?;
+                                }
+                                if !service.wait_remote_resume(&task.id).await? {
+                                    return Ok(());
+                                }
                             }
                             Response::State { status, .. } if status == "cancelled" => {
                                 service.edit(&task.id, |t| {
                                     if t.status != "cancelled" {
                                         t.status = "cancelled".into();
                                         t.error = None;
-                                        t.event("接收方已取消任务");
+                                        t.event("The receiver cancelled the task");
                                     }
                                 })?;
                                 return Ok(());
                             }
-                            _ => return Err(AppError::Other("接收方未提交 Chunk".into())),
+                            _ => return Err(AppError::Other("Receiver did not submit the chunk".into())),
                         }
                     }
                 }
@@ -1224,21 +1331,8 @@ impl TransferService {
                 return Err(err);
             }
         }
-        if self.status_of(id)? == "remote_paused" {
-            let _ = self.wait_remote_resume(&mut creation_control, id).await?;
-            return Ok(());
-        }
-        if self.stopped(id)? {
-            if self.status_of(id)?.as_str() == "paused" {
-                let _ = control.request(&Request::Pause { id: task.wire_id.clone() }).await;
-            }
-            return Ok(());
-        }
         loop {
-            if self.stopped(id)? {
-                if self.status_of(id)?.as_str() == "paused" {
-                    let _ = control.request(&Request::Pause { id: task.wire_id.clone() }).await;
-                }
+            if !self.wait_remote_resume(id).await? {
                 return Ok(());
             }
             match control
@@ -1247,17 +1341,43 @@ impl TransferService {
                 })
                 .await?
             {
+                Response::Repair { files } => {
+                    if files.is_empty() {
+                        return Err(AppError::Conflict("Receiver requested an empty file repair list".into()));
+                    }
+                    self.edit(id, |t| {
+                        t.status = "queued".into();
+                        t.error = None;
+                        t.event(format!(
+                            "Repairing {} files from the original manifest",
+                            files.len()
+                        ));
+                    })?;
+                    return Ok(());
+                }
                 Response::Ack => {
                     self.edit(id, |t| {
                         t.status = "completed".into();
                         t.error = None;
-                        t.event("收到接收方的文件落盘回执");
+                        t.event("Received the receiver’s file-write receipt");
                     })?;
                     return Ok(());
                 }
-                Response::State { status, .. }
-                    if ["paused", "accepted", "transferring"].contains(&status.as_str()) =>
+                Response::State {
+                    status, revision, ..
+                } if ["paused", "remote_paused", "accepted", "transferring"]
+                    .contains(&status.as_str()) =>
                 {
+                    if status == "paused" {
+                        self.apply_remote_state(&task.peer_id, &task.wire_id, revision, "paused")
+                            .await?;
+                    }
+                    if ["paused", "remote_paused"].contains(&status.as_str()) {
+                        if !self.wait_remote_resume(id).await? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
                     // 提交可能要对几十万文件做 rename，接收端会持续报告 transferring；
                     // 这里必须继续等待回执，不能当成错误结束。
                     self.edit(id, |t| {
@@ -1273,7 +1393,7 @@ impl TransferService {
                     self.edit(id, |t| t.status = status)?;
                     return Ok(());
                 }
-                _ => return Err(AppError::Other("接收方尚未完成文件提交".into())),
+                _ => return Err(AppError::Other("Receiver has not finished committing the file".into())),
             }
         }
     }

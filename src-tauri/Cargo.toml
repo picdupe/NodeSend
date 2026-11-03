@@ -7,7 +7,7 @@
 
 [package]
 name = "nodesend"
-version = "0.1.5-build.128"
+version = "0.1.6-build.129"
 default-run = "nodesend"
 description = "NodeSend 跨平台文件传输与共享 Service"
 authors = ["NodeSend"]
@@ -19,25 +19,9 @@ rust-version = "1.95"
 name = "nodesend_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-# 默认不启用任何附加特性：GUI 与安装包只包含 nodesend 主程序。
-default = []
-# 独立命令行客户端开关。CLI 与 GUI 共用应用数据目录和端口，GUI 已启动时无法再占用
-# 同一端口，因此不作为随安装包分发的组件，只单独构建：
-#   cargo build --release --features cli --bin nodesend-cli
-cli = []
-
 [[bin]]
 name = "nodesend"
 path = "src/main.rs"
-
-# 开发者/独立命令工具。required-features 让 cargo 在默认构建中完全跳过它；
-# 较新的 tauri-cli 打包时同样尊重该字段（修复见 tauri-apps/tauri#15325），
-# 更早版本会忽略，见 scripts/windows.ps1 打包前的残留清理。
-[[bin]]
-name = "nodesend-cli"
-path = "src/bin/nodesend-cli.rs"
-required-features = ["cli"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -47,12 +31,14 @@ embed-resource = "3"
 [dependencies]
 # --- Tauri ---
 tauri = { version = "2", features = [] }
+tauri-plugin-os = "2"
 
 # --- 异步运行时 / HTTP 服务（内嵌共享 HTTP，基线 §12）---
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio-util = { version = "0.7", features = ["io"] }
+crossterm = "0.29"
 
 # --- 本地 Node 发现与原生传输 ---
 mdns-sd = "0.11"
@@ -117,7 +103,7 @@ rfd = "0.15"
 tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 smb2 = "0.27"

@@ -25,14 +25,14 @@
 
 use super::{paths, relay, TransferService};
 use crate::error::{AppError, AppResult};
+#[cfg(target_os = "android")]
+use std::os::fd::FromRawFd;
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
-#[cfg(target_os = "android")]
-use std::os::fd::FromRawFd;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
     sync::{mpsc, Mutex as AsyncMutex},
@@ -56,7 +56,6 @@ const GAP_TIMEOUT: Duration = crate::tuning::WRITE_GAP_TIMEOUT;
 const TICK: Duration = crate::tuning::WRITE_TICK;
 
 /// 缓存盘写满后的重试间隔（不报错、不丢数据，等待转写任务释放空间）。
-const CACHE_POLL: Duration = crate::tuning::CACHE_SPACE_POLL;
 
 /// 队列中的单个待写入块。
 pub(crate) struct PendingChunk {
@@ -88,11 +87,6 @@ struct FileBuffer {
 const DIRECT_SYNC_BYTES: u64 = 32 * 1024 * 1024;
 const DIRECT_SYNC_FILES: usize = 8;
 
-/// 任务是否处于可写入状态（供转写调度等「是否继续推进」判定使用）。
-pub(crate) fn writable(status: &str) -> bool {
-    ["accepted", "transferring"].contains(&status)
-}
-
 /// 已入队（已向发送端 Ack）的块是否应放弃落盘。
 ///
 /// 暂停**不丢弃**已收块：这些块已对发送端确认，发送端据此记为完成；若在此丢弃，
@@ -100,7 +94,15 @@ pub(crate) fn writable(status: &str) -> bool {
 /// 「仍有未提交 Chunk」。暂停期间 `receive_chunk` 已拒绝新块，因此不会新增。
 /// 只有取消 / 拒绝 / 完成等终态才放弃这些块。
 fn abandon(status: &str) -> bool {
-    ["cancelling", "cancelled", "rejected", "completed"].contains(&status)
+    [
+        "cancelling",
+        "cancelled",
+        "rejected",
+        "completed",
+        "partial_completed",
+        "incompatible",
+    ]
+    .contains(&status)
 }
 
 /// 取已登记的共享文件句柄（复用任务运行期资源里的句柄，避免重复 open）。
@@ -146,7 +148,7 @@ impl Writer {
     async fn accept(&mut self, service: &Arc<TransferService>, chunk: PendingChunk) {
         let task_id = chunk.task_id.clone();
         if let Err(err) = self.store(service, chunk).await {
-            tracing::error!(task = %task_id, "接收写入失败: {err}");
+            tracing::error!(task = %task_id, "Receive write failed: {err}");
             self.files.retain(|(t, _), _| t != &task_id);
             fail_task(service, &task_id, &err);
         }
@@ -165,6 +167,11 @@ impl Writer {
             return Ok(());
         }
         let key = (chunk.task_id.clone(), chunk.file);
+        if self.files.get(&key).is_some_and(|b| b.handle.is_some())
+            && cached_handle(service, &chunk.task_id, chunk.file).is_none()
+        {
+            self.files.remove(&key);
+        }
         if !self.files.contains_key(&key) {
             let Some(buffer) = open_buffer(service, &chunk.task_id, chunk.file).await? else {
                 discard_one(service, &chunk.task_id, chunk.index);
@@ -174,7 +181,7 @@ impl Writer {
         }
         self.files
             .get_mut(&key)
-            .expect("缓冲刚插入")
+            .expect("Buffer just inserted")
             .ready
             .insert(chunk.offset, chunk);
         self.drain(service, &key).await
@@ -207,7 +214,7 @@ impl Writer {
                 }
                 return Ok(());
             }
-            let chunk = buffer.ready.remove(&offset).expect("刚取过最小偏移");
+            let chunk = buffer.ready.remove(&offset).expect("Just removed the lowest offset");
             buffer.gap_since = None;
             let end = offset + chunk.data.len() as u64;
             let use_cache = buffer.use_cache;
@@ -215,13 +222,16 @@ impl Writer {
             if use_cache {
                 // 缓存模式：写缓存盘分段并 sync，目标盘不参与传输过程。
                 if !store_cached(service, &chunk).await? {
-                    continue; // 任务已不可写，块已丢弃
+                    continue; // The cache writer already recorded the task error.
                 }
             } else {
-                let mut file = handle.as_ref().expect("直写模式必有目标句柄").lock().await;
+                let _writer = service.destination_writer.lock().await;
+                let mut file = handle.as_ref().expect("Direct-write mode requires a target handle").lock().await;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
                 file.write_all(&chunk.data).await?;
-                buffer.dirty.push((chunk.task_id.clone(), chunk.index, chunk.data.len() as u64));
+                buffer
+                    .dirty
+                    .push((chunk.task_id.clone(), chunk.index, chunk.data.len() as u64));
                 buffer.dirty_bytes = buffer.dirty_bytes.saturating_add(chunk.data.len() as u64);
             }
             if buffer.next_offset < end {
@@ -243,15 +253,15 @@ impl Writer {
                     (base..base + count).all(|index| task.completed.contains(&index))
                 });
                 if complete {
-                    // Windows cannot rename an open staging file. Drop both
-                    // the local handle and the writer's buffer before commit.
                     drop(handle);
                     if let Some(buffer) = self.files.remove(key) {
                         for pending in buffer.ready.values() {
                             discard_one(service, &pending.task_id, pending.index);
                         }
                     }
-                    service.commit_ready_file(&chunk.task_id, chunk.file).await?;
+                    service
+                        .commit_ready_file(&chunk.task_id, chunk.file)
+                        .await?;
                     return Ok(());
                 }
             }
@@ -271,8 +281,19 @@ impl Writer {
     }
 
     async fn sync_direct(&mut self, service: &Arc<TransferService>) -> AppResult<()> {
-        for buffer in self.files.values_mut().filter(|buffer| !buffer.use_cache && !buffer.dirty.is_empty()) {
-            buffer.handle.as_ref().expect("直写模式必有目标句柄").lock().await.sync_data().await?;
+        for buffer in self
+            .files
+            .values_mut()
+            .filter(|buffer| !buffer.use_cache && !buffer.dirty.is_empty())
+        {
+            buffer
+                .handle
+                .as_ref()
+                .expect("Direct-write mode requires a target handle")
+                .lock()
+                .await
+                .sync_data()
+                .await?;
             for (task_id, index, length) in std::mem::take(&mut buffer.dirty) {
                 service.mark_chunk_done(&task_id, index, length)?;
                 discard_one(service, &task_id, index);
@@ -302,20 +323,20 @@ impl Writer {
                 continue;
             }
             if let Err(err) = self.drain(service, &key).await {
-                tracing::error!(task = %key.0, "接收写入失败: {err}");
+                tracing::error!(task = %key.0, "Receive write failed: {err}");
                 self.files.remove(&key);
                 fail_task(service, &key.0, &err);
             }
         }
         if let Err(err) = self.sync_direct(service).await {
-            tracing::error!("接收端批量刷盘失败: {err}");
+            tracing::error!("Failed to flush received chunks in a batch: {err}");
             for (task_id, _) in self.files.keys() {
                 fail_task(service, task_id, &err);
             }
         }
         for key in self.files.keys().cloned().collect::<Vec<_>>() {
             if let Err(err) = self.commit_if_complete(service, &key).await {
-                tracing::error!(task = %key.0, "接收文件提交失败: {err}");
+                tracing::error!(task = %key.0, "Failed to commit received file: {err}");
                 self.files.remove(&key);
                 fail_task(service, &key.0, &err);
             }
@@ -327,7 +348,9 @@ impl Writer {
         service: &Arc<TransferService>,
         key: &(String, usize),
     ) -> AppResult<()> {
-        let Some(buffer) = self.files.get(key) else { return Ok(()); };
+        let Some(buffer) = self.files.get(key) else {
+            return Ok(());
+        };
         if buffer.use_cache || !buffer.dirty.is_empty() || !buffer.ready.is_empty() {
             return Ok(());
         }
@@ -346,19 +369,23 @@ impl Writer {
 }
 
 /// 写一个块到缓存盘分段文件，并在成功后 `sync_data`。
-/// 缓存盘写满（ENOSPC）时不报错：阻塞等待转写任务释放空间后重试。
+/// 缓存盘实际空间不足时暂停，避免其他进程占盘导致永久等待。
 async fn store_cached(service: &Arc<TransferService>, chunk: &PendingChunk) -> AppResult<bool> {
     let Some(cache_root) = service.cache_root_for_task(&chunk.task_id) else {
-        return Err(AppError::Other("缓存目录不可用".into()));
+        return Err(AppError::Other("Cache directory is unavailable".into()));
     };
-    let dir = paths::cache_task(&cache_root, &chunk.task_id);
-    std::fs::create_dir_all(&dir)?;
-    let path = paths::cache_segment(
+    let cache_name = service.cache_name_for(&chunk.task_id, chunk.file);
+    let path = paths::cache_segment_named(
         &cache_root,
         &chunk.task_id,
         chunk.file,
+        cache_name.as_deref(),
         chunk.offset / relay::SEG_BYTES,
+        service.file_write_plan(&chunk.task_id, chunk.file)?.1,
     );
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let within = chunk.offset % relay::SEG_BYTES;
     loop {
         if abandon(&service.status_of(&chunk.task_id)?) {
@@ -366,8 +393,22 @@ async fn store_cached(service: &Arc<TransferService>, chunk: &PendingChunk) -> A
             return Ok(false);
         }
         match write_segment(&path, within, &chunk.data).await {
-            Ok(()) => return Ok(true),
-            Err(err) if is_disk_full(&err) => tokio::time::sleep(CACHE_POLL).await,
+            Ok(()) => {
+                if service.verify_hash_of(&chunk.task_id)? {
+                    use sha2::{Digest, Sha256};
+                    let digest = format!("{:x}", Sha256::digest(&chunk.data));
+                    service.app.db.with_conn(|db| {
+                        db.execute("INSERT OR REPLACE INTO transfer_chunk_hash(task_id,chunk_index,digest) VALUES(?1,?2,?3)",rusqlite::params![chunk.task_id,chunk.index as i64,digest])?;
+                        Ok(())
+                    })?;
+                }
+                return Ok(true);
+            }
+            Err(err) if is_disk_full(&err) => {
+                return Err(AppError::Conflict(
+                    "Insufficient free space in the cache directory".into(),
+                ))
+            }
             Err(err) => return Err(err),
         }
     }
@@ -409,8 +450,19 @@ async fn open_buffer(
         // 缓存模式：只为缓存盘建目录，绝不触碰目标盘。
         let cache_root = service
             .cache_root_for_task(id)
-            .ok_or_else(|| AppError::Other("缓存目录不可用".into()))?;
-        std::fs::create_dir_all(paths::cache_task(&cache_root, id))?;
+            .ok_or_else(|| AppError::Other("Cache directory is unavailable".into()))?;
+        let cache_name = service.cache_name_for(id, file);
+        let dir = paths::cache_segment_named(
+            &cache_root,
+            id,
+            file,
+            cache_name.as_deref(),
+            0,
+            expected_size,
+        );
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         return Ok(Some(FileBuffer {
             ready: BTreeMap::new(),
             next_offset,
@@ -425,12 +477,11 @@ async fn open_buffer(
     if _direct_download {
         let task = service.record(id)?;
         let request = service.android_download_request(&task, file)?;
-        let opened = tokio::task::spawn_blocking(move || {
-            crate::android_import::open_download_file(request)
-        })
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?
-        .map_err(AppError::Other)?;
+        let opened =
+            tokio::task::spawn_blocking(move || crate::android_import::open_download_file(request))
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?
+                .map_err(AppError::Other)?;
         if opened.skipped {
             service.mark_conflict_skipped(id, file)?;
             return Ok(None);
@@ -438,13 +489,10 @@ async fn open_buffer(
         let handle = match cached_handle(service, id, file) {
             Some(handle) => handle,
             None => {
-                // SAFETY: MediaStore detaches this descriptor into Rust
-                // ownership exactly once; tokio::fs::File closes it afterwards.
                 let raw = unsafe { std::fs::File::from_raw_fd(opened.fd) };
                 let opened = tokio::fs::File::from_std(raw);
                 let handle = Arc::new(AsyncMutex::new(opened));
-                crate::locks::lock(&service.runtime(id).receive_files)
-                    .insert(file, handle.clone());
+                crate::locks::lock(&service.runtime(id).receive_files).insert(file, handle.clone());
                 handle
             }
         };
@@ -517,7 +565,9 @@ fn fail_task(service: &Arc<TransferService>, task_id: &str, err: &crate::error::
     // 写盘失败后不再继续复用句柄：释放目标盘句柄（调用方已移除文件缓冲）。
     service.release_files(task_id);
     let _ = service.edit(task_id, |t| {
+        t.status = "paused".into();
+        t.state_revision = t.state_revision.wrapping_add(1);
         t.error = Some(err.to_string());
-        t.event(format!("写入失败：{err}"));
+        t.event(format!("Write failed: {err}"));
     });
 }

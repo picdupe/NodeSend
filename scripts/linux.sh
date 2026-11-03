@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build both the GUI AppImage and the native CLI on a Linux builder.
+# Build NodeSend and its AppImage on a Linux builder.
 # Usage: ./scripts/linux.sh [debug] [stable|test]
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -39,14 +39,12 @@ if [[ "$PROFILE_ARG" != "debug" ]]; then
 fi
 
 npm run build
-# 先打包 GUI：nodesend-cli 属于 cli feature，不应进入 AppImage。
+# Build the shared executable once.
 if [[ "$PROFILE_ARG" == "debug" ]]; then
   PROFILE=debug
-  CLI_FLAGS=()
   npm exec -- tauri build --bundles appimage --debug --config src-tauri/tauri.linux.fast.json
 else
   PROFILE=release
-  CLI_FLAGS=(--release)
   npm exec -- tauri build --bundles appimage
 fi
 
@@ -127,10 +125,7 @@ PY
   fi
 fi
 
-# GUI 打包完成后再单独构建 CLI，作为独立命令分发。
-cargo build --manifest-path src-tauri/Cargo.toml --features cli --bin nodesend-cli "${CLI_FLAGS[@]}"
-
 mkdir -p dist/linux
-cp "src-tauri/target/$PROFILE/nodesend-cli" dist/linux/
+cp "src-tauri/target/$PROFILE/nodesend" dist/linux/
 cp "src-tauri/target/$PROFILE/bundle/appimage/"*.AppImage dist/linux/ 2>/dev/null || true
 echo "Linux artifacts written to dist/linux"

@@ -1,4 +1,3 @@
-//! Real QUIC streams and TLS-over-TCP share the same framed protocol.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,8 +83,9 @@ impl Channel {
     pub async fn request(&mut self, r: &Request) -> AppResult<Response> {
         protocol::write_frame(&mut *self.writer, r).await?;
         let timeout = match r {
-            // SAF providers may copy a large staged file before acknowledging.
-            Request::Commit { .. } => crate::tuning::COMMIT_ACK_TIMEOUT,
+            Request::Commit { .. }
+            | Request::RecoveryProbe { .. }
+            | Request::PrepareFile { .. } => crate::tuning::COMMIT_ACK_TIMEOUT,
             // 接收端按条处理清单，慢盘上可能远超默认 IO 超时。
             Request::Offer { .. }
             | Request::ManifestChunk { .. }
@@ -107,12 +107,10 @@ impl Channel {
         protocol::write_frame(&mut *self.writer, r).await?;
         tokio::time::timeout(protocol::IO_TIMEOUT, async {
             self.writer.write_all(data).await?;
-            // TLS may accept plaintext while encrypted bytes remain buffered
-            // under backpressure. Drain them before waiting for the chunk ACK.
             self.writer.flush().await
         })
         .await
-        .map_err(|_| AppError::Other("Chunk 写入超时".into()))??;
+        .map_err(|_| AppError::Other("Chunk write timed out".into()))??;
         self.response().await
     }
 }
@@ -204,7 +202,7 @@ pub async fn connect(
     let address = endpoint.socket(false)?;
     if !allow_public && !is_local(address.ip()) {
         return Err(AppError::Forbidden(format!(
-            "公网路径需要显式允许：{}",
+            "PUBLIC_PATH_CONFIRM_REQUIRED:{}",
             endpoint.address
         )));
     }
@@ -217,16 +215,16 @@ pub async fn connect(
         .await
         {
             Ok(Ok(channel)) => {
-                tracing::info!(remote = %endpoint.address, quic = endpoint.quic_port, peer_id = %channel.peer_id, "QUIC 原生连接已建立");
+                tracing::info!(remote = %endpoint.address, quic = endpoint.quic_port, peer_id = %channel.peer_id, "Native QUIC connection established");
                 return Ok(channel);
             }
             Ok(Err(err)) => {
-                tracing::debug!(remote = %endpoint.address, quic = endpoint.quic_port, %err, "QUIC 连接失败，回退 TCP");
+                tracing::debug!(remote = %endpoint.address, quic = endpoint.quic_port, %err, "QUIC connection failed; falling back to TCP");
                 quic_error = Some(err.to_string());
             }
             Err(_) => {
-                tracing::debug!(remote = %endpoint.address, quic = endpoint.quic_port, "QUIC 握手超时，回退 TCP");
-                quic_error = Some("QUIC 握手超时".into());
+                tracing::debug!(remote = %endpoint.address, quic = endpoint.quic_port, "QUIC handshake timed out; falling back to TCP");
+                quic_error = Some("QUIC handshake timed out".into());
             }
         }
     }
@@ -240,20 +238,20 @@ pub async fn connect(
         Ok(Err(err)) => {
             let reason = match err.kind() {
                 std::io::ErrorKind::ConnectionRefused => {
-                    "无法连接设备：对方可能离线、未启动 NodeSend，或此端口未开放。请确认对方状态后重试".to_string()
+                    "Could not connect to the device: it may be offline, NodeSend may not be running, or the port may be closed. Check the peer and try again.".to_string()
                 }
-                _ => format!("网络连接失败：{err}"),
+                _ => format!("Network connection failed: {err}"),
             };
-            tracing::warn!(%address, error = %reason, "TCP 连接失败");
+            tracing::warn!(%address, error = %reason, "TCP connection failed");
             return Err(other(reason));
         }
         Err(_) => {
-            tracing::warn!(%address, "TCP 连接超时（对方在线但端口无响应）");
-            return Err(other("连接设备超时，请检查对方是否在线及网络是否可达"));
+            tracing::warn!(%address, "TCP connection timed out (peer is online but the port is not responding)");
+            return Err(other("Connection timed out; check whether the peer is online and reachable"));
         }
     };
     stream.set_nodelay(true)?;
-    tracing::debug!(%address, "TCP 已连接，开始 TLS 握手");
+    tracing::debug!(%address, "TCP connected; starting TLS handshake");
     let connector =
         tokio_rustls::TlsConnector::from(Arc::new(tls::client(app, expected.map(str::to_owned))?));
     let secured = match tokio::time::timeout(
@@ -267,20 +265,20 @@ pub async fn connect(
     {
         Ok(Ok(secured)) => secured,
         Ok(Err(error)) => {
-            let quic = quic_error.unwrap_or_else(|| "未尝试".into());
-            tracing::warn!(%address, %error, quic = %quic, "TLS 握手失败");
+            let quic = quic_error.unwrap_or_else(|| "Not attempted".into());
+            tracing::warn!(%address, %error, quic = %quic, "TLS handshake failed");
             return Err(other(format!("TCP TLS: {error}; QUIC: {quic}")));
         }
         Err(_) => {
-            let quic = quic_error.unwrap_or_else(|| "未尝试".into());
-            tracing::warn!(%address, quic = %quic, "TLS 握手超时：端口接受了连接但没有完成 NodeSend 握手");
+            let quic = quic_error.unwrap_or_else(|| "Not attempted".into());
+            tracing::warn!(%address, quic = %quic, "TLS handshake timed out: the port accepted the connection but did not complete the NodeSend handshake");
             return Err(other(format!(
-                "TCP TLS 握手超时：对方端口接受了连接，但没有完成 NodeSend 握手。常见原因：对方 NodeSend 未正常运行或进程卡住、端口被其他程序占用，或防火墙/安全软件只放行了握手、拦截了数据。QUIC: {quic}"
+                "TCP TLS handshake timed out: the peer accepted the connection but did not complete the NodeSend handshake. Common causes include NodeSend not running or being stuck on the peer, the port being occupied, or a firewall/security tool allowing the handshake but blocking data. QUIC: {quic}"
             )));
         }
     };
     let peer_id = tls::remember(app, secured.get_ref().1.peer_certificates().unwrap_or(&[]))?;
-    tracing::info!(%address, peer_id = %peer_id, "TCP 原生连接已建立");
+    tracing::info!(%address, peer_id = %peer_id, "Native TCP connection established");
     let (reader, writer) = tokio::io::split(secured);
     Ok(Channel {
         reader: Box::new(reader),
@@ -320,9 +318,9 @@ async fn connect_quic(
         .map_err(other)?;
     let identity = connection
         .peer_identity()
-        .ok_or_else(|| other("缺少对端证书"))?
+        .ok_or_else(|| other("Peer certificate is missing"))?
         .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-        .map_err(|_| other("对端证书格式非法"))?;
+        .map_err(|_| other("Peer certificate is invalid"))?;
     let peer_id = tls::remember(app, &identity)?;
     let (writer, reader) = connection.open_bi().await.map_err(other)?;
     Ok(Channel {
@@ -334,10 +332,12 @@ async fn connect_quic(
         _connection: Some(connection),
     })
 }
-pub async fn hello(channel: &mut Channel, app: &AppService) -> AppResult<(String, String, u16, u16)> {
+pub async fn hello(
+    channel: &mut Channel,
+    app: &AppService,
+) -> AppResult<(String, String, u16, u16)> {
     match channel
         .request(&Request::Hello {
-            // Match the protocol version used by the committed GitHub build.
             version: protocol::VERSION,
             node_id: app.identity.node_id.clone(),
             display_name: display_name(app),
@@ -355,23 +355,41 @@ pub async fn hello(channel: &mut Channel, app: &AppService) -> AppResult<(String
         } if version == protocol::VERSION && node_id == channel.peer_id => {
             Ok((display_name, device_type, tcp_port, quic_port))
         }
-        _ => Err(AppError::Forbidden("Node 身份或协议版本不匹配".into())),
+        _ => Err(AppError::Forbidden("Node identity or protocol version does not match".into())),
     }
 }
 
 fn local_device_type() -> &'static str {
     #[cfg(target_os = "android")]
-    { "android" }
+    {
+        "android"
+    }
     #[cfg(target_os = "ios")]
-    { "ios" }
+    {
+        "ios"
+    }
     #[cfg(target_os = "windows")]
-    { "windows" }
+    {
+        "windows"
+    }
     #[cfg(target_os = "macos")]
-    { "macos" }
+    {
+        "macos"
+    }
     #[cfg(target_os = "linux")]
-    { "linux" }
-    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "windows", target_os = "macos", target_os = "linux")))]
-    { "unknown" }
+    {
+        "linux"
+    }
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux"
+    )))]
+    {
+        "unknown"
+    }
 }
 #[cfg(target_os = "windows")]
 fn windows_device_name() -> Option<String> {
@@ -379,11 +397,8 @@ fn windows_device_name() -> Option<String> {
     extern "system" {
         fn GetComputerNameExW(kind: i32, buffer: *mut u16, size: *mut u32) -> i32;
     }
-    // ComputerNameDnsHostname preserves case, unlike the NetBIOS name in
-    // COMPUTERNAME. Use the active name, not a pending rename from the registry.
     let mut buffer = [0u16; 256];
     let mut size = buffer.len() as u32;
-    // SAFETY: buffer is writable for size UTF-16 code units; size is valid.
     let success = unsafe { GetComputerNameExW(1, buffer.as_mut_ptr(), &mut size) };
     if success == 0 || size as usize > buffer.len() {
         return None;
@@ -434,7 +449,7 @@ pub async fn serve(listeners: Listeners, transfers: Arc<TransferService>, peers:
     let acceptor = match tls::server(&transfers.app) {
         Ok(c) => tokio_rustls::TlsAcceptor::from(Arc::new(c)),
         Err(e) => {
-            tracing::error!(%e,"TLS 初始化失败");
+            tracing::error!(%e,"TLS initialization failed");
             return;
         }
     };
@@ -524,7 +539,7 @@ fn acquire_slot(
             tracing::warn!(
                 %remote,
                 permits = slots.available_permits(),
-                "连接数已达上限，拒绝新的{}会话",
+                "Connection limit reached; rejecting new {} session",
                 kind.label()
             );
             None
@@ -552,17 +567,17 @@ async fn register_identity(
     match remembered {
         Ok(Ok(Ok(peer_id))) => Some(peer_id),
         Ok(Ok(Err(error))) => {
-            tracing::warn!(%remote, %error, "{} 会话身份登记失败", kind.label());
+            tracing::warn!(%remote, %error, "{} session identity registration failed", kind.label());
             None
         }
         Ok(Err(error)) => {
-            tracing::warn!(%remote, %error, "{} 会话身份登记任务异常", kind.label());
+            tracing::warn!(%remote, %error, "{} session identity registration task panicked", kind.label());
             None
         }
         Err(_) => {
             tracing::warn!(
                 %remote,
-                "{} 会话身份登记超时（数据库锁可能被长期占用），已放弃本次会话",
+                "{} session identity registration timed out (the database lock may be held); abandoning this session",
                 kind.label()
             );
             None
@@ -656,10 +671,8 @@ async fn finish_session(
     quic_port: u16,
 ) {
     if let Err(error) = session(channel, transfers, peers, remote, tcp_port, quic_port).await {
-        tracing::debug!(peer_id = %channel.peer_id, transport = channel.kind, %remote, %error, "原生会话结束");
+        tracing::debug!(peer_id = %channel.peer_id, transport = channel.kind, %remote, %error, "Native session ended");
     }
-    // Send TLS close_notify (or finish the QUIC stream) on our own exit.
-    // A closed stream still does not substitute for a durable commit ACK.
     let _ = tokio::time::timeout(
         crate::tuning::SHUTDOWN_FLUSH_TIMEOUT,
         channel.writer.shutdown(),
@@ -675,15 +688,17 @@ async fn session(
     tcp_port: u16,
     quic_port: u16,
 ) -> AppResult<()> {
-    let request: Request = protocol::read_frame(&mut *channel.reader).await.map_err(|error| {
-        tracing::warn!(
-            peer_id = %channel.peer_id,
-            transport = channel.kind,
-            %error,
-            "底层连接已建立，但读取首个 NodeSend HELLO 请求失败"
-        );
-        error
-    })?;
+    let request: Request = protocol::read_frame(&mut *channel.reader)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                peer_id = %channel.peer_id,
+                transport = channel.kind,
+                %error,
+                "Transport channel established, but failed to read the first NodeSend HELLO request"
+            );
+            error
+        })?;
     let (peer_name, peer_device_type) = match request {
         Request::Hello {
             version,
@@ -696,7 +711,7 @@ async fn session(
         {
             (display_name, device_type)
         }
-        _ => return Err(AppError::Forbidden("无效 HELLO".into())),
+        _ => return Err(AppError::Forbidden("Invalid HELLO".into())),
     };
     protocol::write_frame(
         &mut *channel.writer,
@@ -728,7 +743,12 @@ async fn session(
         };
         persistent |= matches!(
             &request,
-            Request::Offer { .. } | Request::Poll { .. } | Request::WatchTask { .. }
+            Request::Offer { .. }
+                | Request::Poll { .. }
+                | Request::WatchTask { .. }
+                | Request::Chunk { .. }
+                | Request::VersionedChunk { .. }
+                | Request::ManifestChunk { .. }
         );
         // 清单/提交阶段的帧必须留痕：发送端说"已发出"而接收端毫无记录时，
         // 这是唯一能区分"帧没到"和"处理失败"的证据。
@@ -739,7 +759,7 @@ async fn session(
                     transport = channel.kind,
                     first,
                     entries = entries.len(),
-                    "收到清单分片"
+                    "Received manifest chunk"
                 );
             }
             Request::ManifestDone {
@@ -752,14 +772,14 @@ async fn session(
                     transport = channel.kind,
                     file_count,
                     total_size,
-                    "收到清单结束帧"
+                    "Received manifest end frame"
                 );
             }
             Request::Offer { .. } => {
-                tracing::info!(peer = %channel.peer_id, transport = channel.kind, "收到清单摘要（Offer）");
+                tracing::info!(peer = %channel.peer_id, transport = channel.kind, "Received manifest summary (Offer)");
             }
             Request::Commit { .. } => {
-                tracing::info!(peer = %channel.peer_id, transport = channel.kind, "收到提交请求");
+                tracing::info!(peer = %channel.peer_id, transport = channel.kind, "Received commit request");
             }
             _ => {}
         }
@@ -768,57 +788,9 @@ async fn session(
                 id,
                 revision: last_revision,
             } => {
-                let id = crate::transfer::model::incoming_id(&channel.peer_id, id);
-                let runtime = transfers.runtime(&id);
-                let mut events = runtime.control_events.subscribe();
-                // Subscribe before reading durable state so a concurrent UI
-                // decision cannot fall between the snapshot and subscription.
-                let task = transfers.record(&id)?;
+                let id = transfers.task_id_for_peer_wire(&channel.peer_id, id)?;
                 protocol::write_frame(&mut *channel.writer, &Response::Ack).await?;
-                if task.state_revision > *last_revision && task.status != "waiting" {
-                    if let Some(status) = TransferService::control_status(&task) {
-                        protocol::write_frame(
-                            &mut *channel.writer,
-                            &Response::TaskEvent {
-                                revision: task.state_revision,
-                                status: status.into(),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                }
-                loop {
-                    tokio::select! {
-                        _ = transfers.shutdown.cancelled() => return Ok(()),
-                        // Also notice a disconnected sender while no events
-                        // are being produced. This session has no more requests.
-                        closed = channel.reader.read_u8() => {
-                            return match closed {
-                                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
-                                Err(error) => Err(error.into()),
-                                Ok(_) => Err(other("状态订阅会话收到意外请求")),
-                            };
-                        }
-                        changed = events.changed() => {
-                            if changed.is_err() { return Ok(()); }
-                            let event = events.borrow_and_update().clone();
-                            if let Some((next_revision, status)) = event {
-                                if next_revision > *last_revision {
-                                    protocol::write_frame(
-                                        &mut *channel.writer,
-                                        &Response::TaskEvent {
-                                            revision: next_revision,
-                                            status: status.clone(),
-                                        },
-                                    ).await?;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                continue;
+                return super::state::serve(channel, transfers, peers, &id, *last_revision).await;
             }
             Request::Addresses => {
                 let addresses = if_addrs::get_if_addrs()?
@@ -876,7 +848,7 @@ async fn session(
                             .await?;
                         let copied = tokio::io::copy(&mut file, &mut *channel.writer).await?;
                         if copied != length {
-                            return Err(AppError::Other("源文件在下载过程中发生变化".into()));
+                            return Err(AppError::Other("Source file changed while being read".into()));
                         }
                         channel.writer.flush().await?;
                     }
@@ -920,7 +892,7 @@ async fn session(
                             _ => {
                                 drop(file);
                                 let _ = tokio::fs::remove_file(target).await;
-                                return Err(AppError::Other("NodeSend 上传中断".into()));
+                                return Err(AppError::Other("NodeSend upload was interrupted".into()));
                             }
                         }
                     }
@@ -939,10 +911,31 @@ async fn session(
             _ => {}
         }
         let request_label = request_label(&request);
-        let restart_send = matches!(&request, Request::TaskState { status, .. } if status == "resumed");
+        let restart_send = matches!(&request, Request::TaskState { status, .. } if status == "resumed")
+            || matches!(&request, Request::ResumeTask { .. });
         let request_id = match &request {
-            Request::TaskState { id, .. } => transfers.task_id_for_peer_wire(&channel.peer_id, id).ok(),
+            Request::TaskState { id, .. } | Request::ResumeTask { id, .. } => {
+                transfers.task_id_for_peer_wire(&channel.peer_id, id).ok()
+            }
             _ => None,
+        };
+        let (request, file_version) = match request {
+            Request::VersionedChunk {
+                id,
+                index,
+                length,
+                sha256,
+                file_version,
+            } => (
+                Request::Chunk {
+                    id,
+                    index,
+                    length,
+                    sha256,
+                },
+                Some(file_version),
+            ),
+            other => (other, None),
         };
         let result = match request {
             Request::Chunk {
@@ -952,25 +945,49 @@ async fn session(
                 sha256,
             } => {
                 if length as u64 > crate::transfer::CHUNK_SIZE {
-                    return Err(AppError::BadRequest("Chunk 过大".into()));
+                    return Err(AppError::BadRequest("Chunk is too large".into()));
                 }
                 let mut data = vec![0; length];
                 tokio::time::timeout(protocol::IO_TIMEOUT, channel.reader.read_exact(&mut data))
                     .await
-                    .map_err(|_| other("Chunk 读取超时"))??;
+                    .map_err(|_| other("Chunk read timed out"))??;
                 transfers
                     .receive_chunk(
                         &crate::transfer::model::incoming_id(&channel.peer_id, &id),
                         index,
                         data,
                         sha256,
+                        file_version,
                         channel.kind,
                     )
                     .await
             }
+            Request::ResumeTask { id, revision } => {
+                let task_id = transfers.task_id_for_peer_wire(&channel.peer_id, &id)?;
+                let task = transfers.record(&task_id)?;
+                if task.direction != "send" {
+                    return Err(AppError::Conflict("Task is not a send task".into()));
+                }
+                if task.status == "offline" {
+                    return Err(AppError::Conflict(
+                        "The peer is offline; the task cannot be resumed yet".into(),
+                    ));
+                }
+                if revision < task.remote_state_revision {
+                    return Err(AppError::Conflict("Received a stale task state revision".into()));
+                }
+                transfers.action(&task_id, "resume").await?;
+                Ok(Response::Ack)
+            }
             other => {
                 transfers
-                    .control(&channel.peer_id, &peer_name, &peer_device_type, other, channel.kind)
+                    .control(
+                        &channel.peer_id,
+                        &peer_name,
+                        &peer_device_type,
+                        other,
+                        channel.kind,
+                    )
                     .await
             }
         };
@@ -984,7 +1001,7 @@ async fn session(
                     transport = channel.kind,
                     request = request_label,
                     %e,
-                    "会话请求处理失败，已返回错误帧"
+                    "Session request failed; an error frame was returned"
                 );
                 Response::Error {
                     message: e.to_string(),
@@ -1003,7 +1020,10 @@ async fn session(
                             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                         }
                     }
-                    if service.record(&id).is_ok_and(|task| task.direction == "send" && task.status == "queued") {
+                    if service
+                        .record(&id)
+                        .is_ok_and(|task| task.direction == "send" && task.status == "queued")
+                    {
                         service.start_task(peer_store, id);
                     }
                 });
@@ -1015,16 +1035,23 @@ async fn session(
 /// 请求类型简称：用于日志（`Request` 的 Debug 对清单分片会打印上千条条目）。
 fn request_label(request: &Request) -> &'static str {
     match request {
+        Request::PrepareFile { .. } => "PrepareFile",
+        Request::RecoveryProbe { .. } => "RecoveryProbe",
+        Request::RecoveryAck { .. } => "RecoveryAck",
+        Request::SourceIssue { .. } => "SourceIssue",
+        Request::ReplaceFile { .. } => "ReplaceFile",
         Request::SkipFile { .. } => "SkipFile",
         Request::Addresses => "Addresses",
         Request::Hello { .. } => "Hello",
         Request::Offer { .. } => "Offer",
         Request::Reconnect { .. } => "Reconnect",
+        Request::ResumeTask { .. } => "ResumeTask",
         Request::ManifestChunk { .. } => "ManifestChunk",
         Request::ManifestDone { .. } => "ManifestDone",
         Request::Poll { .. } => "Poll",
         Request::WatchTask { .. } => "WatchTask",
         Request::Chunk { .. } => "Chunk",
+        Request::VersionedChunk { .. } => "VersionedChunk",
         Request::Commit { .. } => "Commit",
         Request::Pause { .. } => "Pause",
         Request::Resume { .. } => "Resume",

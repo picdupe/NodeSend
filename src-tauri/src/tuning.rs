@@ -40,8 +40,8 @@ pub(crate) const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 // --- 清单与分块 ---
 
 /// 协议版本：帧格式变更必须同步提升，两端不一致时 HELLO 会直接拒绝。
-/// v5：增加发送端建立的持久任务状态事件流。
-pub(crate) const PROTOCOL_VERSION: u16 = 5;
+/// v8：文件级缓存准入、修复请求、源版本替换及中断恢复校验。
+pub(crate) const PROTOCOL_VERSION: u16 = 8;
 /// 单帧清单条数（**发送起点**）。小批量先行：选完目录立刻就能发第一批，
 /// 不必等扫满整批落库批次（[`MANIFEST_PAGE`]）才开始发送。
 pub(crate) const MANIFEST_BATCH: usize = 256;
@@ -92,12 +92,15 @@ pub(crate) const WRITE_GAP_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const WRITE_TICK: Duration = Duration::from_millis(200);
 /// 缓存盘满时轮询可用空间的间隔。
 pub(crate) const CACHE_SPACE_POLL: Duration = Duration::from_millis(200);
+pub(crate) const CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+pub(crate) const CACHE_RECEIVE_BYTES: u64 = CACHE_MAX_BYTES / 2;
+pub(crate) const CACHE_ASSEMBLE_BYTES: u64 = CACHE_MAX_BYTES / 2;
 /// 等待本任务已入队块落盘的上限。
 pub(crate) const AWAIT_WRITES_TIMEOUT: Duration = Duration::from_secs(30);
 /// 转写长时间无进展即判定失败（避免 commit 永久等待）。
 pub(crate) const RELAY_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// 缓存转写的分段大小，以及触发转写的起始缓存量。
-pub(crate) const RELAY_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const RELAY_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 /// 缓存盘保留的最小可用空间：低于此值阻塞接收，等待转写释放。
 
 // --- 发现与巡检 ---

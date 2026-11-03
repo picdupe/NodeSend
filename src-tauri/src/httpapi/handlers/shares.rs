@@ -85,7 +85,7 @@ pub async fn tree(
 
     let real = security::resolve_existing(share.path_ref(), &virtual_path)?;
     if !real.is_dir() {
-        return Err(AppError::BadRequest("请求路径不是目录".into()));
+        return Err(AppError::BadRequest("Request path is not a directory".into()));
     }
     let mut root = tree::build_tree(&real, &virtual_path, depth)?;
     root.name = share.name.clone(); // 根节点显示共享名称（虚拟根）
@@ -104,7 +104,7 @@ pub async fn list(
 
     let real = security::resolve_existing(share.path_ref(), &virtual_path)?;
     if !real.is_dir() {
-        return Err(AppError::BadRequest("请求路径不是目录".into()));
+        return Err(AppError::BadRequest("Request path is not a directory".into()));
     }
     let root = tree::build_tree(&real, &virtual_path, 1)?;
     Ok(Json(serde_json::json!({
@@ -140,7 +140,7 @@ pub async fn download(
 
     let real = security::resolve_existing(share.path_ref(), &virtual_path)?;
     if !real.is_file() {
-        return Err(AppError::BadRequest("下载目标不是文件".into()));
+        return Err(AppError::BadRequest("Download target is not a file".into()));
     }
     let file_name = real
         .file_name()
@@ -191,7 +191,7 @@ pub async fn upload(
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(|err| AppError::BadRequest(format!("multipart 解析失败: {err}")))?
+        .map_err(|err| AppError::BadRequest(format!("Multipart parsing failed: {err}")))?
     {
         if field.name() != Some("file") {
             continue;
@@ -206,7 +206,7 @@ pub async fn upload(
         while let Some(chunk) = field
             .chunk()
             .await
-            .map_err(|err| AppError::BadRequest(format!("上传数据读取失败: {err}")))?
+            .map_err(|err| AppError::BadRequest(format!("Failed to read uploaded data: {err}")))?
         {
             size += chunk.len() as u64;
             file.write_all(&chunk).await?;
@@ -218,7 +218,9 @@ pub async fn upload(
             size,
         }));
     }
-    Err(AppError::BadRequest("未找到名为 file 的上传字段".into()))
+    Err(AppError::BadRequest(
+        "No upload field named file was found".into(),
+    ))
 }
 
 /// 公共鉴权：加载共享、提取调用方、执行访问控制。
@@ -230,7 +232,7 @@ fn authorize_request(
 ) -> AppResult<ShareConfig> {
     let share = share_repo::get_by_id(&state.db, id)?;
     if share.protocol != crate::share::ShareProtocol::Nodesend {
-        return Err(AppError::NotFound("请使用该共享配置的协议访问".into()));
+        return Err(AppError::NotFound("Use the protocol configured for this share".into()));
     }
     let caller = extract_caller(headers, query_token);
     authorize(&share, &caller, &state.db)?;

@@ -48,7 +48,7 @@ pub fn get_by_id(db: &Db, id: &str) -> AppResult<ShareConfig> {
             params![id],
             row_to_config,
         )
-        .map_err(|_| AppError::NotFound(format!("共享 {id} 不存在")))
+        .map_err(|_| AppError::NotFound(format!("Share {id} does not exist")))
     })
 }
 
@@ -69,15 +69,15 @@ pub fn create(
     access_mode: AccessMode,
 ) -> AppResult<ShareConfig> {
     if name.trim().is_empty() {
-        return Err(AppError::BadRequest("共享名称不能为空".into()));
+        return Err(AppError::BadRequest("Share name cannot be empty".into()));
     }
     if get_by_name(db, name)?.is_some() {
-        return Err(AppError::Conflict(format!("共享名称 {name} 已存在")));
+        return Err(AppError::Conflict(format!(
+            "Share name {name} already exists"
+        )));
     }
     if !std::path::Path::is_dir(std::path::Path::new(path)) {
-        return Err(AppError::BadRequest(format!(
-            "目录不存在或不是目录: {path}"
-        )));
+        return Err(AppError::BadRequest(format!("Directory does not exist or is not a directory: {path}")));
     }
 
     let token = if access_mode == AccessMode::Token {
@@ -109,18 +109,22 @@ pub fn update(
     let mut current = get_by_id(db, id)?;
     if let Some(new_name) = name {
         if new_name.trim().is_empty() {
-            return Err(AppError::BadRequest("共享名称不能为空".into()));
+            return Err(AppError::BadRequest("Share name cannot be empty".into()));
         }
         if new_name != current.name {
             if get_by_name(db, &new_name)?.is_some() {
-                return Err(AppError::Conflict(format!("共享名称 {new_name} 已存在")));
+                return Err(AppError::Conflict(format!(
+                    "Share name {new_name} already exists"
+                )));
             }
             current.name = new_name;
         }
     }
     if let Some(new_path) = path {
         if !std::path::Path::is_dir(std::path::Path::new(&new_path)) {
-            return Err(AppError::BadRequest(format!("目录不存在: {new_path}")));
+            return Err(AppError::BadRequest(format!(
+                "Directory does not exist: {new_path}"
+            )));
         }
         current.path = new_path;
     }

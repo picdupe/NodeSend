@@ -1,9 +1,7 @@
-//! Versioned, length-bounded NodeSend native protocol; no HTTP dependency.
 use crate::error::{AppError, AppResult};
 use crate::transfer::model::{FileEntry, OfferSummary};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-/// v3 adds incremental scan summaries and partial-manifest resume offsets.
 pub const VERSION: u16 = crate::tuning::PROTOCOL_VERSION;
 pub const MAX_FRAME: usize = crate::tuning::MAX_FRAME;
 pub const IO_TIMEOUT: std::time::Duration = crate::tuning::FRAME_IO_TIMEOUT;
@@ -24,8 +22,6 @@ pub struct CompletedRanges {
     ranges: Vec<[u32; 2]>,
 }
 
-// Read legacy v3 arrays as well as the v4 compact object. Serialization remains
-// the v4 compact shape so this build interoperates with the committed GitHub build.
 impl<'de> Deserialize<'de> for CompletedRanges {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -105,6 +101,30 @@ impl CompletedRanges {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    PrepareFile {
+        id: String,
+        file: usize,
+    },
+    RecoveryProbe {
+        id: String,
+        #[serde(default)]
+        epoch: u64,
+    },
+    RecoveryAck {
+        id: String,
+        epoch: u64,
+        repair: Vec<usize>,
+    },
+    SourceIssue {
+        id: String,
+        file: usize,
+        kind: String,
+    },
+    ReplaceFile {
+        id: String,
+        file: usize,
+        entry: FileEntry,
+    },
     SkipFile {
         id: String,
         file: usize,
@@ -122,10 +142,12 @@ pub enum Request {
         id: String,
         summary: OfferSummary,
     },
-    /// Sender has automatically reconnected after an interruption; resume only
-    /// recoverable interrupted receive tasks, never an intentional user pause.
     Reconnect {
         id: String,
+    },
+    ResumeTask {
+        id: String,
+        revision: u64,
     },
     /// 清单分片：`first` 为本片首条在整份清单中的下标（0 起，按序递增）。
     ManifestChunk {
@@ -143,10 +165,16 @@ pub enum Request {
     Poll {
         id: String,
     },
-    /// Keep a sender-initiated session open for receiver control events.
     WatchTask {
         id: String,
         revision: u64,
+    },
+    VersionedChunk {
+        id: String,
+        index: usize,
+        length: usize,
+        sha256: Option<String>,
+        file_version: String,
     },
     Chunk {
         id: String,
@@ -163,8 +191,6 @@ pub enum Request {
     Resume {
         id: String,
     },
-    /// Task state control plane. Sent only when state changes; retried while
-    /// the task remains live if the peer is temporarily unreachable.
     TaskState {
         id: String,
         revision: u64,
@@ -198,6 +224,14 @@ pub struct NativeEntry {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    RecoveryFiles {
+        epoch: u64,
+        files: Vec<(usize, Option<String>)>,
+    },
+    Repair {
+        files: Vec<usize>,
+    },
+    StateHeartbeat,
     TaskEvent {
         revision: u64,
         status: String,
@@ -217,6 +251,7 @@ pub enum Response {
         quic_port: u16,
     },
     State {
+        revision: u64,
         status: String,
         completed: CompletedRanges,
     },
@@ -243,7 +278,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
 ) -> AppResult<()> {
     let body = serde_json::to_vec(value)?;
     if body.len() > MAX_FRAME {
-        return Err(AppError::BadRequest("协议消息过大".into()));
+        return Err(AppError::BadRequest("Protocol message is too large".into()));
     }
     tokio::time::timeout(IO_TIMEOUT, async {
         w.write_u32(body.len() as u32).await?;
@@ -251,7 +286,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
         w.flush().await
     })
     .await
-    .map_err(|_| AppError::Other("网络写入超时".into()))??;
+    .map_err(|_| AppError::Other("Network write timed out".into()))??;
     Ok(())
 }
 pub async fn read_frame<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
@@ -266,18 +301,16 @@ pub async fn read_frame_with_timeout<R: AsyncRead + Unpin + ?Sized, T: Deseriali
     tokio::time::timeout(timeout, async {
         let length = r.read_u32().await? as usize;
         if length == 0 || length > MAX_FRAME {
-            return Err(AppError::BadRequest("协议帧长度非法".into()));
+            return Err(AppError::BadRequest("Invalid protocol frame length".into()));
         }
         let mut buf = vec![0; length];
         r.read_exact(&mut buf).await?;
         Ok(serde_json::from_slice(&buf)?)
     })
     .await
-    .map_err(|_| AppError::Other("网络读取超时".into()))?
+    .map_err(|_| AppError::Other("Network read timed out".into()))?
 }
 
-/// Event streams may be idle while a person decides. Bound partial frames,
-/// but do not time out waiting for the first byte of the next event.
 pub async fn read_event<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
     r: &mut R,
 ) -> AppResult<T> {

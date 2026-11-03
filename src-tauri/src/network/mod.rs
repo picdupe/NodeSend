@@ -1,8 +1,8 @@
-//! Composition of native discovery, authenticated transports and TransferService.
 pub mod browser;
 pub mod discovery;
 pub mod peers;
 pub mod protocol;
+pub(crate) mod state;
 pub mod tls;
 pub mod transport;
 use crate::locks::MutexExt;
@@ -31,8 +31,7 @@ pub struct NetworkOptions {
 impl Default for NetworkOptions {
     fn default() -> Self {
         Self {
-            // Dual-stack listeners accept both native IPv6 and IPv4 peers.
-            bind: "[::]:58082".parse().unwrap(),
+            bind: "[::]:8192".parse().unwrap(),
             discovery: true,
         }
     }
@@ -63,17 +62,52 @@ pub struct NetworkManager {
     preflights: Mutex<HashMap<String, CancellationToken>>,
 }
 impl NetworkManager {
+    pub fn ui_language(&self) -> String {
+        self.app
+            .get_setting("ui_language")
+            .ok()
+            .flatten()
+            .filter(|value| matches!(value.as_str(), "zh-CN" | "zh-TW" | "en-US" | "ja-JP"))
+            .unwrap_or_else(crate::locale::preferred_language)
+    }
+
     pub async fn start(app: Arc<AppService>) -> AppResult<Arc<Self>> {
         Self::start_with(app, NetworkOptions::default()).await
     }
     pub async fn start_with(app: Arc<AppService>, options: NetworkOptions) -> AppResult<Arc<Self>> {
-        let listeners = transport::bind(&app, options.bind).or_else(|e| {
-            if options.bind.ip().is_unspecified() && options.bind.is_ipv6() {
-                tracing::warn!(error = %e, "IPv6 双栈监听失败，回退为仅 IPv4；IPv6 地址将不可连接");
-                transport::bind(&app, SocketAddr::from(([0, 0, 0, 0], options.bind.port())))
-            } else {
-                Err(e)
+        let mut last_error = None;
+        let requested = options.bind.port();
+        let base_port = requested.max(8192);
+        let ports = if requested == 0 {
+            0..=0
+        } else {
+            base_port..=u16::MAX
+        };
+        let mut listeners = None;
+        for port in ports {
+            let ipv6 = SocketAddr::new(options.bind.ip(), port);
+            match transport::bind(&app, ipv6) {
+                Ok(value) => {
+                    listeners = Some(value);
+                    break;
+                }
+                Err(error) if options.bind.is_ipv6() && options.bind.ip().is_unspecified() => {
+                    tracing::debug!(port, error = %error, "IPv6 dual-stack listener failed; falling back to IPv4. IPv6 addresses will be unreachable.");
+                    match transport::bind(&app, SocketAddr::from(([0, 0, 0, 0], port))) {
+                        Ok(value) => {
+                            listeners = Some(value);
+                            break;
+                        }
+                        Err(fallback_error) => last_error = Some(fallback_error),
+                    }
+                }
+                Err(error) => last_error = Some(error),
             }
+        }
+        let listeners = listeners.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                AppError::Other("Failed to bind a TCP listener".into())
+            })
         })?;
         let tcp_port = listeners.tcp_port;
         let quic_port = listeners.quic_port;
@@ -113,8 +147,66 @@ impl NetworkManager {
             server: Mutex::new(Some(server)),
             preflights: Mutex::new(HashMap::new()),
         });
-        // Interrupted tasks remain paused until the user explicitly resumes
-        // them; startup must never unexpectedly reconnect or send files.
+        for task in manager
+            .transfers
+            .snapshots()
+            .into_iter()
+            .filter(|task| task.direction == "send" && task.status == "interrupted")
+        {
+            manager.transfers.start_task(manager.peers.clone(), task.id);
+        }
+        for task in manager
+            .transfers
+            .snapshots()
+            .into_iter()
+            .filter(|task| ["paused", "remote_paused"].contains(&task.status.as_str()))
+        {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                let Ok(task) = manager.transfers.record(&task.id) else {
+                    return;
+                };
+                let Ok(peer) = manager.peers.get(&task.peer_id) else {
+                    return;
+                };
+                for endpoint in peer.endpoints {
+                    let Ok(mut channel) = transport::connect(
+                        &manager.app,
+                        &endpoint,
+                        Some(&task.peer_id),
+                        false,
+                        task.allow_public,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if transport::hello(&mut channel, &manager.app).await.is_err() {
+                        continue;
+                    }
+                    if !matches!(
+                        channel
+                            .request(&protocol::Request::WatchTask {
+                                id: task.wire_id.clone(),
+                                revision: task.remote_state_revision,
+                            })
+                            .await,
+                        Ok(protocol::Response::Ack)
+                    ) {
+                        continue;
+                    }
+                    state::spawn(
+                        channel,
+                        manager.transfers.clone(),
+                        manager.peers.clone(),
+                        task.id,
+                        0,
+                    )
+                    .detach();
+                    return;
+                }
+            });
+        }
         Ok(manager)
     }
     pub fn status(&self) -> NetworkStatus {
@@ -144,7 +236,8 @@ impl NetworkManager {
             tasks: self.transfers.snapshots(),
             receive_directory: self.transfers.default_destination(),
             cache_directory: self.transfers.cache_directory(),
-            receive_policy: self.app
+            receive_policy: self
+                .app
                 .get_setting("receive_policy")
                 .ok()
                 .flatten()
@@ -167,7 +260,12 @@ impl NetworkManager {
             .flatten()
             .unwrap_or_else(|| "ask".into());
         let trusted = crate::registry::list(&self.app.db)
-            .map(|nodes| nodes.into_iter().map(|node| node.node_id).collect::<std::collections::HashSet<_>>())
+            .map(|nodes| {
+                nodes
+                    .into_iter()
+                    .map(|node| node.node_id)
+                    .collect::<std::collections::HashSet<_>>()
+            })
             .unwrap_or_default();
         self.transfers
             .snapshots()
@@ -195,13 +293,15 @@ impl NetworkManager {
     ) -> AppResult<Peer> {
         let input = address.trim();
         if input.is_empty() {
-            return Err(AppError::BadRequest("请输入对方 IP 或主机名".into()));
+            return Err(AppError::BadRequest(
+                "Enter the peer IP address or host name".into(),
+            ));
         }
         let endpoints = resolve_manual_endpoints(&self.app.identity.node_id, input).await?;
-        tracing::info!(address = %input, candidates = endpoints.len(), "手动连接：开始尝试候选地址");
-        let mut failure = "Endpoint 无可用地址".to_string();
+        tracing::info!(address = %input, candidates = endpoints.len(), "Manual connection: trying candidate addresses");
+        let mut failure = "No usable Endpoint address".to_string();
         for endpoint in endpoints {
-            tracing::info!(address = %endpoint.address, tcp = endpoint.tcp_port, quic = endpoint.quic_port, source = %endpoint.source, "尝试连接候选地址");
+            tracing::info!(address = %endpoint.address, tcp = endpoint.tcp_port, quic = endpoint.quic_port, source = %endpoint.source, "Trying candidate address");
             match transport::connect(
                 &self.app,
                 &endpoint,
@@ -222,7 +322,7 @@ impl NetworkManager {
                                 quic = endpoint.quic_port,
                                 peer_id = %channel.peer_id,
                                 error = %error,
-                                "QUIC 通道已建立，但 HELLO 失败；手动连接改用 TCP 重试"
+                                "QUIC channel established, but HELLO failed; retrying manual connection over TCP"
                             );
                             let mut tcp_channel = transport::connect(
                                 &self.app,
@@ -238,10 +338,10 @@ impl NetworkManager {
                                     tcp = endpoint.tcp_port,
                                     quic_error = %error,
                                     tcp_error = %tcp_error,
-                                    "QUIC HELLO 失败，TCP 回退连接也失败"
+                                    "QUIC HELLO failed and the TCP fallback connection also failed"
                                 );
                                 AppError::Other(format!(
-                                    "QUIC 握手失败：{error}；TCP 回退也失败：{tcp_error}"
+                                    "QUIC handshake failed: {error}; TCP fallback also failed: {tcp_error}"
                                 ))
                             })?;
                             let result = transport::hello(&mut tcp_channel, &self.app)
@@ -252,10 +352,10 @@ impl NetworkManager {
                                         tcp = endpoint.tcp_port,
                                         quic_error = %error,
                                         tcp_error = %tcp_error,
-                                        "QUIC 与 TCP 的 NodeSend HELLO 握手均失败"
+                                        "Both QUIC and TCP NodeSend HELLO handshakes failed"
                                     );
                                     AppError::Other(format!(
-                                        "QUIC 握手失败：{error}；TCP 握手也失败：{tcp_error}"
+                                        "QUIC handshake failed: {error}; TCP handshake also failed: {tcp_error}"
                                     ))
                                 })?;
                             (tcp_channel, result)
@@ -267,15 +367,15 @@ impl NetworkManager {
                                 transport = channel.kind,
                                 peer_id = %channel.peer_id,
                                 error = %error,
-                                "手动连接已建立底层通道，但 NodeSend HELLO 握手失败"
+                                "Manual connection established a transport channel, but the NodeSend HELLO handshake failed"
                             );
                             return Err(AppError::Other(format!(
-                                "已连接到对方端口，但 NodeSend 握手失败：{error}"
+                                "Connected to the peer's port, but the NodeSend handshake failed: {error}"
                             )));
                         }
                     };
                     if channel.peer_id == self.app.identity.node_id {
-                        return Err(AppError::BadRequest("不能添加本机作为远端设备".into()));
+                        return Err(AppError::BadRequest("Cannot add this device as a remote device".into()));
                     }
                     let node_id = channel.peer_id.clone();
                     self.peers.upsert(
@@ -288,16 +388,16 @@ impl NetworkManager {
                         }],
                         true,
                     )?;
-                    tracing::info!(peer_id = %node_id, "已添加设备");
+                    tracing::info!(peer_id = %node_id, "Device added");
                     return self.peers.get(&node_id);
                 }
                 Err(err) => {
-                    tracing::warn!(address = %endpoint.address, tcp = endpoint.tcp_port, error = %err, "候选地址连接失败");
+                    tracing::warn!(address = %endpoint.address, tcp = endpoint.tcp_port, error = %err, "Candidate address connection failed");
                     failure = err.to_string();
                 }
             }
         }
-        tracing::warn!(address = %input, error = %failure, "手动连接失败：所有候选地址均不可用");
+        tracing::warn!(address = %input, error = %failure, "Manual connection failed: all candidate addresses are unavailable");
         Err(AppError::Other(failure))
     }
     pub async fn send(
@@ -353,11 +453,9 @@ impl NetworkManager {
             ep.socket(false)
                 .is_ok_and(|addr| !transport::is_local(addr.ip()))
         });
-        // Discovery freshness is only a UI hint. Verify the stable Node ID on
-        // a live connection before creating any task, and refresh metadata.
         let mut reachable = false;
         let mut peer_device_type = String::new();
-        let mut last_error = String::from("没有可用地址");
+        let mut last_error = String::from("No available address");
         for endpoint in &peer.endpoints {
             if !allow_public
                 && !endpoint
@@ -367,7 +465,7 @@ impl NetworkManager {
                 continue;
             }
             let result = tokio::select! {
-                _ = cancellation.cancelled() => return Err(AppError::Other("已取消发送前连接检测。".into())),
+                _ = cancellation.cancelled() => return Err(AppError::Other("Cancelled pre-send connection check.".into())),
                 result = async {
                     let mut channel = transport::connect(&self.app, endpoint, Some(&peer_id), false, allow_public).await?;
                     let hello = transport::hello(&mut channel, &self.app).await?;
@@ -382,7 +480,7 @@ impl NetworkManager {
                     // 这种情况必须立刻报错，否则界面会一直停在"连接检测"。
                     if channel.peer_id == self.app.identity.node_id {
                         return Err(AppError::BadRequest(
-                            "对方使用的 Node ID 与本机完全相同：同一身份不能在两台设备上同时使用，请在对方设备上删除/重建应用数据目录（%APPDATA%\\NodeSend）后重试。".into(),
+                            "The peer is using the same Node ID as this device. One identity cannot be used on two devices at once. Delete or recreate the app data directory (%APPDATA%\\NodeSend) on the other device and try again.".into(),
                         ));
                     }
                     self.peers.upsert(
@@ -417,7 +515,7 @@ impl NetworkManager {
                         )
                         .await
                         {
-                            tracing::debug!(%error, "后台地址更新未完成，保留已有地址");
+                            tracing::debug!(%error, "Background address update is incomplete; retaining existing addresses");
                         }
                     });
                     break;
@@ -432,21 +530,28 @@ impl NetworkManager {
             if !allow_public {
                 if let Some(endpoint) = public_endpoint {
                     return Err(AppError::Forbidden(format!(
-                        "公网路径需要显式允许：{}",
+                        "Public routes require explicit permission: {}",
                         endpoint.address
                     )));
                 }
             }
-            tracing::debug!(%peer_id, %last_error, "发送前连接检测失败");
+            tracing::debug!(%peer_id, %last_error, "Pre-send connection check failed");
             return Err(AppError::Other(
-                "暂时无法连接这台设备。请确认对方已打开 NodeSend，并且两台设备连接到同一网络。"
-                    .into(),
+                "Could not connect to this device. Make sure NodeSend is open on the other device and both devices are on the same network.".into(),
             ));
         }
         let peer = self.peers.get(&peer_id)?;
         let id = self
             .transfers
-            .create_outgoing(peer_id, peer.display_name, peer_device_type, paths, verify_hash, allow_public, preferred_address)
+            .create_outgoing(
+                peer_id,
+                peer.display_name,
+                peer_device_type,
+                paths,
+                verify_hash,
+                allow_public,
+                preferred_address,
+            )
             .await?;
         self.transfers.start_task(self.peers.clone(), id.clone());
         Ok(id)
@@ -459,7 +564,8 @@ impl NetworkManager {
         conflict: ConflictPolicy,
         selected: Option<Vec<String>>,
     ) -> AppResult<()> {
-        let destination = destination.filter(|value| !value.trim().is_empty())
+        let destination = destination
+            .filter(|value| !value.trim().is_empty())
             .or_else(|| Some(self.transfers.default_destination()));
         if accepted
             && destination.as_deref() == Some(self.transfers.default_destination().as_str())
@@ -504,7 +610,7 @@ impl NetworkManager {
         if action == "save" {
             let task = self.transfers.record(&id)?;
             if task.direction != "receive" || task.completed_count != task.chunk_count {
-                return Err(AppError::BadRequest("文件尚未接收完整".into()));
+                return Err(AppError::BadRequest("File has not been fully received".into()));
             }
             if task.status == "completed" {
                 return crate::android_import::export_received(task)
@@ -514,18 +620,105 @@ impl NetworkManager {
             self.transfers.commit(&id).await?;
             return Ok(());
         }
+        let before = self.transfers.record(&id)?;
+        if ["resume", "retry"].contains(&action.as_str()) && before.status == "remote_offline" {
+            return Err(AppError::Conflict(
+                "The peer is offline; reconnect before resuming this task".into(),
+            ));
+        }
+        // 只知道对方的入站连接、没有地址记录的接收任务无法主动回连：
+        // 此时本地照常恢复，由发送端重连后继续推送。
+        if ["resume", "retry"].contains(&action.as_str())
+            && before.direction == "receive"
+            && self
+                .transfers
+                .runtime(&id)
+                .state_sessions
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            && self.peers.get(&before.peer_id).is_ok()
+        {
+            self.transfers.edit(&id, |task| {
+                task.status = "manual_reconnecting".into();
+                task.error = None;
+                task.event("Connecting to the sender’s status channel");
+            })?;
+            let attempt = async {
+                let peer = self.peers.get(&before.peer_id)?;
+                for endpoint in peer.endpoints {
+                    let Ok(mut channel) = transport::connect(
+                        &self.app,
+                        &endpoint,
+                        Some(&before.peer_id),
+                        false,
+                        before.allow_public,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if transport::hello(&mut channel, &self.app).await.is_err() {
+                        continue;
+                    }
+                    if matches!(
+                        channel
+                            .request(&protocol::Request::ResumeTask {
+                                id: before.wire_id.clone(),
+                                revision: before.state_revision.wrapping_add(1),
+                            })
+                            .await,
+                        Ok(protocol::Response::Ack)
+                    ) {
+                        if !matches!(
+                            channel
+                                .request(&protocol::Request::WatchTask {
+                                    id: before.wire_id.clone(),
+                                    revision: before.remote_state_revision,
+                                })
+                                .await,
+                            Ok(protocol::Response::Ack)
+                        ) {
+                            continue;
+                        }
+                        state::spawn(
+                            channel,
+                            self.transfers.clone(),
+                            self.peers.clone(),
+                            id.clone(),
+                            0,
+                        )
+                        .detach();
+                        return Ok(());
+                    }
+                }
+                Err(AppError::Other(
+                    "The peer is offline; reconnect before resuming this task".into(),
+                ))
+            }
+            .await;
+            if let Err(error) = attempt {
+                self.transfers.edit(&id, |task| {
+                    task.status = "interrupted".into();
+                    task.error = Some(error.to_string());
+                    task.event(format!("Manual reconnect failed: {error}"));
+                })?;
+                return Err(error);
+            }
+        }
         self.transfers.action(&id, &action).await?;
         let task = self.transfers.record(&id)?;
-        if ["pause", "resume", "retry", "cancel"].contains(&action.as_str()) {
+        if ["pause", "resume", "retry", "cancel", "finish"].contains(&action.as_str()) {
             let status = match action.as_str() {
                 "pause" => "paused",
                 "cancel" => "cancelled",
+                "finish" => "finish",
                 _ => "resumed",
             };
             self.spawn_state_sync(id.clone(), status.into(), task.state_revision);
         }
         if ["resume", "retry"].contains(&action.as_str())
             && task.direction == "send"
+            && !self.transfers.is_active(&id)
         {
             let service = self.transfers.clone();
             let peers = self.peers.clone();
@@ -541,8 +734,15 @@ impl NetworkManager {
         Ok(())
     }
     fn spawn_state_sync(&self, id: String, status: String, revision: u64) {
-        // Receive-side decisions are delivered on the persistent session that
-        // the sender opened. Never require a new receiver-to-sender connection.
+        if self
+            .transfers
+            .runtime(&id)
+            .state_sessions
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return;
+        }
         if self
             .transfers
             .record(&id)
@@ -559,7 +759,9 @@ impl NetworkManager {
                 if service.shutdown.is_cancelled() {
                     return;
                 }
-                let Ok(current) = service.record(&id) else { return };
+                let Ok(current) = service.record(&id) else {
+                    return;
+                };
                 if current.state_revision != revision
                     || current.status == "completed"
                     || (current.status == "rejected" && status != "rejected")
@@ -593,7 +795,7 @@ impl NetworkManager {
                                 .await,
                             Ok(protocol::Response::Ack)
                         ) {
-                            tracing::info!(task = %id, revision, %status, "对端已确认任务状态");
+                            tracing::info!(task = %id, revision, %status, "Peer confirmed task status");
                             return;
                         }
                     }
@@ -617,15 +819,13 @@ impl NetworkManager {
             || name.len() > 128
             || !["ask", "trusted", "reject"].contains(&policy.as_str())
         {
-            return Err(AppError::BadRequest("本机名称或接收策略非法".into()));
+            return Err(AppError::BadRequest("Invalid device name or receive policy".into()));
         }
         // 目录允许尚不存在：保存时只做词法校验，真正接收/缓存时才创建。
         crate::transfer::paths::validate_destination(&directory)?;
         let cache_directory = cache_directory.trim();
-        if !cache_directory.is_empty()
-            && !std::path::Path::new(cache_directory).is_absolute()
-        {
-            return Err(AppError::BadRequest("缓存目录必须是绝对路径".into()));
+        if !cache_directory.is_empty() && !std::path::Path::new(cache_directory).is_absolute() {
+            return Err(AppError::BadRequest("Cache directory must be an absolute path".into()));
         }
         self.app.set_setting("display_name", name.trim())?;
         self.app.set_setting("receive_directory", &directory)?;
@@ -649,6 +849,73 @@ impl NetworkManager {
             let _ = h.await;
         }
     }
+    #[cfg(desktop)]
+    pub(crate) fn mark_live_tasks_offline(&self) {
+        self.transfers.mark_live_tasks_offline();
+    }
+
+    #[cfg(desktop)]
+    pub(crate) async fn notify_live_tasks_offline(&self) {
+        for task in self.transfers.snapshots() {
+            if ![
+                "connecting",
+                "queued",
+                "waiting",
+                "accepted",
+                "transferring",
+                "interrupted",
+                "manual_reconnecting",
+                "paused",
+                "remote_paused",
+            ]
+            .contains(&task.status.as_str())
+            {
+                continue;
+            }
+            let Ok(updated) = self.transfers.edit(&task.id, |record| {
+                record.status = "offline".into();
+                record.error = None;
+                record.state_revision = record.state_revision.wrapping_add(1);
+                record.event("The peer was notified to stop automatic reconnection because the app is exiting");
+            }) else {
+                continue;
+            };
+            let Ok(peer) = self.peers.get(&updated.peer_id) else {
+                continue;
+            };
+            for endpoint in peer.endpoints {
+                let Ok(Ok(mut channel)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    transport::connect(
+                        &self.app,
+                        &endpoint,
+                        Some(&updated.peer_id),
+                        false,
+                        updated.allow_public,
+                    ),
+                )
+                .await
+                else {
+                    continue;
+                };
+                if transport::hello(&mut channel, &self.app).await.is_err() {
+                    continue;
+                }
+                if matches!(
+                    channel
+                        .request(&protocol::Request::TaskState {
+                            id: updated.wire_id.clone(),
+                            revision: updated.state_revision,
+                            status: "offline".into(),
+                        })
+                        .await,
+                    Ok(protocol::Response::Ack)
+                ) {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 async fn refresh_send_addresses(
@@ -668,7 +935,7 @@ async fn refresh_send_addresses(
         return Ok(());
     };
     if addresses.len() > 128 || tcp_port == 0 {
-        return Err(AppError::BadRequest("地址列表非法".into()));
+        return Err(AppError::BadRequest("Invalid address list".into()));
     }
     drop(channel);
     connected.last_seen = chrono::Utc::now().timestamp();
@@ -707,9 +974,7 @@ async fn refresh_send_addresses(
             error: None,
         };
         if !allow_public && !transport::is_local(ip) {
-            // Retain the peer's current IPv6 candidates without silently granting
-            // permission to probe public networks during a private transfer.
-            endpoint.error = Some("对方公布的地址，尚未验证连通性".into());
+            endpoint.error = Some("Peer-advertised address; connectivity has not been verified".into());
             verified.push(endpoint);
             continue;
         }
@@ -740,13 +1005,13 @@ async fn refresh_send_addresses(
 }
 
 async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<Endpoint>> {
-    tracing::debug!(input, "解析手动输入的设备地址");
+    tracing::debug!(input, "Parse manually entered device address");
     let addresses = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::net::lookup_host(input),
     )
     .await
-    .map_err(|_| AppError::Other("地址解析超时".into()))?;
+    .map_err(|_| AppError::Other("Address resolution timed out".into()))?;
     if let Ok(addresses) = addresses {
         let endpoints: Vec<Endpoint> = addresses
             .map(|addr| Endpoint {
@@ -758,12 +1023,10 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
                 error: None,
             })
             .collect();
-        tracing::info!(input, candidates = endpoints.len(), "使用显式端口");
+        tracing::info!(input, candidates = endpoints.len(), "Using an explicit port");
         return Ok(endpoints);
     }
 
-    // No explicit port: ask the remote NodeSend discovery listener for its
-    // advertised TCP and QUIC ports instead of guessing our own port.
     let discovery_input = discovery_address(input);
     let targets = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -778,7 +1041,7 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
     let mut endpoints = Vec::new();
     for target in targets {
         if let Ok(found) = discovery::probe(target, node_id).await {
-            tracing::debug!(%target, answered = found.len(), "UDP 发现探测结果");
+            tracing::debug!(%target, answered = found.len(), "UDP discovery probe result");
             for (announcement, source) in found {
                 endpoints.push(Endpoint {
                     address: endpoint_address(source),
@@ -795,12 +1058,6 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
         return Ok(endpoints);
     }
 
-    // UDP discovery is intentionally best-effort: firewalls and public
-    // networks commonly drop the probe even when the native TCP listener is
-    // reachable. The desktop/mobile service uses a stable TCP bind port, so
-    // retain the user's host and try that port without making it part of the
-    // address they have to type. QUIC remains disabled for this fallback;
-    // a successful TCP hello returns the peer's advertised QUIC port below.
     let default_tcp = NetworkOptions::default().bind.port();
     let host = input
         .strip_prefix('[')
@@ -816,11 +1073,11 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
         tokio::net::lookup_host(&fallback_input),
     )
     .await
-    .map_err(|_| AppError::Other("地址解析超时".into()))??;
+    .map_err(|_| AppError::Other("Address resolution timed out".into()))??;
     tracing::info!(
         input,
         port = default_tcp,
-        "UDP 发现无应答，回退默认 TCP 端口"
+        "No UDP discovery response; falling back to the default TCP port"
     );
     let fallback = fallback_addresses
         .map(|addr| Endpoint {
@@ -833,9 +1090,9 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
         })
         .collect::<Vec<_>>();
     if fallback.is_empty() {
-        tracing::warn!(input, "未发现 NodeSend 服务");
+        tracing::warn!(input, "No NodeSend service was discovered");
         return Err(AppError::Other(
-            "未发现 NodeSend 服务。请确认对方已启动并连接同一网络".into(),
+            "No NodeSend service was discovered. Make sure the peer is running and on the same network.".into(),
         ));
     }
     Ok(fallback)

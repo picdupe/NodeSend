@@ -1,4 +1,3 @@
-//! Desktop update mechanism. Update sources are tried in the configured order.
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -49,30 +48,25 @@ enum ProbeResult {
     HealthyManifest,
 }
 
-/// Resolve a compile-time trusted public key. It is never accepted from the
-/// remotely hosted source configuration or from the update manifest.
 fn trusted_public_key() -> Result<&'static str, String> {
     match option_env!("NODESEND_UPDATER_PUBLIC_KEY") {
         Some(key) if !key.trim().is_empty() => Ok(key),
-        _ => Err("更新签名公钥尚未配置，暂时无法安全检查更新。".into()),
+        _ => Err("The update signing public key is not configured; update checks cannot be performed securely.".into()),
     }
 }
 
 fn validate_endpoint(value: &str) -> Result<Url, String> {
-    let url = Url::parse(value).map_err(|_| "更新地址格式无效。".to_string())?;
+    let url = Url::parse(value).map_err(|_| "Invalid update address format.".to_string())?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err("更新地址必须使用有效的 HTTP 或 HTTPS 地址。".into());
+        return Err("Update address must be a valid HTTP or HTTPS URL.".into());
     }
     Ok(url)
 }
 
-/// Probe a source before asking Tauri's signed updater to process it. A valid
-/// manifest with no newer version is a healthy source and ends the search.
-/// Network/HTTP/invalid-manifest failures may fall through to the next source.
 async fn probe_endpoint(endpoint: &Url) -> Result<ProbeResult, String> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -93,23 +87,20 @@ async fn probe_endpoint(endpoint: &Url) -> Result<ProbeResult, String> {
     let body = response
         .bytes()
         .await
-        .map_err(|error| format!("读取更新清单响应失败：{error}"))?;
-    // Some Windows-side JSON writers emit a UTF-8 BOM. JSON text exchanged
-    // over HTTP should be BOM-free, but accepting it here avoids treating an
-    // otherwise valid manifest as an unavailable source.
+        .map_err(|error| format!("Failed to read update manifest response: {error}"))?;
     let json_body = body.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&body);
     let payload: Value = serde_json::from_slice(json_body).map_err(|error| {
         let preview = String::from_utf8_lossy(&body);
         let preview = preview.chars().take(160).collect::<String>();
         let preview = preview.replace('\n', " ").replace('\r', " ");
-        format!("更新清单不是有效 JSON：{error}；响应内容：{preview}")
+        format!("Update manifest is not valid JSON: {error}; response: {preview}")
     })?;
     let valid_manifest = payload.get("version").is_some() && payload.get("platforms").is_some()
         || payload.get("version").is_some()
             && payload.get("url").is_some()
             && payload.get("signature").is_some();
     if !valid_manifest {
-        return Err("响应内容不符合 Tauri 更新清单格式。".into());
+        return Err("Response does not match the Tauri update manifest format.".into());
     }
     Ok(ProbeResult::HealthyManifest)
 }
@@ -156,8 +147,6 @@ async fn download_verified(
         .await
 }
 
-/// Checks sources in the exact order configured by the user. An available
-/// source with no newer version is authoritative and ends the check.
 #[tauri::command]
 pub async fn check_update(
     app: AppHandle,
@@ -166,16 +155,16 @@ pub async fn check_update(
     source_endpoints: Vec<String>,
 ) -> Result<Option<UpdateInfo>, String> {
     if !matches!(channel.as_str(), "stable" | "test") {
-        return Err("更新通道无效。".into());
+        return Err("Invalid update channel.".into());
     }
     let public_key = trusted_public_key()?;
     if public_key.trim().is_empty() {
-        return Err("更新签名公钥尚未配置。".into());
+        return Err("Update signing public key has not been configured.".into());
     }
     *pending
         .0
         .lock()
-        .map_err(|_| "更新状态暂时不可用。".to_string())? = None;
+        .map_err(|_| "Update status is temporarily unavailable.".to_string())? = None;
 
     let mut failures = Vec::new();
     let ordered = source_endpoints.clone();
@@ -193,7 +182,7 @@ pub async fn check_update(
             Err(error) => {
                 failures.push(format!(
                     "{}：{error}",
-                    endpoint.host_str().unwrap_or("更新源")
+                    endpoint.host_str().unwrap_or("Update source")
                 ));
                 continue;
             }
@@ -201,8 +190,6 @@ pub async fn check_update(
         if matches!(probe, ProbeResult::HealthyNoUpdate) {
             return Ok(None);
         }
-        // Once a valid manifest is reachable, signature/version errors are
-        // authoritative failures; do not hide them by silently switching source.
         let update = match check_source(&app, &endpoint, public_key).await {
             Ok(update) => update,
             Err(error) => match &error {
@@ -218,11 +205,11 @@ pub async fn check_update(
                 | tauri_plugin_updater::Error::Serialization(_) => {
                     failures.push(format!(
                         "{}：{error}",
-                        endpoint.host_str().unwrap_or("更新源")
+                        endpoint.host_str().unwrap_or("Update source")
                     ));
                     continue;
                 }
-                _ => return Err(format!("更新清单验证失败：{error}")),
+                _ => return Err(format!("Update manifest validation failed: {error}")),
             },
         };
         let Some(update) = update else {
@@ -266,7 +253,7 @@ pub async fn check_update(
         *pending
             .0
             .lock()
-            .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(PendingUpdate {
+            .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(PendingUpdate {
             update,
             downloaded: None,
             fallback_endpoints: ordered.iter().skip(index + 1).cloned().collect(),
@@ -276,9 +263,9 @@ pub async fn check_update(
     }
 
     Err(if failures.is_empty() {
-        "尚未配置可用的更新源。".into()
+        "No update sources are configured.".into()
     } else {
-        format!("所有更新源均不可用：{}", failures.join("；"))
+        format!("All update sources are unavailable: {}", failures.join("；"))
     })
 }
 
@@ -292,16 +279,16 @@ pub async fn download_update(
     let mut current = pending
         .0
         .lock()
-        .map_err(|_| "更新状态暂时不可用。".to_string())?
+        .map_err(|_| "Update status is temporarily unavailable.".to_string())?
         .take()
-        .ok_or_else(|| "请先检查更新。".to_string())?;
+        .ok_or_else(|| "Check for updates first.".to_string())?;
     match download_verified(&current.update, &on_progress).await {
         Ok(bytes) => {
             current.downloaded = Some(bytes);
             *pending
                 .0
                 .lock()
-                .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
             Ok(())
         }
         Err(original_error) => {
@@ -316,8 +303,8 @@ pub async fn download_update(
                 *pending
                     .0
                     .lock()
-                    .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
-                return Err(format!("更新包签名或版本验证失败：{original_error}"));
+                    .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+                return Err(format!("Update package signature or version validation failed: {original_error}"));
             }
             let original_url = current.update.download_url.clone();
             for fallback_url in current.fallback_download_urls.clone() {
@@ -330,7 +317,7 @@ pub async fn download_update(
                     *pending
                         .0
                         .lock()
-                        .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                        .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
                     return Ok(());
                 }
             }
@@ -360,32 +347,30 @@ pub async fn download_update(
                     *pending
                         .0
                         .lock()
-                        .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                        .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
                     return Ok(());
                 }
             }
             *pending
                 .0
                 .lock()
-                .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
+                .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
             Err(format!(
-                "更新源下载失败，且未能从备用源取得相同版本：{original_error}"
+                "Update source download failed, and no backup source provided the same version: {original_error}"
             ))
         }
     }
 }
 
-/// The frontend calls this only after an explicit confirmation. Active transfer
-/// tasks block installation; paused/failed/terminal history does not.
 #[tauri::command]
 pub fn install_update(
     pending: State<'_, PendingUpdateState>,
     network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
     confirmed: bool,
 ) -> Result<(), String> {
-    tracing::info!(confirmed, "收到桌面更新安装请求");
+    tracing::info!(confirmed, "Received desktop update installation request");
     if !confirmed {
-        return Err("需要用户确认后才能安装更新。".into());
+        return Err("User confirmation is required before installing the update.".into());
     }
     let active = network.status().tasks.iter().any(|task| {
         matches!(
@@ -394,36 +379,36 @@ pub fn install_update(
         )
     });
     if active {
-        tracing::warn!("更新安装被阻止：仍有活动传输任务");
-        return Err("当前仍有传输任务，请完成或暂停传输后再安装更新。".into());
+        tracing::warn!("Update installation blocked because transfers are active");
+        return Err("Complete or pause active transfers before installing the update.".into());
     }
     let mut current = pending
         .0
         .lock()
-        .map_err(|_| "更新状态暂时不可用。".to_string())?
+        .map_err(|_| "Update status is temporarily unavailable.".to_string())?
         .take()
-        .ok_or_else(|| "请先检查更新并完成下载。".to_string())?;
+        .ok_or_else(|| "Check for updates and finish downloading first.".to_string())?;
     let Some(bytes) = current.downloaded.take() else {
         *pending
             .0
             .lock()
-            .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
-        return Err("更新尚未下载完成。".into());
+            .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+        return Err("Update download is incomplete.".into());
     };
-    tracing::info!(bytes = bytes.len(), "已下载更新包，开始启动安装程序");
+    tracing::info!(bytes = bytes.len(), "Downloaded update package; launching installer");
     match current.update.install(&bytes) {
         Ok(()) => {
-            tracing::info!("更新安装程序已启动");
+            tracing::info!("Update installer started");
             Ok(())
         }
         Err(error) => {
-            tracing::error!(%error, "启动更新安装程序失败");
+            tracing::error!(%error, "Failed to launch the update installer");
             current.downloaded = Some(bytes);
             *pending
                 .0
                 .lock()
-                .map_err(|_| "更新状态暂时不可用。".to_string())? = Some(current);
-            Err(format!("启动更新安装程序失败：{error}"))
+                .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+            Err(format!("Failed to launch the update installer: {error}"))
         }
     }
 }
@@ -443,5 +428,5 @@ pub fn open_update_url(url: String) -> Result<(), String> {
         .spawn();
     result
         .map(|_| ())
-        .map_err(|error| format!("无法打开更新链接：{error}"))
+        .map_err(|error| format!("Failed to open update link: {error}"))
 }
