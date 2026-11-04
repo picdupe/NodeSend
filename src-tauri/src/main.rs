@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("--service-host") => std::process::exit(nodesend_lib::process_host::run_service()),

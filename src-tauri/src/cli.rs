@@ -538,14 +538,15 @@ async fn remote_once(request: Request) -> Result<Value, String> {
             }
             Err(error) => {
                 return Err(format!(
-                    "Could not connect to the NodeSend service over IPC. Start the service with `nodesend daemon` and retry: {error}"
+                    "Could not connect to the NodeSend service over IPC. Start the service with `nodesend daemon` and retry: {}",
+                    crate::error::io_error_text(&error)
                 ))
             }
         }
     };
     write_frame(&mut pipe, &request)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::error::io_error_text(&e))?;
     let timeout = if request.command == "invoke" {
         3600
     } else if ["role_probe", "gui_probe"].contains(&request.command.as_str()) {
@@ -556,7 +557,7 @@ async fn remote_once(request: Request) -> Result<Value, String> {
     let reply: Reply = tokio::time::timeout(Duration::from_secs(timeout), read_frame(&mut pipe))
         .await
         .map_err(|_| "Timed out waiting for the NodeSend service response".to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::error::io_error_text(&e))?;
     match reply.error {
         Some(error) => Err(error),
         None => Ok(reply.result),

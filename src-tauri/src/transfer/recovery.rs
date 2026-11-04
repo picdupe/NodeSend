@@ -449,6 +449,7 @@ impl TransferService {
             }
             _ => "The source file is temporarily unavailable. Resume to try again",
         };
+        tracing::warn!(task = %id, file_index = file, path = %entry.path, issue = kind, "Source file requires attention");
         self.edit(id, |t| {
             t.source_issue = Some(super::model::SourceIssue {
                 file,
@@ -458,7 +459,7 @@ impl TransferService {
             t.status = "paused".into();
             t.error = Some(format!("{message}: {}", entry.path));
             t.state_revision = t.state_revision.wrapping_add(1);
-            t.event(message);
+            t.event(format!("{message}: {}", entry.path));
         })?;
         Ok(())
     }

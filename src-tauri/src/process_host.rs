@@ -295,6 +295,7 @@ pub fn run_cli_entry() -> i32 {
 
 pub fn start_gui_entry(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut service_unavailable = false;
         loop {
             match crate::cli::control(
                 "entry_heartbeat",
@@ -307,11 +308,15 @@ pub fn start_gui_entry(app: tauri::AppHandle) {
                     let _ = app.run_on_main_thread(move || crate::tray::quit_gui(&handle));
                     break;
                 }
-                Ok(_) => {}
+                Ok(_) => service_unavailable = false,
                 Err(error) => {
-                    tracing::error!(%error,"Failed to start the NodeSend GUI process");
-                    app.exit(1);
-                    break;
+                    if !service_unavailable {
+                        tracing::warn!(%error, "GUI is waiting for the NodeSend service connection");
+                        service_unavailable = true;
+                    }
+                    if let Err(start_error) = crate::process_host::ensure_service().await {
+                        tracing::debug!(%start_error, "Could not restart the NodeSend service while the GUI is waiting");
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

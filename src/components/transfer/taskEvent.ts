@@ -81,6 +81,18 @@ export function translateTaskEvent(value: string, t: Translate): string {
     }
     return t(`transfer:tasks.events.${legacy.key}`, legacy.args);
   }
+  const sourceIssues = [
+    ['The source file changed. Resuming will retransmit the current version', 'sourceChangedWithFile'],
+    ['The source file is missing. You can finish with the received files or cancel', 'sourceMissingWithFile'],
+    ['The source file is temporarily unavailable. Resume to try again', 'sourceUnavailableWithFile'],
+  ] as const;
+  for (const [prefix, key] of sourceIssues) {
+    const marker = `${prefix}: `;
+    if (message.startsWith(marker)) {
+      return t(`transfer:tasks.events.${key}`, { file: message.slice(marker.length) });
+    }
+  }
+
   const exact = exactEvents[message];
   if (exact) return t(`transfer:tasks.events.${exact}`);
 

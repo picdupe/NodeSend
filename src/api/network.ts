@@ -24,6 +24,17 @@ export const requestMediaLibraryPermission = () => invoke<boolean>('request_medi
 export function errorText(error: unknown): string {
   const raw = typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error);
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  const sourceIssues = [
+    ['The source file changed. Resuming will retransmit the current version', 'sourceChangedResume'],
+    ['The source file is missing. You can finish with the received files or cancel', 'sourceMissingResume'],
+    ['The source file is temporarily unavailable. Resume to try again', 'sourceUnavailableResume'],
+  ] as const;
+  for (const [message, key] of sourceIssues) {
+    const prefix = `${message}: `;
+    if (raw.startsWith(prefix)) {
+      return i18next.t(`transfer.${key}`, { ns: 'errors', file: raw.slice(prefix.length) });
+    }
+  }
   if (/10051|network is unreachable/i.test(raw)) {
     return i18next.t('transfer.connectionUnreachable', { ns: 'errors' });
   }

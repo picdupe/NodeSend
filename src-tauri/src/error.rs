@@ -10,8 +10,8 @@ pub enum AppError {
     #[error("Database error: {0}")]
     Db(#[from] rusqlite::Error),
 
-    #[error("File I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("File I/O error: {}", io_error_text(.0))]
+    Io(#[source] std::io::Error),
 
     #[error("Identity or key error: {0}")]
     Crypto(String),
@@ -72,3 +72,17 @@ impl From<serde_json::Error> for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+pub fn io_error_text(error: &std::io::Error) -> String {
+    let kind = format!("{:?}", error.kind());
+    match error.raw_os_error() {
+        Some(code) => format!("{kind} (os error {code})"),
+        None => kind,
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
