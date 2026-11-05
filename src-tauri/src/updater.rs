@@ -363,21 +363,17 @@ pub async fn download_update(
 }
 
 #[tauri::command]
-pub fn install_update(
+pub async fn install_update(
+    app: AppHandle,
     pending: State<'_, PendingUpdateState>,
-    network: State<'_, std::sync::Arc<crate::network::NetworkManager>>,
     confirmed: bool,
 ) -> Result<(), String> {
     tracing::info!(confirmed, "Received desktop update installation request");
     if !confirmed {
         return Err("User confirmation is required before installing the update.".into());
     }
-    let active = network.status().tasks.iter().any(|task| {
-        matches!(
-            task.status.as_str(),
-            "queued" | "connecting" | "waiting" | "accepted" | "transferring" | "interrupted"
-        )
-    });
+    let status = crate::cli::service_invoke(app, "get_network_status".into(), Value::Null).await?;
+    let active = has_active_transfers(&status)?;
     if active {
         tracing::warn!("Update installation blocked because transfers are active");
         return Err("Complete or pause active transfers before installing the update.".into());
@@ -410,6 +406,60 @@ pub fn install_update(
                 .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
             Err(format!("Failed to launch the update installer: {error}"))
         }
+    }
+}
+
+fn has_active_transfers(response: &Value) -> Result<bool, String> {
+    if response.get("handled").and_then(Value::as_bool) != Some(true) {
+        return Err("The background network service is unavailable.".into());
+    }
+    let tasks = response
+        .pointer("/value/tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "The background network service returned an invalid status.".to_string())?;
+    Ok(tasks.iter().any(|task| {
+        task.get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "queued"
+                        | "connecting"
+                        | "waiting"
+                        | "accepted"
+                        | "transferring"
+                        | "interrupted"
+                )
+            })
+    }))
+}
+
+#[cfg(test)]
+mod install_update_tests {
+    use super::*;
+
+    #[test]
+    fn active_transfers_are_read_from_the_shared_service_response() {
+        let response = serde_json::json!({
+            "handled": true,
+            "value": {"tasks": [{"status": "transferring"}]}
+        });
+        assert!(has_active_transfers(&response).unwrap());
+    }
+
+    #[test]
+    fn paused_tasks_do_not_block_update_installation() {
+        let response = serde_json::json!({
+            "handled": true,
+            "value": {"tasks": [{"status": "paused"}, {"status": "completed"}]}
+        });
+        assert!(!has_active_transfers(&response).unwrap());
+    }
+
+    #[test]
+    fn missing_service_status_is_reported_instead_of_panicking() {
+        assert!(has_active_transfers(&serde_json::json!({"handled": false})).is_err());
+        assert!(has_active_transfers(&serde_json::json!({"handled": true, "value": {}})).is_err());
     }
 }
 
