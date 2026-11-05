@@ -393,6 +393,9 @@ impl TransferService {
         }
         self.assign_entry_cache_names(&id, &mut entries)?;
         self.append_entries(&id, first, &entries)?;
+        // 接收任务可能在仅收到顶层目录时就被接受。每收到一批新清单，
+        // 都要在回执前更新缓存计划，避免该批文件的数据先按直写模式落盘。
+        self.extend_cache_plan(&id, first)?;
         for entry in &entries {
             total_size = total_size.saturating_add(entry.size);
             directory_count += usize::from(entry.directory);

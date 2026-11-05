@@ -478,12 +478,21 @@ async fn relay_file_step(
         tokio::fs::create_dir_all(parent).await?;
     }
     paths::ensure_plain(target)?;
+    let target_preexisted = tokio::fs::try_exists(target).await?;
     let mut input = tokio::fs::File::open(&assembled).await?;
     let mut output = tokio::fs::File::create(target).await?;
     let mut copied = 0u64;
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         if !processing(&service.status_of(id)?) {
+            drop(output);
+            if !target_preexisted {
+                match tokio::fs::remove_file(target).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
             return Ok(None);
         }
         let len = input.read(&mut buffer).await?;
@@ -746,6 +755,29 @@ mod safety_tests {
         assert!(!target.exists());
         assert_eq!(service.relayed_at(&id, 0), 0);
         std::fs::write(&segment, &bytes).unwrap();
+        let assembled = paths::cache_file(&cache, &task, 0);
+        std::fs::write(&assembled, &bytes).unwrap();
+        service
+            .journal_transition(
+                &id,
+                0,
+                bytes.len() as u64,
+                "assembled",
+                Some(&target.to_string_lossy()),
+            )
+            .unwrap();
+        service
+            .edit(&id, |t| t.status = "cancelled".into())
+            .unwrap();
+        assert_eq!(
+            relay_file_step(&service, &plan, &cache, &id, 0, bytes.len() as u64, 0)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!target.exists());
+        assert!(assembled.exists());
+        service.edit(&id, |t| t.status = "paused".into()).unwrap();
         assert_eq!(
             relay_file_step(&service, &plan, &cache, &id, 0, bytes.len() as u64, 0)
                 .await

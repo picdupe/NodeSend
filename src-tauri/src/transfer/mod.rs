@@ -1333,11 +1333,8 @@ impl TransferService {
                 break;
             }
         }
-        let use_cache = task.cache_files.contains(&file)
-            || (!task.scan_complete
-                && entry.size > 0
-                && entry.size <= CACHE_FILE_LIMIT
-                && self.cache_root_for_task(id).is_some());
+        // 写入与容量准入使用同一份文件计划，避免扫描期间绕过缓存预留。
+        let use_cache = task.cache_files.contains(&file);
         #[cfg(target_os = "android")]
         let direct_download = self.is_android_direct_receive(task);
         #[cfg(not(target_os = "android"))]
@@ -2044,10 +2041,12 @@ impl TransferService {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        // 等待期间转写器可能刚发布了文件；回滚必须使用最新的发布进度，不能沿用取消前的快照。
+        let task = self.record(&id).unwrap_or_else(|_| task.clone());
         // 关闭直写模式复用的目标盘句柄。
         self.release_files(&id);
         #[cfg(target_os = "android")]
-        if self.is_android_direct_receive(task) {
+        if self.is_android_direct_receive(&task) {
             loop {
                 let task_id = id.clone();
                 match tokio::task::spawn_blocking(move || {
@@ -2068,7 +2067,7 @@ impl TransferService {
         }
         // 删缓存目录。
         if let Some(cache_root) = self.cache_root_for_task(&id) {
-            let dirs = paths::cache_task_dirs(&cache_root, task);
+            let dirs = paths::cache_task_dirs(&cache_root, &task);
             loop {
                 let mut retry = false;
                 for dir in &dirs {
@@ -2089,7 +2088,7 @@ impl TransferService {
         }
         // 回滚已增量发布到最终目录的文件，并恢复覆盖前的文件；仅操作本任务
         // 的提交标记，用户后来修改过的文件不会被直接删除。
-        if let Ok(stage) = paths::stage(task) {
+        if let Ok(stage) = paths::stage(&task) {
             let root = PathBuf::from(task.destination.as_deref().unwrap_or_default());
             loop {
                 let task_for_rollback = task.clone();
@@ -2326,6 +2325,8 @@ impl TransferService {
                     roots.entry(id).or_insert_with(|| old_root.clone());
                 }
             }
+            // 已有任务保留原缓存目录；后续接收任务使用最新解析的目录。
+            *locks::lock(&self.cache_root) = new_root;
         }
     }
     pub(crate) fn refresh_cache_root_from_settings(&self) {

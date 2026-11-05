@@ -831,6 +831,7 @@ impl NetworkManager {
         self.app.set_setting("receive_directory", &directory)?;
         self.app.set_setting("cache_directory", cache_directory)?;
         self.app.set_setting("receive_policy", &policy)?;
+        self.transfers.refresh_cache_root_from_settings();
         Ok(())
     }
     pub fn set_android_media_library_enabled(&self, enabled: bool) -> AppResult<()> {

@@ -865,3 +865,25 @@ async fn startup_reclaims_payload_left_after_durable_publication() {
     assert_eq!(std::fs::read(f.root.join("inbox/a")).unwrap(), vec![7; 33]);
     reopened.shutdown.cancel();
 }
+
+#[tokio::test]
+async fn cache_root_refresh_pins_active_tasks_and_updates_future_tasks() {
+    let f = Fixture::new().await;
+    f.receive();
+
+    let old_root = f.root.join("cache");
+    let new_root = f.root.join("cache-next");
+    std::fs::create_dir_all(&new_root).unwrap();
+    f.service
+        .app
+        .set_setting("cache_directory", new_root.to_string_lossy().as_ref())
+        .unwrap();
+    f.service.refresh_cache_root_from_settings();
+
+    assert_eq!(f.service.current_cache_root(), Some(new_root.clone()));
+    assert_eq!(f.service.cache_root_for_task(&f.id), Some(old_root));
+    assert_eq!(
+        f.service.cache_root_for_task("future-task"),
+        Some(new_root)
+    );
+}
