@@ -25,6 +25,7 @@
     "android:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1",
     "android:debug": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Debug",
     "android:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android.ps1 -Fast",
+    "release": "pwsh -NoProfile -File scripts/release.ps1",
     "linux:build": "bash scripts/linux.sh",
     "linux:debug": "bash scripts/linux.sh debug"
   },
