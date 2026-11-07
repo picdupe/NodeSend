@@ -11,6 +11,7 @@
     "notFound": "找不到请求的内容。",
     "forbidden": "此操作不被允许。",
     "conflict": "操作与当前状态冲突。",
+    "permissionDenied": "没有权限写入该位置。请检查缓存或接收目录权限，或更换为可写目录后重试。",
     "unknown": "操作失败，请重试。"
   },
   "transfer": {
@@ -23,12 +24,15 @@
     "noFiles": "没有可发送的文件。",
     "connectionUnreachable": "暂时无法连接这台设备。请确认对方已打开 NodeSend，并且两台设备连接到同一网络。",
     "connectionRefused": "对方设备没有接受连接。请确认 NodeSend 正在运行，并检查防火墙设置。",
-    "timedOut": "连接设备超时。请确认对方在线，并检查网络和防火墙。"
+    "receiveDirectorySpace": "接收目录空间不足（已计入其他任务的预留空间）。请释放磁盘空间或更换接收目录后重试。",
+    "timedOut": "连接设备超时。请确认对方在线，并检查网络和防火墙。",
+    "cacheSpacePaused": "缓存盘空间不足，任务已暂停。释放缓存盘空间后可恢复任务。"
   },
   "settings": {
     "saveFailed": "保存设置失败：{{reason}}",
     "favoriteSaveFailed": "无法保存收藏夹，请检查应用存储空间后重试。",
-    "invalidLanguage": "不支持所选语言。"
+    "invalidLanguage": "不支持所选语言。",
+    "unfinishedTransfers": "请先完成或取消所有未完成的传输，再安装更新。"
   },
   "update": {
     "desktopOnly": "更新功能仅在桌面应用中可用。",

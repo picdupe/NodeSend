@@ -9,8 +9,6 @@
   "device": "本机设备",
   "name": "设备名称",
   "receiveDirectory": "默认接收目录",
-  "cacheDirectory": "默认缓存目录",
-  "disableCache": "不使用缓存",
   "receivePolicy": "接收策略",
   "askEveryTime": "每次询问",
   "askDescription": "收到文件前确认一次",
@@ -35,7 +33,6 @@
     "jaJP": "日本語",
     "saved": "语言偏好已保存。"
   },
-  "chooseCache": "选择",
   "nameSavedToast": "设备名称已保存，发现广播中的名称将在下次启动时更新。",
   "savedToast": "已保存。",
   "mediaPermission": "未授予相册权限，文件仍保存到当前接收目录。",

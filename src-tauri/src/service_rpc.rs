@@ -269,7 +269,6 @@ impl Backend {
                     self.network.clone(),
                     argument(&args, "name")?,
                     argument(&args, "directory")?,
-                    argument(&args, "cacheDirectory")?,
                     argument(&args, "policy")?,
                 )
                 .await

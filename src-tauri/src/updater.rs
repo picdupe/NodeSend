@@ -373,10 +373,10 @@ pub async fn install_update(
         return Err("User confirmation is required before installing the update.".into());
     }
     let status = crate::cli::service_invoke(app, "get_network_status".into(), Value::Null).await?;
-    let active = has_active_transfers(&status)?;
-    if active {
-        tracing::warn!("Update installation blocked because transfers are active");
-        return Err("Complete or pause active transfers before installing the update.".into());
+    let unfinished = has_unfinished_transfers(&status)?;
+    if unfinished {
+        tracing::warn!("Update installation blocked because unfinished transfers exist");
+        return Err("UPDATE_BLOCKED_UNFINISHED_TRANSFERS".into());
     }
     let mut current = pending
         .0
@@ -409,7 +409,7 @@ pub async fn install_update(
     }
 }
 
-fn has_active_transfers(response: &Value) -> Result<bool, String> {
+fn has_unfinished_transfers(response: &Value) -> Result<bool, String> {
     if response.get("handled").and_then(Value::as_bool) != Some(true) {
         return Err("The background network service is unavailable.".into());
     }
@@ -418,19 +418,10 @@ fn has_active_transfers(response: &Value) -> Result<bool, String> {
         .and_then(Value::as_array)
         .ok_or_else(|| "The background network service returned an invalid status.".to_string())?;
     Ok(tasks.iter().any(|task| {
-        task.get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| {
-                matches!(
-                    status,
-                    "queued"
-                        | "connecting"
-                        | "waiting"
-                        | "accepted"
-                        | "transferring"
-                        | "interrupted"
-                )
-            })
+        !matches!(
+            task.get("status").and_then(Value::as_str),
+            Some("completed" | "cancelled" | "rejected" | "partial_completed" | "incompatible")
+        )
     }))
 }
 
@@ -444,22 +435,22 @@ mod install_update_tests {
             "handled": true,
             "value": {"tasks": [{"status": "transferring"}]}
         });
-        assert!(has_active_transfers(&response).unwrap());
+        assert!(has_unfinished_transfers(&response).unwrap());
     }
 
     #[test]
-    fn paused_tasks_do_not_block_update_installation() {
+    fn paused_tasks_block_update_installation() {
         let response = serde_json::json!({
             "handled": true,
             "value": {"tasks": [{"status": "paused"}, {"status": "completed"}]}
         });
-        assert!(!has_active_transfers(&response).unwrap());
+        assert!(has_unfinished_transfers(&response).unwrap());
     }
 
     #[test]
     fn missing_service_status_is_reported_instead_of_panicking() {
-        assert!(has_active_transfers(&serde_json::json!({"handled": false})).is_err());
-        assert!(has_active_transfers(&serde_json::json!({"handled": true, "value": {}})).is_err());
+        assert!(has_unfinished_transfers(&serde_json::json!({"handled": false})).is_err());
+        assert!(has_unfinished_transfers(&serde_json::json!({"handled": true, "value": {}})).is_err());
     }
 }
 

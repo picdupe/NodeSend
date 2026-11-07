@@ -47,7 +47,6 @@ pub struct NetworkStatus {
     pub peers: Vec<Peer>,
     pub tasks: Vec<TaskSnapshot>,
     pub receive_directory: String,
-    pub cache_directory: String,
     pub receive_policy: String,
     pub media_library_enabled: bool,
 }
@@ -235,7 +234,6 @@ impl NetworkManager {
             peers: self.peers.list(),
             tasks: self.transfers.snapshots(),
             receive_directory: self.transfers.default_destination(),
-            cache_directory: self.transfers.cache_directory(),
             receive_policy: self
                 .app
                 .get_setting("receive_policy")
@@ -812,7 +810,6 @@ impl NetworkManager {
         &self,
         name: String,
         directory: String,
-        cache_directory: String,
         policy: String,
     ) -> AppResult<()> {
         if name.trim().is_empty()
@@ -823,15 +820,9 @@ impl NetworkManager {
         }
         // 目录允许尚不存在：保存时只做词法校验，真正接收/缓存时才创建。
         crate::transfer::paths::validate_destination(&directory)?;
-        let cache_directory = cache_directory.trim();
-        if !cache_directory.is_empty() && !std::path::Path::new(cache_directory).is_absolute() {
-            return Err(AppError::BadRequest("Cache directory must be an absolute path".into()));
-        }
         self.app.set_setting("display_name", name.trim())?;
         self.app.set_setting("receive_directory", &directory)?;
-        self.app.set_setting("cache_directory", cache_directory)?;
         self.app.set_setting("receive_policy", &policy)?;
-        self.transfers.refresh_cache_root_from_settings();
         Ok(())
     }
     pub fn set_android_media_library_enabled(&self, enabled: bool) -> AppResult<()> {

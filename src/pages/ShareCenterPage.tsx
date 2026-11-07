@@ -239,7 +239,7 @@ function LocalShares() {
         const running = native ? share.enabled : !!service?.running;
         return <tr key={share.id}><td>{share.name}</td><td className="mono">{share.path}</td><td>{protocolLabel(share.protocol, t)}</td>
           <td>{share.access_mode === 'token' && !native ? t('shares.password') : accessLabel(share.access_mode, t)}</td>
-          <td>{!share.enabled ? t('shares.disabled') : share.access_mode === 'deny' ? t('shares.deny') : running ? t('shares.enabled') : t('shares.notStarted')}{service?.error && <small className="share-service-error">{service.error}</small>}</td>
+          <td>{!share.enabled ? t('shares.disabled') : share.access_mode === 'deny' ? t('shares.deny') : running ? t('shares.enabled') : t('shares.notStarted')}{service?.error && <small className="share-service-error">{errorText(service.error)}</small>}</td>
           <td className="actions"><button disabled={busy} onClick={() => void perform(() => toggleShare(share.id, !running))}>{running ? t('shares.stop') : t('shares.start')}</button>
             {share.access_mode === 'token' && <button disabled={busy} onClick={() => void perform(() => rotateShareToken(share.id))}>{native ? t('shares.rotateToken') : t('shares.resetPassword')}</button>}
             {network && (native ? <ShareLinks share={share} network={network} /> : <ProtocolConnection share={share} network={network} running={running} />)}

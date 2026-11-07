@@ -184,6 +184,16 @@
       "sourceMissing": "來源檔案已遺失，可完成已接收部分或取消",
       "sourceUnavailable": "來源檔案暫時無法存取，可恢復並重試",
       "peerStatus": "已同步對方工作狀態：{{status}}",
+      "peerStatusValues": {
+        "resumed": "已恢復",
+        "paused": "已暫停",
+        "finish": "已完成接收",
+        "offline": "對方已離線",
+        "cancelled": "已取消",
+        "rejected": "已拒絕"
+      },
+      "unknownPeerStatus": "狀態不明",
+      "untranslated": "此工作包含無法顯示的事件。",
       "partialCompleted": "已保留可用檔案，工作部分完成；未接收檔案已列入放棄清單",
       "waitingForReceiver": "等待接收方繼續",
       "writeFailed": "寫入失敗：{{error}}"

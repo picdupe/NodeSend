@@ -85,7 +85,9 @@ pub fn validate_component(part: &str) -> AppResult<()> {
     Ok(())
 }
 fn invalid() -> AppError {
-    AppError::BadRequest("File path contains traversal, a reserved name, or invalid characters".into())
+    AppError::BadRequest(
+        "File path contains traversal, a reserved name, or invalid characters".into(),
+    )
 }
 /// 判定一份**未跟随符号链接**的元数据是否为普通项：拒绝符号链接与 Windows 重解析点。
 ///
@@ -153,7 +155,9 @@ pub fn ensure_under(root: &Path, path: &Path) -> AppResult<()> {
 pub fn validate_destination(raw: &str) -> AppResult<()> {
     let path = Path::new(raw);
     if raw.trim().is_empty() || !path.is_absolute() || raw.contains('\0') {
-        return Err(AppError::BadRequest("Receive directory must be an absolute path".into()));
+        return Err(AppError::BadRequest(
+            "Receive directory must be an absolute path".into(),
+        ));
     }
     Ok(())
 }
@@ -169,7 +173,9 @@ pub fn destination_for_use(raw: &str) -> AppResult<PathBuf> {
 pub fn destination(raw: &str) -> AppResult<PathBuf> {
     let path = Path::new(raw);
     if !path.is_absolute() || !path.is_dir() {
-        return Err(AppError::BadRequest("Select an existing receive directory".into()));
+        return Err(AppError::BadRequest(
+            "Select an existing receive directory".into(),
+        ));
     }
     // 解析规范路径，并检查其祖先路径是否为符号链接或 Windows 重解析点。
     let real = path.canonicalize()?;
@@ -523,11 +529,13 @@ pub fn cache_journal_named(
 }
 
 fn cache_dir_named(cache_root: &Path, task_id: &str, cache_name: Option<&str>) -> PathBuf {
-    let key = cache_name
-        .and_then(|name| name.split_once("--").map(|(dir, _)| dir))
-        .or(cache_name)
-        .unwrap_or(task_id);
-    cache_root.join(safe_component(key))
+    match cache_name {
+        Some(name) => {
+            let key = name.split_once("--").map(|(dir, _)| dir).unwrap_or(name);
+            cache_root.join(sanitize_file_name(key))
+        }
+        None => cache_root.join(safe_component(task_id)),
+    }
 }
 
 fn cache_file_name(cache_name: &str) -> String {
@@ -629,6 +637,28 @@ mod tests {
         assert_eq!(
             super::cache_name(NODE, "bad:name?.txt", 0),
             "7K3M-9Q2V-XB5N-4T8H-R6-bad_name_.txt"
+        );
+        assert_eq!(
+            super::cache_name(NODE, "质检工具V2.3.BatchFilter(1).zip", 0),
+            "7K3M-9Q2V-XB5N-4T8H-R6-质检工具V2.3.BatchFilter(1).zip"
+        );
+    }
+
+    #[test]
+    fn cache_directories_preserve_valid_unicode_and_punctuation() {
+        use std::path::Path;
+
+        let name = super::cache_name(NODE, "质检工具V2.3.BatchFilter(1).zip", 0);
+        let segment =
+            super::cache_segment_named(Path::new("D:/cache"), "task", 0, Some(&name), 0, 1024);
+
+        assert_eq!(
+            segment.parent().unwrap().file_name().unwrap(),
+            "7K3M-9Q2V-XB5N-4T8H-R6-质检工具V2.3.BatchFilter(1).zip"
+        );
+        assert_eq!(
+            segment.file_name().unwrap(),
+            "质检工具V2.3.BatchFilter(1).zip.seg"
         );
     }
 
@@ -733,10 +763,7 @@ mod tests {
 
     #[test]
     fn rename_preserves_file_extension_and_directory_names() {
-        assert_eq!(
-            numbered_name("report.pdf", false, 1),
-            "report (1).pdf"
-        );
+        assert_eq!(numbered_name("report.pdf", false, 1), "report (1).pdf");
         assert_eq!(numbered_name("photo.JPG", false, 2), "photo (2).JPG");
         assert_eq!(
             numbered_name("archive.tar.gz", false, 1),
@@ -761,9 +788,6 @@ mod tests {
         );
         assert_eq!(numbered_name("README", false, 1), "README (1)");
         assert_eq!(numbered_name(".gitignore", false, 1), ".gitignore (1)");
-        assert_eq!(
-            numbered_name("report.v2", true, 1),
-            "report.v2 (1)"
-        );
+        assert_eq!(numbered_name("report.v2", true, 1), "report.v2 (1)");
     }
 }

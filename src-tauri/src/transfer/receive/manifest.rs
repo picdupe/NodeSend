@@ -19,11 +19,12 @@ impl TransferService {
         transport: &str,
     ) -> AppResult<Response> {
         if wire.len() != 32 || !wire.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AppError::BadRequest(
-                "Invalid task ID".into(),
-            ));
+            return Err(AppError::BadRequest("Invalid task ID".into()));
         }
         let id = incoming_id(peer, wire);
+        if let Some(runtime) = self.runtime_if_exists(&id) {
+            crate::locks::lock(&runtime.cache_fallback_pending).clear();
+        }
         if self.status_of(&id).is_ok() {
             let mut existing_status = self.status_of(&id)?;
             let (digest, received) = self.manifest_received(&id)?;
@@ -31,7 +32,9 @@ impl TransferService {
             if (!summary.streaming && digest != summary.digest)
                 || existing.top_level_fingerprint != summary.top_level_fingerprint
             {
-                return Err(AppError::Conflict("Created task contents cannot be changed".into()));
+                return Err(AppError::Conflict(
+                    "Created task contents cannot be changed".into(),
+                ));
             }
             if existing_status == "interrupted" && existing.destination.is_some() {
                 self.edit(&id, |task| {
@@ -133,6 +136,7 @@ impl TransferService {
             skipped_bytes: 0,
             skipped_paths: vec![],
             cache_files: std::collections::BTreeSet::new(),
+            cache_plan_revision: 0,
             resume_requested: false,
             source_issue: None,
             recovery_epoch: 0,
@@ -251,7 +255,7 @@ impl TransferService {
             ));
         }
         task.manifest.validate()?;
-        self.refresh_cache_plan(&id)?;
+        self.refresh_cache_plan(&id).await?;
         self.edit(&id, |record| {
             record.file_count = actual_file_count;
             record.refresh_file_name();

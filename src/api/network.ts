@@ -18,12 +18,15 @@ export const addEndpoint = (address: string, expectedNodeId: string | null, allo
 export const removePeer = (nodeId: string) => invoke<void>('remove_peer', { nodeId });
 export const decideIncoming = (id: string, accepted: boolean, destination: string | null, conflict: ConflictPolicy, selected: string[] | null = null, trustDevice = false) => invoke<void>('decide_incoming_transfer', { id, accepted, destination, conflict, selected, trustDevice });
 export const transferAction = (id: string, action: string) => invoke<void>('transfer_action', { id, action });
-export const setNetworkSettings = (name: string, directory: string, cacheDirectory: string, policy: string) => invoke<void>('set_network_settings', { name, directory, cacheDirectory, policy });
+export const setNetworkSettings = (name: string, directory: string, policy: string) => invoke<void>('set_network_settings', { name, directory, policy });
 export const setAndroidMediaLibraryEnabled = (enabled: boolean) => invoke<void>('set_android_media_library_enabled', { enabled });
 export const requestMediaLibraryPermission = () => invoke<boolean>('request_media_library_permission');
 export function errorText(error: unknown): string {
   const raw = typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error);
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  if (raw === 'UPDATE_BLOCKED_UNFINISHED_TRANSFERS') {
+    return i18next.t('settings.unfinishedTransfers', { ns: 'errors' });
+  }
   const sourceIssues = [
     ['The source file changed. Resuming will retransmit the current version', 'sourceChangedResume'],
     ['The source file is missing. You can finish with the received files or cancel', 'sourceMissingResume'],
@@ -34,6 +37,18 @@ export function errorText(error: unknown): string {
     if (raw.startsWith(prefix)) {
       return i18next.t(`transfer.${key}`, { ns: 'errors', file: raw.slice(prefix.length) });
     }
+  }
+  if (/^Could not connect to this device\. Make sure NodeSend is open on the other device and both devices are on the same network\.?$/i.test(raw)) {
+    return i18next.t('transfer.connectionUnreachable', { ns: 'errors' });
+  }
+  if (/insufficient receive-directory space, including reservations from other tasks/i.test(raw)) {
+    return i18next.t('transfer.receiveDirectorySpace', { ns: 'errors' });
+  }
+  if (raw === 'CACHE_SPACE_WAIT_TIMEOUT') {
+    return i18next.t('transfer.cacheSpacePaused', { ns: 'errors' });
+  }
+  if (/PermissionDenied|permission denied|os error 5/i.test(raw)) {
+    return i18next.t('generic.permissionDenied', { ns: 'errors' });
   }
   if (/10051|network is unreachable/i.test(raw)) {
     return i18next.t('transfer.connectionUnreachable', { ns: 'errors' });
@@ -56,5 +71,5 @@ export function errorText(error: unknown): string {
   if (/[\u3400-\u9fff]/.test(raw) && !i18next.language.startsWith('zh-CN')) {
     return i18next.t('generic.unknown', { ns: 'errors' });
   }
-  return raw;
+  return i18next.t('generic.unknown', { ns: 'errors' });
 }

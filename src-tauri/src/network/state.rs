@@ -7,7 +7,10 @@ use crate::{
     error::{AppError, AppResult},
     transfer::{TaskRuntime, TransferService},
 };
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 struct SessionGuard(Arc<TaskRuntime>);
 impl Drop for SessionGuard {
@@ -193,16 +196,32 @@ mod tests {
     }
 }
 
-pub(crate) struct StateSession(Option<tokio::task::JoinHandle<()>>);
+pub(crate) struct StateSession {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    transfers: Arc<TransferService>,
+    id: String,
+}
 impl StateSession {
     pub(crate) fn detach(mut self) {
-        self.0.take();
+        self.handle.take();
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map_or(true, tokio::task::JoinHandle::is_finished)
     }
 }
 impl Drop for StateSession {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
+        if let Some(handle) = self.handle.take() {
+            let keep_for_source_resolution = self
+                .transfers
+                .record(&self.id)
+                .is_ok_and(|task| task.status == "paused" && task.source_issue.is_some());
+            if !keep_for_source_resolution {
+                handle.abort();
+            }
         }
     }
 }
@@ -217,12 +236,27 @@ pub(crate) fn spawn(
     let runtime = transfers.runtime(&id);
     runtime.state_sessions.fetch_add(1, Ordering::SeqCst);
     let guard = SessionGuard(runtime);
-    StateSession(Some(tokio::spawn(async move {
+    let session_transfers = transfers.clone();
+    let session_id = id.clone();
+    let handle = tokio::spawn(async move {
         let _guard = guard;
-        if let Err(error) = exchange(&mut channel, transfers.clone(), peers, &id, revision).await {
-            disconnected(&transfers, &id, &error);
+        if let Err(error) = exchange(
+            &mut channel,
+            session_transfers.clone(),
+            peers,
+            &session_id,
+            revision,
+        )
+        .await
+        {
+            disconnected(&session_transfers, &session_id, &error);
         }
-    })))
+    });
+    StateSession {
+        handle: Some(handle),
+        transfers,
+        id,
+    }
 }
 
 pub(crate) async fn serve(
@@ -286,6 +320,10 @@ async fn exchange(
     let task = transfers.record(id)?;
     let peer = task.peer_id.clone();
     let wire_id = task.wire_id.clone();
+    let finish_sent = Arc::new(AtomicBool::new(false));
+    let finish_received = Arc::new(AtomicBool::new(false));
+    let receive_finish_sent = finish_sent.clone();
+    let receive_finish_received = finish_received.clone();
     let receive = async {
         loop {
             let response: Response =
@@ -294,14 +332,22 @@ async fn exchange(
             match response {
                 Response::StateHeartbeat => {}
                 Response::TaskEvent { revision, status } => {
+                    let is_finish = status == "finish";
                     transfers
                         .apply_remote_state(&peer, &wire_id, revision, &status)
                         .await?;
+                    if is_finish {
+                        receive_finish_received.store(true, Ordering::SeqCst);
+                        if receive_finish_sent.load(Ordering::SeqCst) {
+                            return Ok::<(), AppError>(());
+                        }
+                    }
                     if status == "resumed"
                         && transfers.record(id)?.direction == "send"
                         && !transfers.is_active(id)
                     {
                         transfers.start_task(peers.clone(), id.to_string());
+                        return Ok::<(), AppError>(());
                     }
                 }
                 _ => return Err(AppError::BadRequest("Unsupported task action".into())),
@@ -310,6 +356,8 @@ async fn exchange(
         #[allow(unreachable_code)]
         Ok::<(), AppError>(())
     };
+    let send_finish_sent = finish_sent.clone();
+    let send_finish_received = finish_received.clone();
     let send = async {
         if task.state_revision > revision {
             if let Some(status) = TransferService::control_status(&task) {
@@ -326,6 +374,12 @@ async fn exchange(
                     .state_sent_revision
                     .store(revision, Ordering::SeqCst);
                 runtime.state_updates.send_replace(());
+                if status == "finish" {
+                    send_finish_sent.store(true, Ordering::SeqCst);
+                    if send_finish_received.load(Ordering::SeqCst) {
+                        return Ok::<(), AppError>(());
+                    }
+                }
             }
         }
         let mut heartbeat = tokio::time::interval(crate::tuning::QUIC_KEEPALIVE);
@@ -339,12 +393,19 @@ async fn exchange(
                     let event = events.borrow_and_update().clone();
                     if let Some((next, status)) = event {
                         if next > revision {
+                            let is_finish = status == "finish";
                             protocol::write_frame(&mut *channel.writer, &Response::TaskEvent {
                                 revision: next, status,
                             }).await?;
                             revision = next;
                             runtime.state_sent_revision.store(revision,Ordering::SeqCst);
                             runtime.state_updates.send_replace(());
+                            if is_finish {
+                                send_finish_sent.store(true, Ordering::SeqCst);
+                                if send_finish_received.load(Ordering::SeqCst) {
+                                    return Ok::<(), AppError>(());
+                                }
+                            }
                         }
                     }
                 }

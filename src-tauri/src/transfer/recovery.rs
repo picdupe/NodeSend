@@ -2,7 +2,7 @@ use super::TransferService;
 use crate::error::{AppError, AppResult};
 use rusqlite::{params, OptionalExtension};
 
-fn reservation_bytes(size: u64) -> u64 {
+pub(crate) fn reservation_bytes(size: u64) -> u64 {
     size.div_ceil(4096)
         .saturating_mul(4096)
         .saturating_add(8192)
@@ -151,7 +151,7 @@ impl TransferService {
                 });
                 if exists || (base..base + count).any(|i| task.completed.contains(&i)) {
                     self.app.db.with_conn(|db| {
-                        db.execute("INSERT OR IGNORE INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved) VALUES(?1,?2,?3,'receiving',?4)",params![id,*file as i64,entry.size as i64,reservation_bytes(entry.size) as i64])?;
+                        db.execute("INSERT OR IGNORE INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved,assemble_reserved) VALUES(?1,?2,?3,'receiving',?4,?4)",params![id,*file as i64,entry.size as i64,reservation_bytes(entry.size) as i64])?;
                         Ok(())
                     })?;
                 }
@@ -180,14 +180,48 @@ impl TransferService {
         limit: u64,
     ) -> AppResult<bool> {
         self.app.db.with_transaction(|db| {
-            let old: Option<String> = db.query_row(
-                "SELECT state FROM transfer_file_journal WHERE task_id=?1 AND file_index=?2",
-                params![id,file as i64], |r| r.get(0)).optional()?;
-            if old.is_some() { return Ok(true); }
-            let used: i64 = db.query_row("SELECT COALESCE(SUM(receive_reserved),0) FROM transfer_file_journal WHERE receive_reserved>0", [], |r| r.get(0))?;
-            if reservation_bytes(size) > limit || (used as u64).saturating_add(reservation_bytes(size)) > limit { return Ok(false); }
-            db.execute("INSERT INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved) VALUES(?1,?2,?3,'receiving',?4)", params![id,file as i64,size as i64,reservation_bytes(size) as i64])?;
+            let old: Option<(i64, i64)> = db.query_row(
+                "SELECT receive_reserved,assemble_reserved FROM transfer_file_journal WHERE task_id=?1 AND file_index=?2",
+                params![id,file as i64], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            let bytes = reservation_bytes(size);
+            if old.is_some_and(|(receive, assemble)| receive as u64 >= bytes && assemble as u64 >= bytes) {
+                return Ok(true);
+            }
+            let used_receive: i64 = db.query_row(
+                "SELECT COALESCE(SUM(receive_reserved),0) FROM transfer_file_journal WHERE receive_reserved>0 AND NOT(task_id=?1 AND file_index=?2)",
+                params![id,file as i64], |r| r.get(0))?;
+            let used_assemble: i64 = db.query_row(
+                "SELECT COALESCE(SUM(assemble_reserved),0) FROM transfer_file_journal WHERE assemble_reserved>0 AND NOT(task_id=?1 AND file_index=?2)",
+                params![id,file as i64], |r| r.get(0))?;
+            if bytes > limit
+                || (used_receive.max(0) as u64).saturating_add(bytes) > limit
+                || (used_assemble.max(0) as u64).saturating_add(bytes) > limit
+            {
+                return Ok(false);
+            }
+            db.execute(
+                "INSERT INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved,assemble_reserved) \
+                 VALUES(?1,?2,?3,'receiving',?4,?4) \
+                 ON CONFLICT(task_id,file_index) DO UPDATE SET \
+                 state='receiving',receive_reserved=excluded.receive_reserved,assemble_reserved=excluded.assemble_reserved",
+                params![id,file as i64,size as i64,bytes as i64],
+            )?;
             Ok(true)
+        })
+    }
+
+    pub(crate) fn cached_file_reserved(&self, id: &str, file: usize, size: u64) -> AppResult<bool> {
+        self.app.db.with_conn(|db| {
+            let reservation: Option<(i64, i64)> = db
+                .query_row(
+                    "SELECT receive_reserved,assemble_reserved FROM transfer_file_journal WHERE task_id=?1 AND file_index=?2",
+                    params![id, file as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let expected = reservation_bytes(size) as i64;
+            Ok(reservation
+                .is_some_and(|(receive, assemble)| receive >= expected && assemble >= expected))
         })
     }
 
@@ -221,8 +255,8 @@ impl TransferService {
             let order: i64 = if state == "published" {
                 db.query_row("SELECT COALESCE(MAX(publish_order),0)+1 FROM transfer_file_journal", [], |r| r.get(0))?
             } else { 0 };
-            let receive = if ["receiving", "assembled", "publishing"].contains(&state) { reservation_bytes(size) } else { 0 };
-            let assemble = if ["assembled", "publishing"].contains(&state) { reservation_bytes(size) } else { 0 };
+            let receive = if ["receiving", "assembled"].contains(&state) { reservation_bytes(size) } else { 0 };
+            let assemble = if ["receiving", "assembled", "publishing"].contains(&state) { reservation_bytes(size) } else { 0 };
             db.execute("INSERT INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved,assemble_reserved,target,publish_order)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(task_id,file_index) DO UPDATE SET
                 state=excluded.state,receive_reserved=excluded.receive_reserved,assemble_reserved=excluded.assemble_reserved,
@@ -288,7 +322,9 @@ impl TransferService {
             .as_ref()
             .is_none_or(|i| i.kind != "missing")
         {
-            return Err(AppError::Conflict("Partial completion requires a missing source file".into()));
+            return Err(AppError::Conflict(
+                "Partial completion requires a missing source file".into(),
+            ));
         }
         self.edit(id, |t| {
             t.status = "finishing".into();
@@ -477,7 +513,9 @@ impl TransferService {
             .get(file)
             .ok_or_else(|| AppError::BadRequest("Invalid file index".into()))?;
         if old.path != entry.path || old.directory || entry.directory {
-            return Err(AppError::BadRequest("A replacement must refer to the same regular file path".into()));
+            return Err(AppError::BadRequest(
+                "A replacement must refer to the same regular file path".into(),
+            ));
         }
         let base = task.manifest.file_base(file);
         let old_size = old.size;
@@ -535,11 +573,6 @@ impl TransferService {
             *value = 0;
         }
         if task.use_cache {
-            if entry.size > 0 && entry.size <= super::CACHE_FILE_LIMIT {
-                task.cache_files.insert(file);
-            } else {
-                task.cache_files.remove(&file);
-            }
             task.relay_target_bytes = task
                 .cache_files
                 .iter()
@@ -608,24 +641,81 @@ impl TransferService {
         Ok(())
     }
     pub(crate) fn invalidate_file(&self, id: &str, file: usize) -> AppResult<()> {
+        self.reset_file_for_retry(id, file, true)
+    }
+
+    pub(crate) async fn fallback_cached_file_to_direct(
+        &self,
+        id: &str,
+        file: usize,
+    ) -> AppResult<bool> {
+        let _admission = self.cache_admission.lock().await;
+        let task = self.record(id)?;
+        if !task.cache_files.contains(&file) {
+            return Ok(false);
+        }
+        if self.journal_state(id, file)?.as_deref() == Some("published") {
+            return Ok(false);
+        }
+        let entry = task
+            .manifest
+            .entries
+            .get(file)
+            .ok_or_else(|| AppError::BadRequest("Invalid file index".into()))?;
+        let size = entry.size;
+        self.reset_file_for_retry(id, file, false)?;
+        self.edit(id, |current| {
+            if current.cache_files.remove(&file) {
+                current.use_cache = !current.cache_files.is_empty();
+                current.relay_target_bytes = current
+                    .cache_files
+                    .iter()
+                    .filter_map(|index| current.manifest.entries.get(*index))
+                    .map(|entry| entry.size)
+                    .sum();
+                current.cache_plan_revision = current.cache_plan_revision.wrapping_add(1);
+            }
+        })?;
+        self.app.db.with_conn(|db| {
+            db.execute(
+                "INSERT INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved,assemble_reserved) \
+                 VALUES(?1,?2,?3,'direct',0,0) \
+                 ON CONFLICT(task_id,file_index) DO UPDATE SET size=excluded.size,state='direct',receive_reserved=0,assemble_reserved=0",
+                params![id, file as i64, size as i64],
+            )?;
+            Ok(())
+        })?;
+        if let Some(runtime) = self.runtime_if_exists(id) {
+            crate::locks::lock(&runtime.cache_fallback_pending).insert(file);
+            let base = task.manifest.file_base(file);
+            let end = base.saturating_add(size.div_ceil(task.chunk_size) as usize);
+            crate::locks::lock(&runtime.write_pending).retain(|index| *index < base || *index >= end);
+        }
+        tracing::warn!(task = %id, file, size_bytes = size, "Cache space is insufficient; cached data was discarded and the complete file will be retransmitted directly");
+        Ok(true)
+    }
+
+    fn reset_file_for_retry(&self, id: &str, file: usize, count_repair: bool) -> AppResult<()> {
         let task = self.record(id)?;
         let entry = task
             .manifest
             .entries
             .get(file)
             .ok_or_else(|| AppError::BadRequest("Invalid file index".into()))?;
-        let attempts: i64 = self.app.db.with_transaction(|db| {
-            db.execute("INSERT INTO transfer_file_repairs(task_id,file_index,attempts) VALUES(?1,?2,1) ON CONFLICT(task_id,file_index) DO UPDATE SET attempts=attempts+1",params![id,file as i64])?;
-            Ok(db.query_row("SELECT attempts FROM transfer_file_repairs WHERE task_id=?1 AND file_index=?2",params![id,file as i64],|r| r.get(0))?)
-        })?;
-        if attempts > 3 {
-            self.edit(id, |t| {
-                t.status = "failed".into();
-                t.error = Some("The received file could not be restored after three attempts".into());
+        if count_repair {
+            let attempts: i64 = self.app.db.with_transaction(|db| {
+                db.execute("INSERT INTO transfer_file_repairs(task_id,file_index,attempts) VALUES(?1,?2,1) ON CONFLICT(task_id,file_index) DO UPDATE SET attempts=attempts+1",params![id,file as i64])?;
+                Ok(db.query_row("SELECT attempts FROM transfer_file_repairs WHERE task_id=?1 AND file_index=?2",params![id,file as i64],|r| r.get(0))?)
             })?;
-            return Err(AppError::Conflict(
-                "The received file could not be restored after three attempts".into(),
-            ));
+            if attempts > 3 {
+                self.edit(id, |t| {
+                    t.status = "failed".into();
+                    t.error = Some("The received file could not be restored after three attempts".into());
+                })?;
+                return Err(AppError::Conflict(
+                    "The received file could not be restored after three attempts".into(),
+                ));
+            }
         }
         let base = task.manifest.file_base(file);
         let end = base + entry.size.div_ceil(task.chunk_size) as usize;
@@ -644,7 +734,11 @@ impl TransferService {
                 *value = 0;
             }
             t.error = None;
-            t.event(format!("File needs to be retransferred: {}", entry.path));
+            t.event(if count_repair {
+                format!("File needs to be retransferred: {}", entry.path)
+            } else {
+                format!("Cache space is insufficient; the file will be retransmitted directly: {}", entry.path)
+            });
         })?;
         self.save_decision(id)?;
         if let Some(cache) = self.cache_root_for_task(id) {
@@ -761,27 +855,98 @@ impl TransferService {
         Ok(missing)
     }
 
-    pub(crate) async fn admit_cached_file(&self, id: &str, file: usize) -> AppResult<()> {
+    pub(crate) async fn admit_cached_file(&self, id: &str, file: usize) -> AppResult<bool> {
         let task = self.record(id)?;
+        let Some(entry) = task.manifest.entries.get(file) else {
+            return Err(AppError::BadRequest("Invalid file index".into()));
+        };
         if !task.cache_files.contains(&file) {
-            return Ok(());
+            return Ok(false);
         }
-        let size = task.manifest.entries[file].size;
-        loop {
-            if !processing(&self.status_of(id)?) {
-                return Err(AppError::Conflict("Task is no longer active".into()));
+        let size = entry.size;
+        let Some(cache_root) = self.cache_root_for_task(id) else {
+            return self.fallback_cached_file_to_direct(id, file).await;
+        };
+        if !processing(&self.status_of(id)?) {
+            return Err(AppError::Conflict("Task is no longer active".into()));
+        }
+        let mut retry_direct = false;
+        let mut switched_without_data = false;
+        {
+            let _lock = self.cache_admission.lock().await;
+            let current = self.record(id)?;
+            if !current.cache_files.contains(&file) {
+                return Ok(false);
             }
-            {
-                let _lock = self.cache_admission.lock().await;
-                if self.reserve_cached_file(id, file, size, crate::tuning::CACHE_RECEIVE_BYTES)? {
-                    return Ok(());
+            let base = current.manifest.file_base(file);
+            let end = base.saturating_add(size.div_ceil(current.chunk_size) as usize);
+            let has_received_chunks = current.completed.range(base..end).next().is_some();
+            let journal = self.journal_state(id, file)?;
+            let has_cache_state = journal
+                .as_deref()
+                .is_some_and(|state| matches!(state, "assembled" | "publishing" | "published"));
+            let has_cached_data = super::paths::cache_file(&cache_root, &task, file).exists()
+                || super::paths::cache_segment(&cache_root, &task, file, 0).exists();
+            match self.cache_budget(&cache_root).await {
+                Ok(budget) => {
+                    let capacity = budget.receive.min(budget.assemble);
+                    let fits = super::cache_candidate_fits(size, 0, budget.max_file_size(), capacity);
+                    if !fits
+                        || !self.cached_file_reserved(id, file, size)?
+                            && !self.reserve_cached_file(id, file, size, capacity)?
+                    {
+                        if has_received_chunks || has_cache_state || has_cached_data {
+                            retry_direct = true;
+                        } else {
+                            self.disable_cached_file(id, file, size)?;
+                            switched_without_data = true;
+                        }
+                    }
+                    if switched_without_data {
+                        tracing::info!(
+                            task = %id,
+                            file,
+                            size_bytes = size,
+                            disk_free_bytes = budget.free,
+                            total_budget_bytes = budget.total,
+                            "Cache capacity is unavailable; selecting direct destination writes for this file"
+                        );
+                    }
+                }
+                Err(_) => {
+                    retry_direct = true;
+                    tracing::warn!(task = %id, file, "Cache space could not be measured; switching this file to direct writes");
                 }
             }
-            tokio::select! {
-                _ = self.shutdown.cancelled() => return Err(AppError::Other("Transfer service is shutting down".into())),
-                _ = tokio::time::sleep(crate::tuning::CACHE_SPACE_POLL) => {}
-            }
         }
+        if retry_direct {
+            return self.fallback_cached_file_to_direct(id, file).await;
+        }
+        Ok(false)
+    }
+
+    fn disable_cached_file(&self, id: &str, file: usize, size: u64) -> AppResult<()> {
+        let mut changed = false;
+        self.edit(id, |task| {
+            if task.cache_files.remove(&file) {
+                changed = true;
+                task.use_cache = !task.cache_files.is_empty();
+                task.relay_target_bytes = task.relay_target_bytes.saturating_sub(size);
+                task.cache_plan_revision = task.cache_plan_revision.wrapping_add(1);
+            }
+        })?;
+        if changed {
+            self.app.db.with_conn(|db| {
+                db.execute(
+                    "INSERT INTO transfer_file_journal(task_id,file_index,size,state,receive_reserved,assemble_reserved) \
+                     VALUES(?1,?2,?3,'direct',0,0) \
+                     ON CONFLICT(task_id,file_index) DO UPDATE SET state='direct',receive_reserved=0,assemble_reserved=0",
+                    params![id, file as i64, size as i64],
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 }
 

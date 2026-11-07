@@ -11,6 +11,7 @@
     "notFound": "The requested item was not found.",
     "forbidden": "This operation is not allowed.",
     "conflict": "The operation conflicts with the current state.",
+    "permissionDenied": "The app does not have permission to write to this location. Check the cache or receive-directory permissions, or choose a writable folder and try again.",
     "unknown": "The operation failed. Please try again."
   },
   "transfer": {
@@ -23,12 +24,15 @@
     "noFiles": "There are no files to send.",
     "connectionUnreachable": "Could not reach this device. Make sure NodeSend is open on the other device and both devices are on the same network.",
     "connectionRefused": "The other device refused the connection. Make sure NodeSend is running and check the firewall settings.",
-    "timedOut": "The connection timed out. Make sure the other device is online and check the network and firewall."
+    "receiveDirectorySpace": "There is not enough space in the receive directory, including space reserved for other tasks. Free disk space or choose another receive directory, then try again.",
+    "timedOut": "The connection timed out. Make sure the other device is online and check the network and firewall.",
+    "cacheSpacePaused": "The cache drive ran out of available space, so the task was paused. Free space on the cache drive, then resume the task."
   },
   "settings": {
     "saveFailed": "Could not save settings: {{reason}}",
     "favoriteSaveFailed": "Could not save favorites. Check the app's available storage and try again.",
-    "invalidLanguage": "The selected language is not supported."
+    "invalidLanguage": "The selected language is not supported.",
+    "unfinishedTransfers": "Complete or cancel all unfinished transfers before installing the update."
   },
   "update": {
     "desktopOnly": "Updates are available only in the desktop app.",

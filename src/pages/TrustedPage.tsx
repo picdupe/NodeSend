@@ -14,6 +14,7 @@ import {
 import type { TrustedNode } from '../types';
 import { SidebarToggle, WindowControls } from '../components/AppLayout';
 import { useTranslation } from 'react-i18next';
+import { errorText } from '../api/network';
 
 export function TrustedPage() {
   const { t, i18n } = useTranslation('common');
@@ -21,7 +22,7 @@ export function TrustedPage() {
   const [message, setMessage] = useState('');
 
   const refresh = useCallback(() => {
-    listTrustedNodes().then(setNodes).catch((err) => setMessage(String(err)));
+    listTrustedNodes().then(setNodes).catch((err) => setMessage(errorText(err)));
   }, []);
   useEffect(refresh, [refresh]);
 
@@ -36,7 +37,7 @@ export function TrustedPage() {
       form.reset();
       refresh();
     } catch (err) {
-      setMessage(String(err));
+      setMessage(errorText(err));
     }
   };
 

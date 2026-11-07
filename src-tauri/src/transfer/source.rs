@@ -39,7 +39,9 @@ impl SourceScanner {
             let meta = std::fs::symlink_metadata(path)?;
             paths::ensure_plain_meta(&meta)?;
             if !meta.is_file() && !meta.is_dir() {
-                return Err(AppError::BadRequest("Only regular files and directories are supported".into()));
+                return Err(AppError::BadRequest(
+                    "Only regular files and directories are supported".into(),
+                ));
             }
             let name = path
                 .file_name()
@@ -78,17 +80,23 @@ impl SourceScanner {
     pub fn resume_after(&mut self, last_seq: usize, last_path: &str) -> AppResult<()> {
         if last_seq == 0 {
             if !last_path.is_empty() {
-                return Err(AppError::BadRequest("An empty scan cursor cannot include a path".into()));
+                return Err(AppError::BadRequest(
+                    "An empty scan cursor cannot include a path".into(),
+                ));
             }
             return Ok(());
         }
         if last_path.is_empty() {
-            return Err(AppError::BadRequest("Scan cursor is missing its last path".into()));
+            return Err(AppError::BadRequest(
+                "Scan cursor is missing its last path".into(),
+            ));
         }
         for seq in 1..=last_seq {
-            let entry = self
-                .next_entry()?
-                .ok_or_else(|| AppError::Conflict("Source directory changed; cannot restore the manifest scan position".into()))?;
+            let entry = self.next_entry()?.ok_or_else(|| {
+                AppError::Conflict(
+                    "Source directory changed; cannot restore the manifest scan position".into(),
+                )
+            })?;
             if seq == last_seq && entry.path != last_path {
                 return Err(AppError::Conflict(
                     "Deterministic scan order of the source directory changed; cannot restore the manifest scan position".into(),
@@ -139,7 +147,9 @@ impl SourceScanner {
 
         while let Some((path, relative, depth, emit)) = self.stack.pop() {
             if depth > 64 {
-                return Err(AppError::BadRequest("Directory nesting exceeds the limit".into()));
+                return Err(AppError::BadRequest(
+                    "Directory nesting exceeds the limit".into(),
+                ));
             }
             if !emit {
                 let mut children = std::fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
@@ -163,7 +173,9 @@ impl SourceScanner {
                 continue;
             }
             if !meta.is_file() && !meta.is_dir() {
-                return Err(AppError::BadRequest("Only regular files and directories are supported".into()));
+                return Err(AppError::BadRequest(
+                    "Only regular files and directories are supported".into(),
+                ));
             }
             if meta.is_dir() {
                 self.stack
@@ -440,7 +452,11 @@ mod fingerprint_tests {
             expected[2..],
             "After resuming from the persisted cursor, the remaining manifest must match the suffix of a full scan"
         );
-        assert_eq!(2 + suffix.len(), expected.len(), "Recovery scan must not omit or add entries");
+        assert_eq!(
+            2 + suffix.len(),
+            expected.len(),
+            "Recovery scan must not omit or add entries"
+        );
 
         let mut invalid = SourceScanner::new(vec![first.to_string_lossy().into_owned()]).unwrap();
         assert!(invalid.resume_after(2, "first/not-a.txt").is_err());

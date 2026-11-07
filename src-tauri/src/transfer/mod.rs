@@ -34,12 +34,53 @@ pub(crate) const MANIFEST_PAGE: usize = crate::tuning::MANIFEST_PAGE;
 /// 传输分块大小。见 [`crate::tuning::CHUNK_SIZE`]。
 pub(crate) const CHUNK_SIZE: u64 = crate::tuning::CHUNK_SIZE;
 
+/// 缓存预算按当前磁盘可用空间动态计算，同时受总上限约束。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheBudget {
+    pub total: u64,
+    pub receive: u64,
+    pub assemble: u64,
+    pub free: u64,
+    pub min_free: u64,
+}
+
+impl CacheBudget {
+    pub(crate) fn max_file_size(self) -> u64 {
+        let reservation_limit = self.receive.min(self.assemble).min(self.total / 2);
+        reservation_limit
+            .saturating_sub(8192)
+            .checked_div(4096)
+            .unwrap_or_default()
+            .saturating_mul(4096)
+    }
+}
+
+fn task_cache_reserved_bytes(task: &TaskRecord) -> u64 {
+    task.cache_files
+        .iter()
+        .filter_map(|index| {
+            let entry = task.manifest.entries.get(*index)?;
+            let relayed = task.relayed.get(*index).copied().unwrap_or_default();
+            (!entry.directory && entry.size > 0 && relayed < entry.size)
+                .then(|| recovery::reservation_bytes(entry.size))
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+fn effective_cache_total(free: u64, volume_total: u64, min_free: u64) -> u64 {
+    crate::tuning::CACHE_MAX_BYTES
+        .min(volume_total)
+        .min(free.saturating_sub(min_free))
+}
+
+fn cache_candidate_fits(size: u64, planned: u64, file_limit: u64, capacity: u64) -> bool {
+    size > 0
+        && size <= file_limit
+        && planned.saturating_add(recovery::reservation_bytes(size)) <= capacity
+}
+
 /// 发送端同时保留的读句柄上限。见 [`crate::tuning::SEND_HANDLES_LIMIT`]。
 pub(crate) const SEND_HANDLES_LIMIT: usize = crate::tuning::SEND_HANDLES_LIMIT;
-
-/// 单文件缓存上限。缓存盘是流式中转区，累计数据由 relay 持续释放，
-/// 因此不应按整个任务大小筛掉后续文件；只有超过该上限的单文件直写目标盘。
-const CACHE_FILE_LIMIT: u64 = crate::tuning::CACHE_RECEIVE_BYTES - 8192;
 
 /// 缓存中转的只读标量视图：供转写调度与 `commit` 判定使用，**不加载清单明细**。
 /// 全部字段来自 `TaskRecord` 的持久化标量，因此构造与使用都是 O(1)。
@@ -56,6 +97,7 @@ pub(crate) struct RelayState {
     pub completed_bytes: u64,
     pub relayed_total: u64,
     pub relay_target_bytes: u64,
+    pub cache_plan_revision: u64,
 }
 
 /// 转写任务所需的只读计划：每个文件条目、块基址、目标路径与已转写进度一次取齐。
@@ -64,6 +106,7 @@ pub(crate) struct RelayPlan {
     pub digest: String,
     pub use_cache: bool,
     pub cache_files: BTreeSet<usize>,
+    pub cache_plan_revision: u64,
     pub entries: Vec<FileEntry>,
     pub bases: Vec<usize>,
     pub chunk_size: u64,
@@ -99,6 +142,8 @@ pub(crate) struct TaskRuntime {
     pub(crate) send_files: Mutex<HashMap<usize, Arc<AsyncMutex<tokio::fs::File>>>>,
     /// 接收端目标盘写句柄（文件序号 → File）。
     pub(crate) receive_files: Mutex<HashMap<usize, Arc<AsyncMutex<tokio::fs::File>>>>,
+    /// 文件因缓存空间不足被重置后，等待发送端开始整文件重传。
+    pub(crate) cache_fallback_pending: Mutex<HashSet<usize>>,
 }
 
 impl Default for TaskRuntime {
@@ -116,6 +161,7 @@ impl Default for TaskRuntime {
             committing: AtomicBool::new(false),
             send_files: Mutex::default(),
             receive_files: Mutex::default(),
+            cache_fallback_pending: Mutex::default(),
         }
     }
 }
@@ -131,16 +177,63 @@ pub struct TransferService {
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
     /// 接收写入队列（有界，满时背压接收路径）。见 `write_queue` 模块。
     pub(crate) write_tx: mpsc::Sender<write_queue::PendingChunk>,
-    /// 当前缓存目录；设置变更后立即更新。
+    /// 当前按安装盘符解析的固定缓存目录。
     pub(crate) cache_root: Mutex<Option<PathBuf>>,
     /// 已选择缓存模式的任务固定使用原目录，避免运行中切换目录导致分块散落。
     task_cache_roots: Mutex<HashMap<String, PathBuf>>,
 }
 impl TransferService {
-    pub(crate) fn extend_cache_plan(&self, id: &str, first: usize) -> AppResult<()> {
-        let Some(_) = self.cache_root_for_task(id) else {
+    pub(crate) async fn cache_budget(&self, root: &std::path::Path) -> AppResult<CacheBudget> {
+        let root = root.to_path_buf();
+        let (free, total_space) = tokio::task::spawn_blocking(move || {
+            Ok::<_, std::io::Error>((fs2::available_space(&root)?, fs2::total_space(&root)?))
+        })
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))??;
+        let min_free = (total_space / 50)
+            .max(crate::tuning::CACHE_MIN_FREE_FLOOR_BYTES)
+            .min(crate::tuning::CACHE_MIN_FREE_CEILING_BYTES)
+            .min(total_space / 2);
+        let total = effective_cache_total(free, total_space, min_free);
+        let half = total / 2;
+        Ok(CacheBudget {
+            total,
+            receive: half,
+            assemble: total.saturating_sub(half),
+            free,
+            min_free,
+        })
+    }
+
+    pub(crate) async fn wait_for_cache_space(&self, id: &str, bytes: u64) -> AppResult<bool> {
+        let Some(root) = self.cache_root_for_task(id) else {
+            return Ok(false);
+        };
+        let stats_root = root.clone();
+        let Ok(Ok(total_space)) = tokio::task::spawn_blocking(move || fs2::total_space(&stats_root)).await else {
+            return Ok(false);
+        };
+        let min_free = (total_space / 50)
+            .max(crate::tuning::CACHE_MIN_FREE_FLOOR_BYTES)
+            .min(crate::tuning::CACHE_MIN_FREE_CEILING_BYTES)
+            .min(total_space / 2);
+        if !recovery::processing(&self.status_of(id)?) {
+            return Ok(false);
+        }
+        let probe_root = root.clone();
+        let Ok(Ok(free)) = tokio::task::spawn_blocking(move || fs2::available_space(&probe_root)).await else {
+            return Ok(false);
+        };
+        Ok(free >= min_free.saturating_add(bytes))
+    }
+
+    pub(crate) async fn extend_cache_plan(&self, id: &str, first: usize) -> AppResult<()> {
+        let Some(cache_root) = self.cache_root_for_task(id) else {
             return Ok(());
         };
+        let budget = self.cache_budget(&cache_root).await?;
+        let file_limit = budget.max_file_size();
+        let capacity = budget.receive.min(budget.assemble);
         let mut map = locks::lock(&self.tasks);
         let task = map
             .get_mut(id)
@@ -148,6 +241,7 @@ impl TransferService {
         if task.scan_complete || task.destination.is_none() {
             return Ok(());
         }
+        let mut planned = task_cache_reserved_bytes(task);
         let mut added_files = 0usize;
         let mut added_bytes = 0u64;
         for index in first..task.manifest.entries.len() {
@@ -161,8 +255,10 @@ impl TransferService {
             {
                 continue;
             }
-            if entry.size <= CACHE_FILE_LIMIT {
+            let reserve = recovery::reservation_bytes(entry.size);
+            if cache_candidate_fits(entry.size, planned, file_limit, capacity) {
                 task.cache_files.insert(index);
+                planned = planned.saturating_add(reserve);
                 added_files = added_files.saturating_add(1);
                 added_bytes = added_bytes.saturating_add(entry.size);
             }
@@ -170,12 +266,14 @@ impl TransferService {
         if added_files > 0 {
             task.use_cache = true;
             task.relay_target_bytes = task.relay_target_bytes.saturating_add(added_bytes);
+            task.cache_plan_revision = task.cache_plan_revision.wrapping_add(1);
             task.updated_at = chrono::Utc::now().to_rfc3339();
             self.persist(task)?;
+            tracing::debug!(task = %id, added_files, added_bytes, file_limit_bytes = file_limit, "Cache plan extended using the current free-space budget");
         }
         Ok(())
     }
-    pub(crate) fn refresh_cache_plan(&self, id: &str) -> AppResult<()> {
+    pub(crate) async fn refresh_cache_plan(&self, id: &str) -> AppResult<()> {
         let task = self.record(id)?;
         if task.destination.is_none() {
             return Ok(());
@@ -183,7 +281,18 @@ impl TransferService {
         let Some(cache) = self.cache_root_for_task(id) else {
             return Ok(());
         };
+        let budget = self.cache_budget(&cache).await?;
+        let file_limit = budget.max_file_size();
+        let capacity = budget.receive.min(budget.assemble);
+        let direct_files: HashSet<usize> = self.app.db.with_conn(|db| {
+            let mut statement = db.prepare(
+                "SELECT file_index FROM transfer_file_journal WHERE task_id=?1 AND state='direct'",
+            )?;
+            let rows = statement.query_map([id], |row| Ok(row.get::<_, i64>(0)? as usize))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
         let mut selected = task.cache_files.clone();
+        let mut planned = task_cache_reserved_bytes(&task);
         selected.retain(|index| {
             task.manifest
                 .entries
@@ -197,8 +306,17 @@ impl TransferService {
             {
                 continue;
             }
-            if !selected.contains(&index) && entry.size <= CACHE_FILE_LIMIT {
+            let reserve = recovery::reservation_bytes(entry.size);
+            let base = task.manifest.file_base(index);
+            let end = base.saturating_add(entry.size.div_ceil(task.chunk_size) as usize);
+            let has_received_chunks = task.completed.range(base..end).next().is_some();
+            if !selected.contains(&index)
+                && !direct_files.contains(&index)
+                && !has_received_chunks
+                && cache_candidate_fits(entry.size, planned, file_limit, capacity)
+            {
                 selected.insert(index);
+                planned = planned.saturating_add(reserve);
             }
         }
         let target_bytes: u64 = selected
@@ -206,10 +324,14 @@ impl TransferService {
             .filter_map(|i| task.manifest.entries.get(*i))
             .map(|e| e.size)
             .sum();
+        let changed = selected != task.cache_files;
         self.edit(id, |record| {
             record.cache_files = selected.clone();
             record.use_cache = !selected.is_empty();
             record.relay_target_bytes = target_bytes;
+            if changed {
+                record.cache_plan_revision = record.cache_plan_revision.wrapping_add(1);
+            }
             if record.relayed.len() < record.manifest.entries.len() {
                 record.relayed.resize(record.manifest.entries.len(), 0);
             }
@@ -554,7 +676,9 @@ impl TransferService {
             .get_mut(id)
             .ok_or_else(|| AppError::NotFound("Send task not found".into()))?;
         if task.manifest.entries.len() != first {
-            return Err(AppError::Conflict("Local manifest cursor does not match persisted entries".into()));
+            return Err(AppError::Conflict(
+                "Local manifest cursor does not match persisted entries".into(),
+            ));
         }
         let previous = (
             task.file_count,
@@ -1213,6 +1337,7 @@ impl TransferService {
             completed_bytes: task.completed_bytes,
             relayed_total: task.relayed_total,
             relay_target_bytes: task.relay_target_bytes,
+            cache_plan_revision: task.cache_plan_revision,
         })
     }
     /// 转写任务需要的只读计划（每文件条目、块基址、目标路径），一次取齐。
@@ -1237,6 +1362,7 @@ impl TransferService {
             digest: task.digest.clone(),
             use_cache: task.use_cache,
             cache_files: task.cache_files.clone(),
+            cache_plan_revision: task.cache_plan_revision,
             entries: task.manifest.entries.clone(),
             bases,
             chunk_size: task.chunk_size,
@@ -1503,7 +1629,9 @@ impl TransferService {
         let sources = scanner.roots().to_vec();
         let root_entries = scanner.next_batch(sources.len().max(1))?;
         if root_entries.is_empty() {
-            return Err(AppError::BadRequest("Select at least one regular file or directory".into()));
+            return Err(AppError::BadRequest(
+                "Select at least one regular file or directory".into(),
+            ));
         }
         let manifest = Manifest::new(root_entries, CHUNK_SIZE, verify_hash);
         let wire_id = random_id();
@@ -1546,6 +1674,7 @@ impl TransferService {
             skipped_bytes: 0,
             skipped_paths: vec![],
             cache_files: BTreeSet::new(),
+            cache_plan_revision: 0,
             resume_requested: false,
             source_issue: None,
             recovery_epoch: 0,
@@ -1658,7 +1787,9 @@ impl TransferService {
             .map_err(|error| AppError::Other(error.to_string()))??;
         let targets = paths::plan_targets(&task, &root, &conflict, selected.as_deref())?;
         if targets.iter().all(Option::is_none) {
-            return Err(AppError::BadRequest("No files selected for receiving".into()));
+            return Err(AppError::BadRequest(
+                "No files selected for receiving".into(),
+            ));
         }
         let required: u64 = task
             .manifest
@@ -1687,7 +1818,8 @@ impl TransferService {
         };
         if free < required.saturating_add(reserved) {
             return Err(AppError::Conflict(
-                "Insufficient receive-directory space, including reservations from other tasks".into(),
+                "Insufficient receive-directory space, including reservations from other tasks"
+                    .into(),
             ));
         }
         let skipped = task
@@ -1702,9 +1834,26 @@ impl TransferService {
         // 同卷判断要查询卷信息，属于同步文件系统调用，同样放到阻塞线程池。
         self.refresh_cache_root_from_settings();
         let current_cache_root = self.current_cache_root();
+        let (cache_file_limit, cache_capacity) = match current_cache_root.as_deref() {
+            Some(root) => {
+                let budget = self.cache_budget(root).await?;
+                tracing::info!(
+                    cache = %root.display(),
+                    disk_free_bytes = budget.free,
+                    safety_reserve_bytes = budget.min_free,
+                    total_budget_bytes = budget.total,
+                    receive_budget_bytes = budget.receive,
+                    assemble_budget_bytes = budget.assemble,
+                    "Cache budget calculated from current free disk space"
+                );
+                (budget.max_file_size(), budget.receive.min(budget.assemble))
+            }
+            None => (0, 0),
+        };
         let cache_files = match current_cache_root.clone() {
             Some(_) => {
                 let mut selected = BTreeSet::new();
+                let mut planned = 0u64;
                 for (index, entry) in task.manifest.entries.iter().enumerate() {
                     if entry.directory
                         || entry.size == 0
@@ -1712,8 +1861,10 @@ impl TransferService {
                     {
                         continue;
                     }
-                    if entry.size <= CACHE_FILE_LIMIT {
+                    let reserve = recovery::reservation_bytes(entry.size);
+                    if cache_candidate_fits(entry.size, planned, cache_file_limit, cache_capacity) {
                         selected.insert(index);
+                        planned = planned.saturating_add(reserve);
                     }
                 }
                 selected
@@ -1764,6 +1915,7 @@ impl TransferService {
                 .map(|c| c.length as u64)
                 .sum();
             t.cache_files = cache_files.clone();
+            t.cache_plan_revision = t.cache_plan_revision.wrapping_add(1);
             t.relay_target_bytes = t
                 .manifest
                 .entries
@@ -1800,7 +1952,7 @@ impl TransferService {
             } else if use_cache {
                 format!("The receiver confirmed the save location and conflict policy (cache relay enabled for {} files at {})", cache_files.len(), current_cache_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default())
             } else {
-                "The receiver confirmed the save location and conflict policy (no cache directory configured; writing directly to destination)".to_string()
+                "The receiver confirmed the save location and conflict policy (cache relay unavailable or unnecessary; writing directly to destination)".to_string()
             });
             t.event("Acceptance confirmed. Receiving started");
         })?;
@@ -1854,9 +2006,7 @@ impl TransferService {
                 .as_ref()
                 .is_some_and(|i| i.kind == "missing")
         {
-            return Err(AppError::Conflict(
-                "Task has ended".into(),
-            ));
+            return Err(AppError::Conflict("Task has ended".into()));
         }
         let state = match action {
             "pause" => "paused",
@@ -1926,7 +2076,9 @@ impl TransferService {
         ]
         .contains(&status)
         {
-            return Err(AppError::BadRequest("Invalid task status synchronization value".into()));
+            return Err(AppError::BadRequest(
+                "Invalid task status synchronization value".into(),
+            ));
         }
         let id = self.task_id_for_peer_wire(peer, wire_id)?;
         let gate = self.gate(&id);
@@ -2024,7 +2176,9 @@ impl TransferService {
                 }
             }
         }
-        Err(AppError::NotFound("The corresponding transfer task does not exist on the peer".into()))
+        Err(AppError::NotFound(
+            "The corresponding transfer task does not exist on the peer".into(),
+        ))
     }
     /// 取消/删除接收任务的完整清理顺序：
     async fn cleanup_receive(&self, task: &TaskRecord) {
@@ -2284,13 +2438,6 @@ impl TransferService {
             save_to_gallery: task.android_media_library,
         })
     }
-    pub fn cache_directory(&self) -> String {
-        // 设置页展示用户配置的缓存目录（未配置时给出默认候选），与当前是否已创建/已解析无关。
-        relay::configured_cache_root(&self.app)
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
     pub(crate) fn current_cache_root(&self) -> Option<PathBuf> {
         locks::lock(&self.cache_root).clone()
     }
@@ -2382,7 +2529,9 @@ impl TransferService {
         std::thread::Builder::new()
             .name("nodesend-preview-scan".into())
             .spawn(move || preview_scan(scanner, worker_status, worker_cancel, CHUNK_SIZE))
-            .map_err(|error| AppError::Other(format!("Failed to start preview scanning thread: {error}")))?;
+            .map_err(|error| {
+                AppError::Other(format!("Failed to start preview scanning thread: {error}"))
+            })?;
         let snapshot = locks::lock(&status).clone();
         *locks::lock(&PREVIEW_JOB) = Some(PreviewJob {
             key,
@@ -2510,7 +2659,10 @@ mod preview_tests {
 
         let first = TransferService::preview_start(vec![root.to_string_lossy().into_owned()])
             .expect("preview should start");
-        assert!(first.scanning, "Selection should immediately return a scanning state");
+        assert!(
+            first.scanning,
+            "Selection should immediately return a scanning state"
+        );
         assert_eq!(first.top_level_count, 1);
 
         let mut last = first;
@@ -2523,15 +2675,40 @@ mod preview_tests {
             last = status;
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(!last.scanning, "Preview should finish scanning in the background");
-        assert_eq!(last.file_count, 3, "Three files");
-        assert_eq!(
-            last.directory_count, 2,
-            "Root directory + subdirectory"
+        assert!(
+            !last.scanning,
+            "Preview should finish scanning in the background"
         );
+        assert_eq!(last.file_count, 3, "Three files");
+        assert_eq!(last.directory_count, 2, "Root directory + subdirectory");
         assert_eq!(last.total_size, 6, "aaa + bb + c");
         assert!(!last.exceeded);
         TransferService::preview_cancel();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_budget_never_exceeds_a_small_volume_or_its_free_space() {
+        let small_volume = 8 * 1024 * 1024 * 1024;
+        assert_eq!(
+            effective_cache_total(100 * small_volume, small_volume, 0),
+            small_volume
+        );
+        assert_eq!(
+            effective_cache_total(3 * 1024 * 1024 * 1024, small_volume, 1024 * 1024 * 1024),
+            2 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn cache_plan_reserves_only_half_and_caps_aggregate_file_sizes() {
+        let capacity = 4 * 1024 * 1024 * 1024 - 1;
+        let file_size = 2 * 1024 * 1024 * 1024 - 4096;
+        assert!(cache_candidate_fits(file_size, 0, file_size, capacity));
+        let planned = recovery::reservation_bytes(file_size);
+        assert!(!cache_candidate_fits(
+            file_size, planned, file_size, capacity
+        ));
+        assert!(!cache_candidate_fits(file_size + 1, 0, file_size, capacity));
     }
 }

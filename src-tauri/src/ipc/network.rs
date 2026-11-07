@@ -363,14 +363,12 @@ pub async fn set_network_settings(
     network: State<'_, Arc<NetworkManager>>,
     name: String,
     directory: String,
-    cache_directory: String,
     policy: String,
 ) -> AppResult<()> {
     set_network_settings_service(
         network.inner().clone(),
         name,
         directory,
-        cache_directory,
         policy,
     )
     .await
@@ -380,10 +378,9 @@ pub(crate) async fn set_network_settings_service(
     network: Arc<NetworkManager>,
     name: String,
     directory: String,
-    cache_directory: String,
     policy: String,
 ) -> AppResult<()> {
-    network.settings(name, directory, cache_directory, policy)
+    network.settings(name, directory, policy)
 }
 #[tauri::command]
 pub fn set_android_media_library_enabled(

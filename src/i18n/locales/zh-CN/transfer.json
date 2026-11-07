@@ -184,6 +184,16 @@
       "sourceMissing": "源文件已丢失，可完成已接收部分或取消",
       "sourceUnavailable": "源文件暂时不可访问，可恢复重试",
       "peerStatus": "已同步对端任务状态：{{status}}",
+      "unknownPeerStatus": "未知状态",
+      "untranslated": "此任务包含暂不支持显示的事件。",
+      "peerStatusValues": {
+        "resumed": "已恢复",
+        "paused": "已暂停",
+        "finish": "已完成接收",
+        "offline": "对方已离线",
+        "cancelled": "已取消",
+        "rejected": "已拒绝"
+      },
       "partialCompleted": "已保留可用文件，任务部分完成；未接收文件已列入放弃清单",
       "waitingForReceiver": "等待接收方继续",
       "writeFailed": "写入失败：{{error}}"

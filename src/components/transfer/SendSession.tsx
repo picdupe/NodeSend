@@ -3,6 +3,7 @@ import type { NetworkStatus } from '../../types/network';
 import { Icon } from '../Icon';
 import { formatBytes, statusKeys } from './format';
 import { useTranslation } from 'react-i18next';
+import { errorText } from '../../api/network';
 
 export function SendSession({ taskId, status, onCancel, onClose }: { taskId: string; status: NetworkStatus; onCancel: (id: string) => void; onClose: () => void }) {
   const { t } = useTranslation(['common', 'transfer']);
@@ -30,7 +31,7 @@ export function SendSession({ taskId, status, onCancel, onClose }: { taskId: str
       <div className="task-header"><div className="task-title"><h2>{task.file_name || t('transfer:send.selectedContent')}</h2><p>{t('transfer:send.fileCount', { count: task.file_count })}{task.directory_count ? ` · ${t('transfer:send.directoryCount', { count: task.directory_count })}` : ''}</p></div><span className="badge">{t(`transfer:${statusKeys[task.status]}`)}</span></div>
       <progress max={100} value={Number(percent.toFixed(2))} />
       <div className="task-meta"><span>{formatBytes(task.completed_bytes)} / {total ? formatBytes(total) : '--'} · {percent.toFixed(2)}%</span><span>{task.transport?.toUpperCase() ?? t('transfer:send.waitConnection')}</span></div>
-      {task.error && <div className="notice error">{task.error}</div>}
+      {task.error && <div className="notice error">{errorText(task.error)}</div>}
       <div className="send-session-actions">{awaitingDecision ? <button onClick={cancel}><Icon name="close" size={16} />{t('common:actions.cancel')}</button> : <button onClick={onClose}><Icon name="close" size={16} />{t('common:actions.close')}</button>}</div>
     </div>
   </section>;

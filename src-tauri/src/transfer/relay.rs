@@ -57,10 +57,22 @@ const TICK: Duration = crate::tuning::WRITE_TICK;
 /// 转写进度（已 sync 到目标盘）保存失败时的兜底设置键前缀提示，见 `pending_cleanup`。
 const PENDING_CLEANUP_KEY: &str = "pending_cleanup";
 
-/// 解析缓存盘中转目录：
-/// 用户设置 `cache_directory` → `D:\ProgramData\NodeSend\Cache` → `C:\ProgramData\NodeSend\Cache`。
-/// 返回第一个「可创建」的目录；全部不可用时返回 `None`（此时所有任务自动直写）。
+/// 解析固定缓存目录。Windows 将注册表中的 ProgramData 子路径映射到安装盘；其他桌面平台使用应用数据目录。
+/// 路径不可用时返回 `None`，接收任务直接写入目标目录。
 pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Ok(Some(configured)) = app.get_setting("cache_directory") {
+        let configured = configured.trim();
+        if configured.is_empty() {
+            return None;
+        }
+        let candidate = PathBuf::from(configured);
+        return std::fs::create_dir_all(&candidate)
+            .ok()
+            .filter(|_| cache_writable(&candidate))
+            .map(|_| candidate);
+    }
+    let _ = &app;
     #[cfg(target_os = "android")]
     {
         let _ = app;
@@ -68,38 +80,136 @@ pub(crate) fn resolve_cache_root(app: &AppService) -> Option<PathBuf> {
     }
     #[cfg(not(target_os = "android"))]
     {
-        let mut candidates = Vec::new();
-        if let Ok(Some(dir)) = app.get_setting("cache_directory") {
-            if dir.trim().is_empty() {
-                return None;
-            }
-            candidates.push(PathBuf::from(dir));
-        }
         #[cfg(windows)]
         {
-            candidates.push(PathBuf::from(r"D:\ProgramData\NodeSend\Cache"));
-            candidates.push(PathBuf::from(r"C:\ProgramData\NodeSend\Cache"));
+            let install_dir = registered_install_dir()
+                .or_else(|| std::env::current_exe().ok()?.parent().map(Path::to_path_buf))?;
+            let drive = install_dir.components().find_map(|component| match component {
+                std::path::Component::Prefix(prefix) => match prefix.kind() {
+                    std::path::Prefix::Disk(drive) => Some(drive as char),
+                    _ => None,
+                },
+                _ => None,
+            })?;
+            let common_data = registered_common_data_dir()
+                .unwrap_or_else(|| PathBuf::from("ProgramData"));
+            let suffix = common_data
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(part) => Some(part),
+                    _ => None,
+                })
+                .collect::<PathBuf>();
+            let suffix = if suffix.as_os_str().is_empty() {
+                PathBuf::from("ProgramData")
+            } else {
+                suffix
+            };
+            let candidate = PathBuf::from(format!("{drive}:\\"))
+                .join(suffix)
+                .join("NodeSend")
+                .join("Cache");
+            if is_filesystem_root(&candidate) {
+                return None;
+            }
+            return match std::fs::create_dir_all(&candidate) {
+                Ok(()) if cache_writable(&candidate) => Some(candidate),
+                Ok(()) => {
+                    tracing::warn!(dir = %candidate.display(), "Cache directory is not writable");
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(dir = %candidate.display(), "Cache directory is unavailable: {error}");
+                    None
+                }
+            };
         }
         #[cfg(not(windows))]
         {
-            // 非 Windows 平台没有 D:/C: ProgramData 约定，保留平台数据目录。
-            candidates.push(app.paths.data_dir.join("Cache"));
-        }
-        for candidate in candidates {
-            if is_filesystem_root(&candidate) {
-                tracing::error!(dir = %candidate.display(), "Refusing to use a drive root as the NodeSend cache directory");
-                continue;
-            }
-            match std::fs::create_dir_all(&candidate) {
-                Ok(()) if cache_writable(&candidate) => return Some(candidate),
-                Ok(()) => {
-                    tracing::warn!(dir = %candidate.display(), "Cache directory is not writable")
+            let candidate = app.paths.data_dir.join("Cache");
+            return match std::fs::create_dir_all(&candidate) {
+                Ok(()) if cache_writable(&candidate) => Some(candidate),
+                Ok(()) => None,
+                Err(error) => {
+                    tracing::warn!(dir = %candidate.display(), "Cache directory is unavailable: {error}");
+                    None
                 }
-                Err(err) => tracing::warn!(dir = %candidate.display(), "Cache directory is unavailable: {err}"),
-            }
+            };
         }
-        None
     }
+}
+
+#[cfg(windows)]
+fn registered_install_dir() -> Option<PathBuf> {
+    let value = read_machine_registry_string(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend",
+        "InstallLocation",
+    )
+    .or_else(|| {
+        read_user_registry_string(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend",
+            "InstallLocation",
+        )
+    })?;
+    let path = PathBuf::from(value.trim().trim_matches('"'));
+    (path.is_absolute() && path.join("nodesend.exe").is_file()).then_some(path)
+}
+
+#[cfg(windows)]
+fn registered_common_data_dir() -> Option<PathBuf> {
+    let value = read_machine_registry_string(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        "Common AppData",
+    )?;
+    let path = PathBuf::from(value.trim().trim_matches('"'));
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(windows)]
+fn read_machine_registry_string(key: &str, name: &str) -> Option<String> {
+    read_registry_string(windows::Win32::System::Registry::HKEY_LOCAL_MACHINE, key, name)
+}
+
+#[cfg(windows)]
+fn read_user_registry_string(key: &str, name: &str) -> Option<String> {
+    read_registry_string(windows::Win32::System::Registry::HKEY_CURRENT_USER, key, name)
+}
+
+#[cfg(windows)]
+fn read_registry_string(
+    root: windows::Win32::System::Registry::HKEY,
+    key: &str,
+    name: &str,
+) -> Option<String> {
+    use windows::{
+        core::PCWSTR,
+        Win32::System::Registry::{RegGetValueW, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ},
+    };
+
+    let key = key.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let name = name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let mut buffer = vec![0u16; 32_768];
+    let mut bytes = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+    let result = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if result.0 != 0 {
+        return None;
+    }
+    let length = (bytes as usize / std::mem::size_of::<u16>()).min(buffer.len());
+    buffer.truncate(length);
+    while buffer.last() == Some(&0) {
+        buffer.pop();
+    }
+    String::from_utf16(&buffer).ok().filter(|value| !value.trim().is_empty())
 }
 
 /// 缓存目录存在不等于可写（ProgramData 常见为管理员独占）。真正建一个探针文件，
@@ -118,38 +228,6 @@ fn cache_writable(dir: &std::path::Path) -> bool {
             true
         }
         Err(_) => false,
-    }
-}
-
-/// 仅解析设置页要展示的缓存目录，不创建任何目录。
-/// 用户未指定时给出平台默认候选（Windows 优先 D 盘，不存在则 C 盘）。
-pub(crate) fn configured_cache_root(app: &AppService) -> Option<PathBuf> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = app;
-        return None;
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        if let Ok(Some(dir)) = app.get_setting("cache_directory") {
-            let dir = dir.trim();
-            if dir.is_empty() {
-                return None;
-            }
-            return Some(PathBuf::from(dir));
-        }
-        #[cfg(windows)]
-        {
-            let d = PathBuf::from(r"D:\ProgramData\NodeSend\Cache");
-            if Path::new("D:\\").exists() {
-                return Some(d);
-            }
-            return Some(PathBuf::from(r"C:\ProgramData\NodeSend\Cache"));
-        }
-        #[cfg(not(windows))]
-        {
-            Some(app.paths.data_dir.join("Cache"))
-        }
     }
 }
 
@@ -265,8 +343,11 @@ async fn relay_task(service: &Arc<TransferService>, id: &str) -> AppResult<()> {
         }
         // 接收端可能在传输过程中继续追加清单。不能只使用启动时的快照：
         // 否则转写器会永远看不到后续文件，缓存不断增长，暂停/继续重启转写后才可能推进。
-        // 只有条目数量发生变化时才重新加载清单，避免每轮复制几十万条记录。
-        if plan.entries.len() < state.file_count || plan.digest != state.digest {
+        // 仅在清单或缓存选择变化时重载，避免每轮复制几十万条记录。
+        if plan.entries.len() < state.file_count
+            || plan.digest != state.digest
+            || plan.cache_plan_revision != state.cache_plan_revision
+        {
             plan = service.relay_plan(id)?;
         }
         if relay_done(&state) {
@@ -339,17 +420,20 @@ async fn relay_file_step(
     if done >= size {
         return Ok(None);
     }
-    if size > crate::tuning::CACHE_ASSEMBLE_BYTES {
-        return Err(AppError::Conflict(
-            "File exceeds the cache assembly size limit".into(),
-        ));
-    }
     let base = plan.bases[file];
     let count = size.div_ceil(plan.chunk_size) as usize;
     if !(base..base + count).all(|index| service.is_completed(id, index)) {
         return Ok(None);
     }
-    let _writer = service.destination_writer.lock().await;
+    let initial_state = service.journal_state(id, file)?;
+    if !matches!(
+        initial_state.as_deref(),
+        Some("assembled" | "publishing" | "published")
+    ) {
+        if service.admit_cached_file(id, file).await? {
+            return Ok(None);
+        }
+    }
     let task = service.record(id)?;
     if task.manifest.entries.get(file) != plan.entries.get(file) {
         return Ok(None);
@@ -366,7 +450,11 @@ async fn relay_file_step(
     );
     paths::ensure_under(root, target)?;
     let assembled = paths::cache_file(cache_root, &task, file);
-    std::fs::create_dir_all(assembled.parent().unwrap())?;
+    if let Err(error) = std::fs::create_dir_all(assembled.parent().unwrap()) {
+        tracing::warn!(task = %id, file, error = %error, "Cache directory could not be prepared; retrying this file as a direct transfer");
+        service.fallback_cached_file_to_direct(id, file).await?;
+        return Ok(None);
+    }
     let state = service.journal_state(id, file)?;
     if state.as_deref() == Some("published") {
         if !std::fs::metadata(target).is_ok_and(|m| m.is_file() && m.len() == size) {
@@ -381,10 +469,14 @@ async fn relay_file_step(
         return Ok(Some(size));
     }
     if !matches!(state.as_deref(), Some("assembled" | "publishing")) {
-        if !service.reserve_cached_file(id, file, size, crate::tuning::CACHE_RECEIVE_BYTES)? {
-            return Ok(None);
-        }
-        let mut output = tokio::fs::File::create(&assembled).await?;
+        let mut output = match tokio::fs::File::create(&assembled).await {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(task = %id, file, error = %error, "Cache assembly could not be created; retrying this file as a direct transfer");
+                service.fallback_cached_file_to_direct(id, file).await?;
+                return Ok(None);
+            }
+        };
         use sha2::{Digest, Sha256};
         let mut assembled_hash = task.verify_hash.then(Sha256::new);
         let mut offset = 0;
@@ -397,31 +489,58 @@ async fn relay_file_step(
                 .min(size - offset)
                 .min(SEG_BYTES - offset % SEG_BYTES) as usize;
             let segment = paths::cache_segment(cache_root, &task, file, offset / SEG_BYTES);
-            let data = read_segment(&segment, offset % SEG_BYTES, len).await?;
+            let data = match read_segment(&segment, offset % SEG_BYTES, len).await {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::warn!(task = %id, file, error = %error, "Cached segment could not be read; retrying this file as a direct transfer");
+                    drop(output);
+                    service.fallback_cached_file_to_direct(id, file).await?;
+                    return Ok(None);
+                }
+            };
             if task.verify_hash {
                 use rusqlite::OptionalExtension;
                 use sha2::{Digest, Sha256};
                 let index = base + (offset / plan.chunk_size) as usize;
                 let expected: Option<String> = service.app.db.with_conn(|db| Ok(db.query_row("SELECT digest FROM transfer_chunk_hash WHERE task_id=?1 AND chunk_index=?2",rusqlite::params![id,index as i64],|r| r.get(0)).optional()?))?;
                 if expected.as_deref() != Some(format!("{:x}", Sha256::digest(&data)).as_str()) {
-                    return Err(AppError::Conflict(
-                        "Cached chunk SHA-256 verification failed".into(),
-                    ));
+                    tracing::warn!(task = %id, file, "Cached chunk verification failed; retrying this file as a direct transfer");
+                    drop(output);
+                    service.fallback_cached_file_to_direct(id, file).await?;
+                    return Ok(None);
                 }
             }
             if let Some(hash) = &mut assembled_hash {
                 hash.update(&data);
             }
-            output.write_all(&data).await?;
+            if !service.wait_for_cache_space(id, len as u64).await? {
+                if processing(&service.status_of(id)?) {
+                    service.fallback_cached_file_to_direct(id, file).await?;
+                }
+                return Ok(None);
+            }
+            if let Err(error) = output.write_all(&data).await {
+                tracing::warn!(task = %id, file, error = %error, "Cache assembly write failed; retrying this file as a direct transfer");
+                drop(output);
+                service.fallback_cached_file_to_direct(id, file).await?;
+                return Ok(None);
+            }
             service
                 .runtime(id)
                 .relay_progress
                 .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
             offset += len as u64;
         }
-        output.sync_all().await?;
+        if let Err(error) = output.sync_all().await {
+            tracing::warn!(task = %id, file, error = %error, "Cache assembly could not be synchronized; retrying this file as a direct transfer");
+            drop(output);
+            service.fallback_cached_file_to_direct(id, file).await?;
+            return Ok(None);
+        }
         if output.metadata().await?.len() != size {
-            return Err(AppError::Conflict("Assembled cache file size does not match the manifest".into()));
+            return Err(AppError::Conflict(
+                "Assembled cache file size does not match the manifest".into(),
+            ));
         }
         drop(output);
         if let Some(hash) = assembled_hash {
@@ -478,6 +597,7 @@ async fn relay_file_step(
         tokio::fs::create_dir_all(parent).await?;
     }
     paths::ensure_plain(target)?;
+    let _writer = service.destination_writer.lock().await;
     let target_preexisted = tokio::fs::try_exists(target).await?;
     let mut input = tokio::fs::File::open(&assembled).await?;
     let mut output = tokio::fs::File::create(target).await?;
@@ -700,7 +820,7 @@ mod safety_tests {
     use crate::{config::AppPaths, transfer::model::random_id};
 
     #[tokio::test]
-    async fn relay_publishes_durable_bytes_and_rejects_missing_cache() {
+    async fn relay_publishes_durable_bytes_and_ignores_cancelled_task() {
         let root = std::env::temp_dir().join(format!("relay-{}", random_id()));
         std::fs::create_dir_all(&root).unwrap();
         let app = AppService::init(AppPaths::new(root.join("data"))).unwrap();
@@ -747,13 +867,6 @@ mod safety_tests {
         let segment = paths::cache_segment(&cache, &task, 0, 0);
         std::fs::create_dir_all(segment.parent().unwrap()).unwrap();
         let plan = service.relay_plan(&id).unwrap();
-        assert!(
-            relay_file_step(&service, &plan, &cache, &id, 0, bytes.len() as u64, 0)
-                .await
-                .is_err()
-        );
-        assert!(!target.exists());
-        assert_eq!(service.relayed_at(&id, 0), 0);
         std::fs::write(&segment, &bytes).unwrap();
         let assembled = paths::cache_file(&cache, &task, 0);
         std::fs::write(&assembled, &bytes).unwrap();

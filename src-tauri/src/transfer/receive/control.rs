@@ -16,7 +16,15 @@ impl TransferService {
         match request {
             Request::PrepareFile { id, file } => {
                 let id = incoming_id(peer, &id);
-                self.admit_cached_file(&id, file).await?;
+                if self.admit_cached_file(&id, file).await? {
+                    return Ok(Response::Repair { files: vec![file] });
+                }
+                if self
+                    .runtime_if_exists(&id)
+                    .is_some_and(|runtime| crate::locks::lock(&runtime.cache_fallback_pending).contains(&file))
+                {
+                    return Ok(Response::Repair { files: vec![file] });
+                }
                 let status = self.status_of(&id)?;
                 if !["accepted", "transferring"].contains(&status.as_str()) {
                     return self.remote_state(&id);

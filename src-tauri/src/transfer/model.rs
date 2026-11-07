@@ -371,7 +371,9 @@ impl Manifest {
             super::paths::validate_relative(&e.path)?;
             let normalized = e.path.to_lowercase();
             if !names.insert(normalized.clone()) || (e.directory && e.size != 0) {
-                return Err(AppError::BadRequest("Duplicate path or invalid directory size".into()));
+                return Err(AppError::BadRequest(
+                    "Duplicate path or invalid directory size".into(),
+                ));
             }
             if e.directory {
                 directories.insert(normalized);
@@ -381,11 +383,17 @@ impl Manifest {
                 .ok_or_else(|| AppError::BadRequest("File size overflow".into()))?;
         }
         // 条目数不设上限；只保留总量溢出检查（防止清单被构造成不可能的巨量总量）。
-        debug_assert_eq!(total, self.total(), "Manifest totals do not match the entry summary");
+        debug_assert_eq!(
+            total,
+            self.total(),
+            "Manifest totals do not match the entry summary"
+        );
         for e in &self.entries {
             if let Some((parent, _)) = e.path.rsplit_once('/') {
                 if !directories.contains(&parent.to_lowercase()) {
-                    return Err(AppError::BadRequest("Manifest is missing a parent directory or has a path type conflict".into()));
+                    return Err(AppError::BadRequest(
+                        "Manifest is missing a parent directory or has a path type conflict".into(),
+                    ));
                 }
             }
         }
@@ -546,6 +554,9 @@ pub struct TaskRecord {
     /// 接受任务时选择使用 SSD 缓存的文件索引；未包含的文件直接写目标盘。
     #[serde(default)]
     pub cache_files: BTreeSet<usize>,
+    /// 缓存文件集合变化时递增，使运行中的转写任务重载缓存计划。
+    #[serde(default)]
+    pub cache_plan_revision: u64,
     #[serde(default)]
     pub resume_requested: bool,
     #[serde(default)]

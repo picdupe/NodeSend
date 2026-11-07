@@ -184,6 +184,16 @@
       "sourceMissing": "The source file is missing. You can finish with the received files or cancel",
       "sourceUnavailable": "The source file is temporarily unavailable. Resume to try again",
       "peerStatus": "Synchronized peer task status: {{status}}",
+      "unknownPeerStatus": "unknown status",
+      "untranslated": "This task contains an event that cannot be displayed.",
+      "peerStatusValues": {
+        "resumed": "resumed",
+        "paused": "paused",
+        "finish": "finished receiving",
+        "offline": "peer offline",
+        "cancelled": "cancelled",
+        "rejected": "rejected"
+      },
       "partialCompleted": "Available files were kept. The task is partially complete; unreceived files are listed as abandoned",
       "waitingForReceiver": "Waiting for the receiver to continue",
       "writeFailed": "Write failed: {{error}}"

@@ -42,6 +42,7 @@ struct ScanStream {
     db_buffer: Vec<super::model::FileEntry>,
     /// `db_buffer` 首条在清单中的下标。
     db_buffer_start: usize,
+    cache_restart: Option<Vec<usize>>,
 }
 impl TransferService {
     async fn prepare_remote_file(
@@ -49,10 +50,12 @@ impl TransferService {
         channel: &mut Channel,
         task: &TaskRecord,
         file: usize,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<Vec<usize>>> {
         loop {
             if !self.wait_remote_resume(&task.id).await? {
-                return Err(AppError::Conflict("Remote task ended before the file could be prepared".into()));
+                return Err(AppError::Conflict(
+                    "Remote task ended before the file could be prepared".into(),
+                ));
             }
             match channel
                 .request(&Request::PrepareFile {
@@ -61,7 +64,8 @@ impl TransferService {
                 })
                 .await?
             {
-                Response::Ack => return Ok(()),
+                Response::Ack => return Ok(None),
+                Response::Repair { files } => return Ok(Some(files)),
                 Response::State {
                     status, revision, ..
                 } if ["paused", "remote_paused"].contains(&status.as_str()) => {
@@ -70,7 +74,11 @@ impl TransferService {
                             .await?;
                     }
                 }
-                _ => return Err(AppError::Conflict("Unexpected response while preparing the remote file".into())),
+                _ => {
+                    return Err(AppError::Conflict(
+                        "Unexpected response while preparing the remote file".into(),
+                    ))
+                }
             }
         }
     }
@@ -214,7 +222,11 @@ impl TransferService {
                         self.edit(&task.id, |t| t.status = status)?;
                         return Ok(first);
                     }
-                    _ => return Err(AppError::Other("Receiver did not confirm the manifest chunk".into())),
+                    _ => {
+                        return Err(AppError::Other(
+                            "Receiver did not confirm the manifest chunk".into(),
+                        ))
+                    }
                 }
             }
             for (page_offset, entry) in page.iter().enumerate() {
@@ -267,14 +279,19 @@ impl TransferService {
             }
             if state.send_data {
                 self.flush_scan_buffer(task, state, first)?;
-                self.send_streaming_ready_files(
-                    control,
-                    task,
-                    &state.entries,
-                    &mut state.pending_files,
-                    &mut state.sent_chunks,
-                )
-                .await?;
+                if let Some(files) = self
+                    .send_streaming_ready_files(
+                        control,
+                        task,
+                        &state.entries,
+                        &mut state.pending_files,
+                        &mut state.sent_chunks,
+                    )
+                    .await?
+                {
+                    state.cache_restart = Some(files);
+                    return Ok(first);
+                }
             }
         }
         // 收尾：把不足一个落库批次的剩余条目写库，游标推进到扫描终点。
@@ -308,15 +325,30 @@ impl TransferService {
                     .map_err(|e| AppError::Other(e.to_string()))?;
                 let cooldown = Arc::new(AtomicI64::new(0));
                 let mut attempt = 0u32;
+                let mut state_session = None;
                 loop {
                     if service.stopped(&id)? {
+                        if ["paused", "remote_paused"].contains(&service.status_of(&id)?.as_str()) {
+                            if !service.wait_remote_resume(&id).await? {
+                                return Ok::<(), AppError>(());
+                            }
+                            continue;
+                        }
                         return Ok(());
                     }
                     match service
-                        .send_once(peers.clone(), &id, cooldown.clone())
+                        .send_once(peers.clone(), &id, cooldown.clone(), &mut state_session)
                         .await
                     {
                         Ok(()) if service.status_of(&id)? == "queued" => continue,
+                        Ok(())
+                            if ["paused", "remote_paused"]
+                                .contains(&service.status_of(&id)?.as_str()) =>
+                        {
+                            if !service.wait_remote_resume(&id).await? {
+                                return Ok(());
+                            }
+                        }
                         Ok(()) => return Ok(()),
                         Err(err) => {
                             if matches!(err, AppError::Conflict(_))
@@ -329,12 +361,37 @@ impl TransferService {
                                 service.edit(&id, |t| t.status = "queued".into())?;
                                 continue;
                             }
+                            if ["paused", "remote_paused"]
+                                .contains(&service.status_of(&id)?.as_str())
+                            {
+                                if !service.wait_remote_resume(&id).await? {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
                             if service.stopped(&id)? {
                                 return Ok(());
                             }
                             let retry = matches!(err, AppError::Io(_) | AppError::Other(_));
                             if !retry {
-                                return Err(err);
+                                service.edit(&id, |task| {
+                                    if ![
+                                        "cancelled",
+                                        "completed",
+                                        "partial_completed",
+                                        "rejected",
+                                        "incompatible",
+                                    ]
+                                    .contains(&task.status.as_str())
+                                    {
+                                        task.status = "paused".into();
+                                        task.error = Some(err.to_string());
+                                    }
+                                })?;
+                                if !service.wait_remote_resume(&id).await? {
+                                    return Ok(());
+                                }
+                                continue;
                             }
                             cooldown.store(i64::MAX, Ordering::Relaxed);
                             attempt = attempt.saturating_add(1);
@@ -359,7 +416,16 @@ impl TransferService {
             let result = tokio::select! {r=run=>r,_=service.shutdown.cancelled()=>Ok(())};
             if let Err(err) = result {
                 let _ = service.edit(&id, |t| {
-                    if !["cancelled", "paused"].contains(&t.status.as_str()) {
+                    if ![
+                        "cancelled",
+                        "paused",
+                        "completed",
+                        "partial_completed",
+                        "rejected",
+                        "incompatible",
+                    ]
+                    .contains(&t.status.as_str())
+                    {
                         t.status = "paused".into();
                         t.error = Some(err.to_string());
                         t.event("The device is temporarily offline. The task is paused; resume when it is online");
@@ -404,6 +470,42 @@ impl TransferService {
             "finishing",
         ]
         .contains(&self.status_of(id)?.as_str()))
+    }
+    fn queue_for_file_repair(&self, id: &str, files: &[usize]) -> AppResult<()> {
+        let task = self.record(id)?;
+        let mut ranges = Vec::with_capacity(files.len());
+        for file in files {
+            let entry = task.manifest.entries.get(*file).ok_or_else(|| {
+                AppError::BadRequest("Receiver requested an invalid file index".into())
+            })?;
+            let start = task.manifest.file_base(*file);
+            ranges.push((
+                start,
+                start.saturating_add(entry.size.div_ceil(task.chunk_size) as usize),
+            ));
+        }
+        self.edit(id, |task| {
+            task.completed.retain(|index| {
+                !ranges
+                    .iter()
+                    .any(|(start, end)| index >= start && index < end)
+            });
+            task.completed_count = task.completed.len();
+            task.completed_bytes = task
+                .completed
+                .iter()
+                .filter_map(|index| task.manifest.chunk(*index))
+                .map(|chunk| chunk.length as u64)
+                .sum();
+            task.status = "queued".into();
+            task.error = None;
+            task.event(format!(
+                "Receiver requested retransmission of {} files",
+                ranges.len()
+            ));
+        })?;
+        self.save_decision(id)?;
+        Ok(())
     }
     async fn channel(
         &self,
@@ -467,8 +569,9 @@ impl TransferService {
                         };
                         if let Err(tcp_error) = transport::hello(&mut tcp_channel, &self.app).await
                         {
-                            last =
-                                format!("QUIC read failed: {quic_error}; TCP HELLO failed: {tcp_error}");
+                            last = format!(
+                                "QUIC read failed: {quic_error}; TCP HELLO failed: {tcp_error}"
+                            );
                             peers.failure(&task.peer_id, endpoint, last.clone());
                             continue;
                         }
@@ -547,6 +650,7 @@ impl TransferService {
             digest: ManifestDigest::new(),
             db_buffer: Vec::new(),
             db_buffer_start: cursor,
+            cache_restart: None,
         };
         let _ = self
             .stream_scan(control, &task, &mut stream, scanner, cursor)
@@ -589,7 +693,7 @@ impl TransferService {
         entries: &[super::model::FileEntry],
         pending: &mut VecDeque<(usize, usize)>,
         sent: &mut BTreeSet<usize>,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<Vec<usize>>> {
         let state = control
             .request(&Request::Poll {
                 id: task.wire_id.clone(),
@@ -599,7 +703,11 @@ impl TransferService {
             Response::State {
                 status, completed, ..
             } => (status, completed),
-            _ => return Err(AppError::Other("Receiver did not return the manifest scan status".into())),
+            _ => {
+                return Err(AppError::Other(
+                    "Receiver did not return the manifest scan status".into(),
+                ))
+            }
         };
         if ["waiting", "accepted", "transferring"].contains(&status.as_str()) {
             self.edit(&task.id, |record| {
@@ -620,7 +728,7 @@ impl TransferService {
             if ["cancelled", "rejected"].contains(&status.as_str()) {
                 self.edit(&task.id, |record| record.status = status)?;
             }
-            return Ok(());
+            return Ok(None);
         }
         let remote_completed = completed.iter().collect::<BTreeSet<_>>();
         // 每轮只占用有限的几秒发送"已扫描到"的文件数据：清单扫描优先推进，
@@ -643,15 +751,19 @@ impl TransferService {
             if self.stopped(&task.id)? {
                 pending.push_front((file_index, first_chunk));
 
-                return Ok(());
+                return Ok(None);
             }
             let Some(entry) = entries.get(file_index) else {
-                return Err(AppError::Conflict("File indices in the scan are not contiguous".into()));
+                return Err(AppError::Conflict(
+                    "File indices in the scan are not contiguous".into(),
+                ));
             };
             if entry.directory || entry.size == 0 {
                 continue;
             }
-            self.prepare_remote_file(control, task, file_index).await?;
+            if let Some(files) = self.prepare_remote_file(control, task, file_index).await? {
+                return Ok(Some(files));
+            }
             handled += 1;
             let chunk_count = entry.size.div_ceil(task.chunk_size) as usize;
             let mut truncated = false;
@@ -670,7 +782,7 @@ impl TransferService {
                 if self.stopped(&task.id)? {
                     pending.push_front((file_index, first_chunk));
 
-                    return Ok(());
+                    return Ok(None);
                 }
                 let index = first_chunk + local_index;
                 if sent.contains(&index) || remote_completed.contains(&index) {
@@ -706,6 +818,7 @@ impl TransferService {
                         )
                         .await?
                     {
+                        Response::Repair { files } => return Ok(Some(files)),
                         Response::Ack => {
                             self.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
                             sent.insert(index);
@@ -736,7 +849,7 @@ impl TransferService {
                                 .await?;
                             }
                             if !self.wait_remote_resume(&task.id).await? {
-                                return Ok(());
+                                return Ok(None);
                             }
                             continue;
                         }
@@ -744,9 +857,13 @@ impl TransferService {
                             if ["cancelled", "rejected"].contains(&status.as_str()) =>
                         {
                             self.edit(&task.id, |record| record.status = status)?;
-                            return Ok(());
+                            return Ok(None);
                         }
-                        _ => return Err(AppError::Other("Unexpected response while waiting for the receiver".into())),
+                        _ => {
+                            return Err(AppError::Other(
+                                "Unexpected response while waiting for the receiver".into(),
+                            ))
+                        }
                     }
                     break;
                 }
@@ -755,7 +872,7 @@ impl TransferService {
                 break;
             }
         }
-        Ok(())
+        Ok(None)
     }
     async fn wait_remote_resume(&self, id: &str) -> AppResult<bool> {
         let runtime = self.runtime(id);
@@ -763,7 +880,9 @@ impl TransferService {
         loop {
             match self.status_of(id)?.as_str() {
                 "paused" | "remote_paused" | "waiting" | "finishing" => {}
-                "interrupted" => return Err(AppError::Other("Transfer task was interrupted".into())),
+                "interrupted" => {
+                    return Err(AppError::Other("Transfer task was interrupted".into()))
+                }
                 "offline" | "remote_offline" | "cancelled" | "cancelling" | "rejected"
                 | "completed" | "partial_completed" | "incompatible" => return Ok(false),
                 _ => return Ok(true),
@@ -779,6 +898,7 @@ impl TransferService {
         peers: Arc<PeerStore>,
         id: &str,
         cooldown: Arc<AtomicI64>,
+        state_session: &mut Option<crate::network::state::StateSession>,
     ) -> AppResult<()> {
         let mut task = self.edit(id, |t| {
             t.status = "connecting".into();
@@ -804,7 +924,11 @@ impl TransferService {
                 .await?
             {
                 Response::Ack => {}
-                _ => return Err(AppError::Conflict("Receiver did not acknowledge the replacement file manifest".into())),
+                _ => {
+                    return Err(AppError::Conflict(
+                        "Receiver did not acknowledge the replacement file manifest".into(),
+                    ))
+                }
             }
             self.replace_file_entry(id, issue.file, entry)?;
             task = self.record(id)?;
@@ -846,25 +970,33 @@ impl TransferService {
                 .await?;
             self.edit(id, |record| record.resume_requested = false)?;
         }
-        let mut state_channel = self.channel(&peers, &task, &cooldown, true).await?;
-        if !matches!(
-            state_channel
-                .request(&Request::WatchTask {
-                    id: task.wire_id.clone(),
-                    revision: task.remote_state_revision,
-                })
-                .await?,
-            Response::Ack
-        ) {
-            return Err(AppError::Other("Receiver did not acknowledge the task state subscription".into()));
+        if state_session
+            .as_ref()
+            .map_or(true, |session| session.is_finished())
+        {
+            *state_session = None;
+            let mut state_channel = self.channel(&peers, &task, &cooldown, true).await?;
+            if !matches!(
+                state_channel
+                    .request(&Request::WatchTask {
+                        id: task.wire_id.clone(),
+                        revision: task.remote_state_revision,
+                    })
+                    .await?,
+                Response::Ack
+            ) {
+                return Err(AppError::Other(
+                    "Receiver did not acknowledge the task state subscription".into(),
+                ));
+            }
+            *state_session = Some(crate::network::state::spawn(
+                state_channel,
+                self.clone(),
+                peers.clone(),
+                id.to_string(),
+                0,
+            ));
         }
-        let _state_session = crate::network::state::spawn(
-            state_channel,
-            self.clone(),
-            peers.clone(),
-            id.to_string(),
-            0,
-        );
         if let Response::RecoveryFiles { epoch, files } = control
             .request(&Request::RecoveryProbe {
                 id: task.wire_id.clone(),
@@ -874,11 +1006,9 @@ impl TransferService {
         {
             let mut repair = Vec::new();
             for (file, remote_hash) in files {
-                let entry = task
-                    .manifest
-                    .entries
-                    .get(file)
-                    .ok_or_else(|| AppError::BadRequest("Invalid file index in recovery response".into()))?;
+                let entry = task.manifest.entries.get(file).ok_or_else(|| {
+                    AppError::BadRequest("Invalid file index in recovery response".into())
+                })?;
                 let path = source::source_path_from_roots(&task.sources, &entry.path)?;
                 let meta = match std::fs::metadata(&path) {
                     Ok(meta) => meta,
@@ -894,7 +1024,9 @@ impl TransferService {
                             &mut control,
                             &task,
                             file,
-                            AppError::Conflict("Source file changed since the manifest was created".into()),
+                            AppError::Conflict(
+                                "Source file changed since the manifest was created".into(),
+                            ),
                         )
                         .await);
                 }
@@ -915,7 +1047,9 @@ impl TransferService {
                     .await?,
                 Response::Ack
             ) {
-                return Err(AppError::Conflict("Receiver did not acknowledge the recovery response".into()));
+                return Err(AppError::Conflict(
+                    "Receiver did not acknowledge the recovery response".into(),
+                ));
             }
         }
 
@@ -992,18 +1126,27 @@ impl TransferService {
                         self.edit(id, |t| t.status = status)?;
                         return Ok(());
                     }
-                    _ => return Err(AppError::Other("Receiver did not confirm the top-level manifest".into())),
+                    _ => {
+                        return Err(AppError::Other(
+                            "Receiver did not confirm the top-level manifest".into(),
+                        ))
+                    }
                 }
             }
 
-            self.send_streaming_ready_files(
-                &mut control,
-                &task,
-                &entries,
-                &mut pending_files,
-                &mut sent_chunks,
-            )
-            .await?;
+            if let Some(files) = self
+                .send_streaming_ready_files(
+                    &mut control,
+                    &task,
+                    &entries,
+                    &mut pending_files,
+                    &mut sent_chunks,
+                )
+                .await?
+            {
+                self.queue_for_file_repair(id, &files)?;
+                return Ok(());
+            }
             if ["paused", "remote_paused"].contains(&self.status_of(id)?.as_str()) {
                 self.wait_remote_resume(id).await?;
             }
@@ -1042,10 +1185,15 @@ impl TransferService {
                 digest,
                 db_buffer: Vec::new(),
                 db_buffer_start: roots_count,
+                cache_restart: None,
             };
             let first = self
                 .stream_scan(&mut control, &task, &mut stream, scanner, roots_count)
                 .await?;
+            if let Some(files) = stream.cache_restart {
+                self.queue_for_file_repair(id, &files)?;
+                return Ok(());
+            }
             if ["paused", "remote_paused"].contains(&self.status_of(id)?.as_str()) {
                 self.wait_remote_resume(id).await?;
             }
@@ -1240,7 +1388,7 @@ impl TransferService {
                 let mut prepared_file = None;
                 loop {
                     if !service.wait_remote_resume(&task.id).await? {
-                        return Ok::<_, AppError>(());
+                        return Ok::<_, AppError>(None);
                     }
                     let Some((index, chunk)) = queue.lock().await.pop_front() else {
                         break;
@@ -1249,9 +1397,12 @@ impl TransferService {
                         continue;
                     }
                     if prepared_file != Some(chunk.file) {
-                        service
+                        if let Some(files) = service
                             .prepare_remote_file(&mut channel, &task, chunk.file)
-                            .await?;
+                            .await?
+                        {
+                            return Ok(Some(files));
+                        }
                         prepared_file = Some(chunk.file);
                     }
                     let bytes = match service.read_chunk_cached(&task, chunk).await {
@@ -1268,7 +1419,7 @@ impl TransferService {
                         .then(|| format!("{:x}", Sha256::digest(&bytes)));
                     loop {
                         if !service.wait_remote_resume(&task.id).await? {
-                            return Ok(());
+                            return Ok(None);
                         }
                         match channel
                             .chunk(
@@ -1286,6 +1437,7 @@ impl TransferService {
                             )
                             .await?
                         {
+                            Response::Repair { files } => return Ok(Some(files)),
                             Response::Ack => {
                                 service.mark_chunk_done(&task.id, index, bytes.len() as u64)?;
                                 break;
@@ -1304,7 +1456,7 @@ impl TransferService {
                                         .await?;
                                 }
                                 if !service.wait_remote_resume(&task.id).await? {
-                                    return Ok(());
+                                    return Ok(None);
                                 }
                             }
                             Response::State { status, .. } if status == "cancelled" => {
@@ -1315,21 +1467,39 @@ impl TransferService {
                                         t.event("The receiver cancelled the task");
                                     }
                                 })?;
-                                return Ok(());
+                                return Ok(None);
                             }
-                            _ => return Err(AppError::Other("Receiver did not submit the chunk".into())),
+                            _ => {
+                                return Err(AppError::Other(
+                                    "Receiver did not submit the chunk".into(),
+                                ))
+                            }
                         }
                     }
                 }
-                Ok(())
+                Ok(None)
             });
         }
+        let mut repair_requested = None;
         while let Some(result) = workers.join_next().await {
-            if let Err(err) = result.map_err(|e| AppError::Other(e.to_string()))? {
-                workers.abort_all();
-                while workers.join_next().await.is_some() {}
-                return Err(err);
+            match result.map_err(|e| AppError::Other(e.to_string()))? {
+                Ok(Some(files)) => {
+                    repair_requested = Some(files);
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                    break;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                    return Err(err);
+                }
             }
+        }
+        if let Some(files) = repair_requested {
+            self.queue_for_file_repair(id, &files)?;
+            return Ok(());
         }
         loop {
             if !self.wait_remote_resume(id).await? {
@@ -1343,16 +1513,11 @@ impl TransferService {
             {
                 Response::Repair { files } => {
                     if files.is_empty() {
-                        return Err(AppError::Conflict("Receiver requested an empty file repair list".into()));
-                    }
-                    self.edit(id, |t| {
-                        t.status = "queued".into();
-                        t.error = None;
-                        t.event(format!(
-                            "Repairing {} files from the original manifest",
-                            files.len()
+                        return Err(AppError::Conflict(
+                            "Receiver requested an empty file repair list".into(),
                         ));
-                    })?;
+                    }
+                    self.queue_for_file_repair(id, &files)?;
                     return Ok(());
                 }
                 Response::Ack => {
@@ -1393,7 +1558,11 @@ impl TransferService {
                     self.edit(id, |t| t.status = status)?;
                     return Ok(());
                 }
-                _ => return Err(AppError::Other("Receiver has not finished committing the file".into())),
+                _ => {
+                    return Err(AppError::Other(
+                        "Receiver has not finished committing the file".into(),
+                    ))
+                }
             }
         }
     }

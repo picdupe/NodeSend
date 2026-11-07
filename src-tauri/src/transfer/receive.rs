@@ -219,7 +219,9 @@ impl TransferService {
             return Ok(Response::ManifestAck);
         }
         if first != current {
-            return Err(AppError::Conflict("Manifest chunks are out of order".into()));
+            return Err(AppError::Conflict(
+                "Manifest chunks are out of order".into(),
+            ));
         }
         if status != "waiting" {
             let destination = {
@@ -237,125 +239,128 @@ impl TransferService {
             .map_err(|error| AppError::Other(error.to_string()))??;
             if free < additional_size {
                 return Err(AppError::Conflict(
-                    "Insufficient space remains in the receive directory; later data was paused".into(),
+                    "Insufficient space remains in the receive directory; later data was paused"
+                        .into(),
                 ));
             }
         }
         if status != "waiting" {
-            let mut map = crate::locks::lock(&self.tasks);
-            let task = map
-                .get_mut(&id)
-                .ok_or_else(|| AppError::NotFound("Receive task not found".into()))?;
-            let destination = PathBuf::from(
-                task.destination
-                    .as_deref()
-                    .ok_or_else(|| AppError::Conflict("Receive target has not been selected".into()))?,
-            );
-            let roots = task
-                .manifest
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| !entry.path.contains('/'))
-                .map(|(index, entry)| {
-                    (
-                        entry.path.clone(),
-                        task.targets.get(index).cloned().flatten(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            // 稳定缓存名称在条目落库前分配并随行持久化：后续任何阶段
-            // （写入、转写、恢复、取消）都只按文件索引读取这份映射。
-            let node_id = task.peer_id.clone();
-            paths::assign_cache_names(&mut entries, &node_id, &mut task.cache_name_seq);
-            // 顶层目标数量很少：这里保留完整校验（含符号链接/重解析点），
-            // 子条目的逐条校验改用词法检查，避免每帧数千次 canonicalize。
-            for (_, root_target) in &roots {
-                if let Some(path) = root_target {
-                    paths::ensure_under(&destination, Path::new(path))?;
-                }
-            }
-            let mut next_chunk = task.chunk_count;
-            let mut completed_to_save = Vec::new();
-            let mut target_rows = Vec::new();
-            for entry in &entries {
-                let (top, tail) = entry.path.split_once('/').ok_or_else(|| {
-                    AppError::Conflict("Received a non-root entry while scanning; manifest order is invalid".into())
-                })?;
-                let root_target = roots
+            {
+                let mut map = crate::locks::lock(&self.tasks);
+                let task = map
+                    .get_mut(&id)
+                    .ok_or_else(|| AppError::NotFound("Receive task not found".into()))?;
+                let destination = PathBuf::from(task.destination.as_deref().ok_or_else(|| {
+                    AppError::Conflict("Receive target has not been selected".into())
+                })?);
+                let roots = task
+                    .manifest
+                    .entries
                     .iter()
-                    .find(|(name, _)| name == top)
-                    .and_then(|(_, target)| target.clone());
-                let target = root_target.map(|path| {
-                    let mut path = PathBuf::from(path);
-                    path.push(tail);
-                    path
-                });
-                if let Some(path) = target.as_ref() {
-                    // 一帧最多 5000 条，这里不能做 canonicalize 之类的重活：
-                    // 词法校验 + 仅在策略需要时探测文件系统。
-                    paths::ensure_relative_safe(&entry.path)?;
-                    if path.exists() && entry.directory != path.is_dir() {
-                        return Err(AppError::Conflict(format!(
-                            "Path type conflicts with {}",
-                            entry.path
-                        )));
+                    .enumerate()
+                    .filter(|(_, entry)| !entry.path.contains('/'))
+                    .map(|(index, entry)| {
+                        (
+                            entry.path.clone(),
+                            task.targets.get(index).cloned().flatten(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                // 稳定缓存名称在条目落库前分配并随行持久化：后续任何阶段
+                // （写入、转写、恢复、取消）都只按文件索引读取这份映射。
+                let node_id = task.peer_id.clone();
+                paths::assign_cache_names(&mut entries, &node_id, &mut task.cache_name_seq);
+                // 顶层目标数量很少：这里保留完整校验（含符号链接/重解析点），
+                // 子条目的逐条校验改用词法检查，避免每帧数千次 canonicalize。
+                for (_, root_target) in &roots {
+                    if let Some(path) = root_target {
+                        paths::ensure_under(&destination, Path::new(path))?;
                     }
                 }
-                let file_index = task.file_count;
-                if let Some(path) = target.as_ref() {
-                    target_rows.push((file_index, path.to_string_lossy().into_owned()));
-                    task.targets.push(Some(path.to_string_lossy().into_owned()));
-                    if !entry.directory {
-                        #[cfg(target_os = "android")]
-                        if task.android_media_library {
-                            task.receive_directories
-                                .insert(paths::android_media_directory(&entry.path).to_string());
+                let mut next_chunk = task.chunk_count;
+                let mut completed_to_save = Vec::new();
+                let mut target_rows = Vec::new();
+                for entry in &entries {
+                    let (top, tail) = entry.path.split_once('/').ok_or_else(|| {
+                        AppError::Conflict(
+                            "Received a non-root entry while scanning; manifest order is invalid"
+                                .into(),
+                        )
+                    })?;
+                    let root_target = roots
+                        .iter()
+                        .find(|(name, _)| name == top)
+                        .and_then(|(_, target)| target.clone());
+                    let target = root_target.map(|path| {
+                        let mut path = PathBuf::from(path);
+                        path.push(tail);
+                        path
+                    });
+                    if let Some(path) = target.as_ref() {
+                        // 一帧最多 5000 条，这里不能做 canonicalize 之类的重活：
+                        // 词法校验 + 仅在策略需要时探测文件系统。
+                        paths::ensure_relative_safe(&entry.path)?;
+                        if path.exists() && entry.directory != path.is_dir() {
+                            return Err(AppError::Conflict(format!(
+                                "Path type conflicts with {}",
+                                entry.path
+                            )));
                         }
-                        task.relay_target_bytes =
-                            task.relay_target_bytes.saturating_add(entry.size);
                     }
-                } else {
-                    task.targets.push(None);
-                }
-                task.relayed.push(0);
-                let count = if entry.directory {
-                    0
-                } else {
-                    entry.size.div_ceil(task.chunk_size) as usize
-                };
-                if target.is_none() {
-                    for index in next_chunk..next_chunk + count {
-                        if task.completed.insert(index) {
-                            completed_to_save.push(index);
-                            task.completed_bytes =
-                                task.completed_bytes.saturating_add(task.chunk_size.min(
-                                    entry.size.saturating_sub(
+                    let file_index = task.file_count;
+                    if let Some(path) = target.as_ref() {
+                        target_rows.push((file_index, path.to_string_lossy().into_owned()));
+                        task.targets.push(Some(path.to_string_lossy().into_owned()));
+                        if !entry.directory {
+                            #[cfg(target_os = "android")]
+                            if task.android_media_library {
+                                task.receive_directories.insert(
+                                    paths::android_media_directory(&entry.path).to_string(),
+                                );
+                            }
+                            task.relay_target_bytes =
+                                task.relay_target_bytes.saturating_add(entry.size);
+                        }
+                    } else {
+                        task.targets.push(None);
+                    }
+                    task.relayed.push(0);
+                    let count = if entry.directory {
+                        0
+                    } else {
+                        entry.size.div_ceil(task.chunk_size) as usize
+                    };
+                    if target.is_none() {
+                        for index in next_chunk..next_chunk + count {
+                            if task.completed.insert(index) {
+                                completed_to_save.push(index);
+                                task.completed_bytes = task.completed_bytes.saturating_add(
+                                    task.chunk_size.min(entry.size.saturating_sub(
                                         (index - next_chunk) as u64 * task.chunk_size,
-                                    ),
-                                ));
+                                    )),
+                                );
+                            }
                         }
                     }
+                    next_chunk += count;
+                    task.directory_count += usize::from(entry.directory);
+                    task.total_size = task.total_size.saturating_add(entry.size);
+                    task.file_count += 1;
                 }
-                next_chunk += count;
-                task.directory_count += usize::from(entry.directory);
-                task.total_size = task.total_size.saturating_add(entry.size);
-                task.file_count += 1;
-            }
-            let mut all_entries = std::mem::take(&mut task.manifest.entries);
-            all_entries.extend(entries.iter().cloned());
-            task.manifest = Manifest::new(all_entries, task.chunk_size, task.verify_hash);
-            task.chunk_count = next_chunk;
-            task.completed_count = task.completed.len();
-            task.scan_last_seq = task.file_count;
-            task.scan_last_path = entries
-                .last()
-                .map(|entry| entry.path.clone())
-                .unwrap_or_default();
-            task.updated_at = chrono::Utc::now().to_rfc3339();
-            // `with_transaction` 内部持有唯一连接守卫，闭包拿不到连接，
-            // 因此"持连接再取连接"这种非重入死锁在这里写不出来。
-            self.app.db.with_transaction(|tx| {
+                let mut all_entries = std::mem::take(&mut task.manifest.entries);
+                all_entries.extend(entries.iter().cloned());
+                task.manifest = Manifest::new(all_entries, task.chunk_size, task.verify_hash);
+                task.chunk_count = next_chunk;
+                task.completed_count = task.completed.len();
+                task.scan_last_seq = task.file_count;
+                task.scan_last_path = entries
+                    .last()
+                    .map(|entry| entry.path.clone())
+                    .unwrap_or_default();
+                task.updated_at = chrono::Utc::now().to_rfc3339();
+                // `with_transaction` 内部持有唯一连接守卫，闭包拿不到连接，
+                // 因此"持连接再取连接"这种非重入死锁在这里写不出来。
+                self.app.db.with_transaction(|tx| {
                 {
                     let mut stmt = tx.prepare("INSERT OR REPLACE INTO task_entries(task_id,index_no,path,size,modified_ms,directory,name,cache_name) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?;
                     for (offset, entry) in entries.iter().enumerate() {
@@ -385,9 +390,9 @@ impl TransferService {
                 }
                 Ok(())
             })?;
-            self.persist(task)?;
-            drop(map);
-            self.extend_cache_plan(&id, first)?;
+                self.persist(task)?;
+            }
+            self.extend_cache_plan(&id, first).await?;
             log_manifest_chunk(&id, first, entries.len(), started.elapsed(), true);
             return Ok(Response::ManifestAck);
         }
@@ -395,7 +400,7 @@ impl TransferService {
         self.append_entries(&id, first, &entries)?;
         // 接收任务可能在仅收到顶层目录时就被接受。每收到一批新清单，
         // 都要在回执前更新缓存计划，避免该批文件的数据先按直写模式落盘。
-        self.extend_cache_plan(&id, first)?;
+        self.extend_cache_plan(&id, first).await?;
         for entry in &entries {
             total_size = total_size.saturating_add(entry.size);
             directory_count += usize::from(entry.directory);
@@ -453,7 +458,15 @@ impl TransferService {
         let chunk = self
             .chunk_at(id, index)?
             .ok_or_else(|| AppError::BadRequest("Chunk index is out of range".into()))?;
-        self.admit_cached_file(id, chunk.file).await?;
+        if self.admit_cached_file(id, chunk.file).await?
+            || self.runtime_if_exists(id).is_some_and(|runtime| {
+                crate::locks::lock(&runtime.cache_fallback_pending).contains(&chunk.file)
+            })
+        {
+            return Ok(Response::Repair {
+                files: vec![chunk.file],
+            });
+        }
         let gate = self.gate(id);
         let lock = gate.lock().await;
         let status = self.status_of(id)?;
@@ -484,7 +497,9 @@ impl TransferService {
         if self.verify_hash_of(id)?
             && hash.as_deref() != Some(format!("{:x}", Sha256::digest(&data)).as_str())
         {
-            return Err(AppError::Conflict("Chunk SHA-256 verification failed".into()));
+            return Err(AppError::Conflict(
+                "Chunk SHA-256 verification failed".into(),
+            ));
         }
         let runtime = self.runtime(id);
         // 已完成，或已入队但尚未落盘：重复块直接确认，不重复入队。
@@ -754,10 +769,7 @@ impl TransferService {
         Ok(Response::Ack)
     }
 
-    fn cleanup_cache_dirs(&self, task: &super::model::TaskRecord) {
-        if !task.use_cache {
-            return;
-        }
+    pub(super) fn cleanup_cache_dirs(&self, task: &super::model::TaskRecord) {
         let Some(cache_root) = self.cache_root_for_task(&task.id) else {
             return;
         };

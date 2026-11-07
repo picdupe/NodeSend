@@ -121,7 +121,7 @@ export function translateTaskEvent(value: string, t: Translate): string {
   if (dynamic) return t('transfer:tasks.events.writeFailed', { error: errorText(dynamic[1]) });
 
   dynamic = message.match(/^(.+), skipped: (.*)$/i);
-  if (dynamic) return t('transfer:tasks.events.skippedPath', { reason: dynamic[1], path: dynamic[2] });
+  if (dynamic) return t('transfer:tasks.events.skippedPath', { reason: errorText(dynamic[1]), path: dynamic[2] });
 
   if (/^Manifest scan incomplete; continuing with remaining entries$/i.test(message)) {
     return t('transfer:tasks.events.continueScan');
@@ -134,9 +134,17 @@ export function translateTaskEvent(value: string, t: Translate): string {
   if (dynamic) return t('transfer:tasks.events.transport', { transport: dynamic[1], route: dynamic[2] });
 
   dynamic = message.match(/^Synchronized peer task status: (.*)$/i);
-  if (dynamic) return t('transfer:tasks.events.peerStatus', { status: dynamic[1] });
+  if (dynamic) {
+    const statusKeys: Record<string, string> = {
+      resumed: 'resumed', paused: 'paused', finish: 'finish', offline: 'offline',
+      cancelled: 'cancelled', rejected: 'rejected',
+    };
+    const statusKey = statusKeys[dynamic[1].toLowerCase()];
+    const status = statusKey ? t(`transfer:tasks.peerStatusValues.${statusKey}`) : t('transfer:tasks.events.unknownPeerStatus');
+    return t('transfer:tasks.events.peerStatus', { status });
+  }
 
-  return message;
+  return t('transfer:tasks.events.untranslated');
 }
 
 export function formatTaskEvent(value: string, language: string, t: Translate, fallback?: string): string {

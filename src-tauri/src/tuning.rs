@@ -90,11 +90,11 @@ pub(crate) const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const WRITE_GAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 后台写入/转写巡检间隔。
 pub(crate) const WRITE_TICK: Duration = Duration::from_millis(200);
-/// 缓存盘满时轮询可用空间的间隔。
-pub(crate) const CACHE_SPACE_POLL: Duration = Duration::from_millis(200);
+/// 缓存目录所在磁盘的绝对容量上限；实际预算还会受当前可用空间约束。
 pub(crate) const CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-pub(crate) const CACHE_RECEIVE_BYTES: u64 = CACHE_MAX_BYTES / 2;
-pub(crate) const CACHE_ASSEMBLE_BYTES: u64 = CACHE_MAX_BYTES / 2;
+/// 缓存盘动态保留空间的下限与上限。
+pub(crate) const CACHE_MIN_FREE_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const CACHE_MIN_FREE_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 /// 等待本任务已入队块落盘的上限。
 pub(crate) const AWAIT_WRITES_TIMEOUT: Duration = Duration::from_secs(30);
 /// 转写长时间无进展即判定失败（避免 commit 永久等待）。

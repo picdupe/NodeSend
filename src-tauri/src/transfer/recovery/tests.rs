@@ -226,6 +226,48 @@ async fn admission_reserves_whole_files_across_tasks_and_survives_restart() {
 }
 
 #[tokio::test]
+async fn cache_admission_switches_an_unstarted_oversized_file_to_direct_write() {
+    let f = Fixture::new().await;
+    let task = f.service.record(&f.id).unwrap();
+    let mut entries = task.manifest.entries.clone();
+    entries[0].size = 64 * 1024 * 1024 * 1024;
+    let manifest = Manifest::new(entries, task.chunk_size, false);
+    f.service
+        .edit(&f.id, |record| {
+            record.attach_manifest(manifest);
+            record.scan_complete = true;
+        })
+        .unwrap();
+    f.receive();
+    f.service
+        .edit(&f.id, |record| record.status = "accepted".into())
+        .unwrap();
+
+    f.service.admit_cached_file(&f.id, 0).await.unwrap();
+
+    let task = f.service.record(&f.id).unwrap();
+    assert!(!task.cache_files.contains(&0));
+    assert!(task.cache_files.contains(&1));
+    assert!(task.use_cache);
+    assert_eq!(
+        f.service.journal_state(&f.id, 0).unwrap().as_deref(),
+        Some("direct")
+    );
+}
+
+#[tokio::test]
+async fn cache_writes_remain_available_while_transfer_is_paused_or_offline() {
+    let f = Fixture::new().await;
+    f.receive();
+
+    assert!(f.service.wait_for_cache_space(&f.id, 1).await.unwrap());
+    f.service
+        .edit(&f.id, |record| record.status = "offline".into())
+        .unwrap();
+    assert!(f.service.wait_for_cache_space(&f.id, 1).await.unwrap());
+}
+
+#[tokio::test]
 async fn interrupted_cache_drains_and_missing_source_can_finish_without_discarding_output() {
     let f = Fixture::new().await;
     f.receive();
@@ -669,14 +711,26 @@ async fn actual_sender_source_issue(missing: bool, finish_at_sender: bool) {
             {
                 break;
             }
-            if task.status == "paused" && !sender.transfers.is_active(&id) {
-                panic!("resume failed: {:?}", task.error);
-            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        let sender_task = sender.transfers.record(&id).unwrap();
+        let receiver_task = receiver.transfers.record(&incoming).unwrap();
+        panic!(
+            "Timed out waiting for partial completion: sender_status={} sender_error={:?} sender_remote_revision={} receiver_status={} receiver_revision={} sender_state_sessions={} sender_state_sent_revision={} receiver_state_sessions={} receiver_state_sent_revision={}",
+            sender_task.status,
+            sender_task.error,
+            sender_task.remote_state_revision,
+            receiver_task.status,
+            receiver_task.state_revision,
+            sender.transfers.runtime(&id).state_sessions.load(std::sync::atomic::Ordering::SeqCst),
+            sender.transfers.runtime(&id).state_sent_revision.load(std::sync::atomic::Ordering::SeqCst),
+            receiver.transfers.runtime(&incoming).state_sessions.load(std::sync::atomic::Ordering::SeqCst),
+            receiver.transfers.runtime(&incoming).state_sent_revision.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    });
     assert_eq!(sender.transfers.record(&id).unwrap().wire_id, wire);
     if missing {
         assert_eq!(
@@ -767,7 +821,46 @@ async fn optional_cache_hash_rejects_same_size_segment_corruption() {
         &f.service, &plan, &cache, &f.id, 0, 33, 0
     )
     .await
-    .is_err());
+    .unwrap()
+    .is_none());
+    let task = f.service.record(&f.id).unwrap();
+    assert!(!task.cache_files.contains(&0));
+    assert!(task.repair_files.contains(&0));
+    assert_eq!(
+        f.service.journal_state(&f.id, 0).unwrap().as_deref(),
+        Some("direct")
+    );
+    assert!(!f.root.join("inbox/a").exists());
+    let task_cache_dirs = paths::cache_task_dirs(&cache, &task);
+    assert!(task_cache_dirs.iter().any(|dir| dir.exists()));
+    f.service.cleanup_cache_dirs(&task);
+    assert!(task_cache_dirs.iter().all(|dir| !dir.exists()));
+}
+
+#[tokio::test]
+async fn missing_cached_segment_requests_direct_file_retransmission() {
+    let f = Fixture::new().await;
+    f.receive();
+    f.cache_file(0);
+    let task = f.service.record(&f.id).unwrap();
+    let cache = f.root.join("cache");
+    std::fs::remove_file(paths::cache_segment(&cache, &task, 0, 0)).unwrap();
+    let plan = f.service.relay_plan(&f.id).unwrap();
+
+    assert!(super::super::relay::relay_file_step_shared(
+        &f.service, &plan, &cache, &f.id, 0, 33, 0
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    let task = f.service.record(&f.id).unwrap();
+    assert!(!task.cache_files.contains(&0));
+    assert!(task.repair_files.contains(&0));
+    assert_eq!(
+        f.service.journal_state(&f.id, 0).unwrap().as_deref(),
+        Some("direct")
+    );
     assert!(!f.root.join("inbox/a").exists());
 }
 
@@ -882,8 +975,5 @@ async fn cache_root_refresh_pins_active_tasks_and_updates_future_tasks() {
 
     assert_eq!(f.service.current_cache_root(), Some(new_root.clone()));
     assert_eq!(f.service.cache_root_for_task(&f.id), Some(old_root));
-    assert_eq!(
-        f.service.cache_root_for_task("future-task"),
-        Some(new_root)
-    );
+    assert_eq!(f.service.cache_root_for_task("future-task"), Some(new_root));
 }

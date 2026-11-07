@@ -11,6 +11,7 @@
     "notFound": "找不到要求的內容。",
     "forbidden": "不允許此操作。",
     "conflict": "操作與目前狀態衝突。",
+    "permissionDenied": "沒有權限寫入此位置。請檢查快取或接收目錄權限，或改用可寫入的目錄後重試。",
     "unknown": "操作失敗，請重試。"
   },
   "transfer": {
@@ -23,12 +24,15 @@
     "noFiles": "沒有可傳送的檔案。",
     "connectionUnreachable": "暫時無法連線到這台裝置。請確認對方已開啟 NodeSend，且兩台裝置連線到同一個網路。",
     "connectionRefused": "對方裝置拒絕連線。請確認 NodeSend 正在執行，並檢查防火牆設定。",
-    "timedOut": "連線裝置逾時。請確認對方在線，並檢查網路和防火牆。"
+    "receiveDirectorySpace": "接收目錄空間不足（已計入其他工作預留的空間）。請釋放磁碟空間或更換接收目錄後重試。",
+    "timedOut": "連線裝置逾時。請確認對方在線，並檢查網路和防火牆。",
+    "cacheSpacePaused": "快取磁碟空間不足，任務已暫停。釋放快取磁碟空間後即可恢復任務。"
   },
   "settings": {
     "saveFailed": "儲存設定失敗：{{reason}}",
     "favoriteSaveFailed": "無法儲存收藏項目，請檢查應用程式儲存空間後再試。",
-    "invalidLanguage": "不支援所選語言。"
+    "invalidLanguage": "不支援所選語言。",
+    "unfinishedTransfers": "請先完成或取消所有未完成的傳輸，再安裝更新。"
   },
   "update": {
     "desktopOnly": "更新功能僅適用於桌面應用程式。",

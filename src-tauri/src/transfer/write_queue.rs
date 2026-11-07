@@ -24,7 +24,9 @@
 //! 因此不会出现「完成状态说完成了，但数据没落盘」。
 
 use super::{paths, relay, TransferService};
-use crate::error::{AppError, AppResult};
+#[cfg(target_os = "android")]
+use crate::error::AppError;
+use crate::error::AppResult;
 #[cfg(target_os = "android")]
 use std::os::fd::FromRawFd;
 use std::{
@@ -214,7 +216,10 @@ impl Writer {
                 }
                 return Ok(());
             }
-            let chunk = buffer.ready.remove(&offset).expect("Just removed the lowest offset");
+            let chunk = buffer
+                .ready
+                .remove(&offset)
+                .expect("Just removed the lowest offset");
             buffer.gap_since = None;
             let end = offset + chunk.data.len() as u64;
             let use_cache = buffer.use_cache;
@@ -222,11 +227,28 @@ impl Writer {
             if use_cache {
                 // 缓存模式：写缓存盘分段并 sync，目标盘不参与传输过程。
                 if !store_cached(service, &chunk).await? {
-                    continue; // The cache writer already recorded the task error.
+                    if !service.file_write_plan(&chunk.task_id, chunk.file)?.2 {
+                        discard_one(service, &chunk.task_id, chunk.index);
+                        if let Some(buffer) = self.files.remove(key) {
+                            for pending in buffer.ready.values() {
+                                discard_one(service, &pending.task_id, pending.index);
+                            }
+                            for (task_id, index, _) in buffer.dirty {
+                                discard_one(service, &task_id, index);
+                            }
+                        }
+                    } else {
+                        buffer.ready.insert(offset, chunk);
+                    }
+                    return Ok(());
                 }
             } else {
                 let _writer = service.destination_writer.lock().await;
-                let mut file = handle.as_ref().expect("Direct-write mode requires a target handle").lock().await;
+                let mut file = handle
+                    .as_ref()
+                    .expect("Direct-write mode requires a target handle")
+                    .lock()
+                    .await;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
                 file.write_all(&chunk.data).await?;
                 buffer
@@ -369,10 +391,17 @@ impl Writer {
 }
 
 /// 写一个块到缓存盘分段文件，并在成功后 `sync_data`。
-/// 缓存盘实际空间不足时暂停，避免其他进程占盘导致永久等待。
+/// 外部程序占用空间导致写入失败时，清理该文件缓存并请求发送端整文件直写重传。
 async fn store_cached(service: &Arc<TransferService>, chunk: &PendingChunk) -> AppResult<bool> {
+    if !service.file_write_plan(&chunk.task_id, chunk.file)?.2 {
+        discard_one(service, &chunk.task_id, chunk.index);
+        return Ok(false);
+    }
     let Some(cache_root) = service.cache_root_for_task(&chunk.task_id) else {
-        return Err(AppError::Other("Cache directory is unavailable".into()));
+        service
+            .fallback_cached_file_to_direct(&chunk.task_id, chunk.file)
+            .await?;
+        return Ok(false);
     };
     let cache_name = service.cache_name_for(&chunk.task_id, chunk.file);
     let path = paths::cache_segment_named(
@@ -384,12 +413,24 @@ async fn store_cached(service: &Arc<TransferService>, chunk: &PendingChunk) -> A
         service.file_write_plan(&chunk.task_id, chunk.file)?.1,
     );
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            tracing::warn!(task = %chunk.task_id, file = chunk.file, error = %error, "Cache directory could not be prepared; retrying this file as a direct transfer");
+            service
+                .fallback_cached_file_to_direct(&chunk.task_id, chunk.file)
+                .await?;
+            return Ok(false);
+        }
     }
     let within = chunk.offset % relay::SEG_BYTES;
     loop {
         if abandon(&service.status_of(&chunk.task_id)?) {
             discard_one(service, &chunk.task_id, chunk.index);
+            return Ok(false);
+        }
+        if !service.wait_for_cache_space(&chunk.task_id, chunk.data.len() as u64).await? {
+            if crate::transfer::recovery::processing(&service.status_of(&chunk.task_id)?) {
+                service.fallback_cached_file_to_direct(&chunk.task_id, chunk.file).await?;
+            }
             return Ok(false);
         }
         match write_segment(&path, within, &chunk.data).await {
@@ -404,12 +445,11 @@ async fn store_cached(service: &Arc<TransferService>, chunk: &PendingChunk) -> A
                 }
                 return Ok(true);
             }
-            Err(err) if is_disk_full(&err) => {
-                return Err(AppError::Conflict(
-                    "Insufficient free space in the cache directory".into(),
-                ))
+            Err(err) => {
+                tracing::warn!(task = %chunk.task_id, file = chunk.file, error = %err, "Cache write failed; retrying this file as a direct transfer");
+                service.fallback_cached_file_to_direct(&chunk.task_id, chunk.file).await?;
+                return Ok(false);
             }
-            Err(err) => return Err(err),
         }
     }
 }
@@ -429,14 +469,6 @@ async fn write_segment(path: &Path, within: u64, data: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
-/// 是否为「磁盘写满」类错误（Windows 112 / 类 Unix 28）。
-fn is_disk_full(err: &AppError) -> bool {
-    match err {
-        AppError::Io(io) => matches!(io.raw_os_error(), Some(28) | Some(112)),
-        _ => false,
-    }
-}
-
 /// 建立缓冲：复用（或新建）文件句柄，起点取「该文件第一个未完成块」的偏移。
 async fn open_buffer(
     service: &Arc<TransferService>,
@@ -448,9 +480,10 @@ async fn open_buffer(
         service.file_write_plan(id, file)?;
     if use_cache {
         // 缓存模式：只为缓存盘建目录，绝不触碰目标盘。
-        let cache_root = service
-            .cache_root_for_task(id)
-            .ok_or_else(|| AppError::Other("Cache directory is unavailable".into()))?;
+        let Some(cache_root) = service.cache_root_for_task(id) else {
+            service.fallback_cached_file_to_direct(id, file).await?;
+            return Ok(None);
+        };
         let cache_name = service.cache_name_for(id, file);
         let dir = paths::cache_segment_named(
             &cache_root,
@@ -461,7 +494,11 @@ async fn open_buffer(
             expected_size,
         );
         if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent)?;
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::warn!(task = %id, file, error = %error, "Cache directory could not be prepared; retrying this file as a direct transfer");
+                service.fallback_cached_file_to_direct(id, file).await?;
+                return Ok(None);
+            }
         }
         return Ok(Some(FileBuffer {
             ready: BTreeMap::new(),

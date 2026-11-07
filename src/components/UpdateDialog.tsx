@@ -10,6 +10,7 @@ import {
 import { frontendPreview } from '../api/runtime';
 import { displayVersion } from '../utils/version';
 import { useTranslation } from 'react-i18next';
+import { errorText } from '../api/network';
 
 type Phase = 'prompt' | 'downloading' | 'installing' | 'done' | 'error';
 
@@ -38,7 +39,11 @@ export function UpdateDialog({ update, onClose, onSkip }: {
         return;
       }
       if (android) {
-        if (!update.sha256) throw new Error(t('updateDialog.missingHash'));
+        if (!update.sha256) {
+          setPhase('error');
+          setError(t('updateDialog.missingHash'));
+          return;
+        }
         const path = await downloadAndroidUpdate(update.downloadUrl, update.sha256, update.fallbackUrls ?? []);
         setPhase('installing');
         await installAndroidUpdate(path);
@@ -53,13 +58,13 @@ export function UpdateDialog({ update, onClose, onSkip }: {
       }
     } catch (reason) {
       setPhase('error');
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(errorText(reason));
     }
   }
 
   async function openReleasePage() {
     try { await openUpdateUrl(update.releasePageUrl); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { setError(errorText(reason)); }
   }
 
   return <div className="app-modal-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }}>

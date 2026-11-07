@@ -51,7 +51,9 @@ impl TransferService {
         if done.exists() {
             let metadata = std::fs::metadata(target)?;
             if !metadata.is_file() || metadata.len() != entry.size {
-                return Err(AppError::Conflict("Published file is missing or its size does not match the manifest".into()));
+                return Err(AppError::Conflict(
+                    "Published file is missing or its size does not match the manifest".into(),
+                ));
             }
             return Ok(());
         }
@@ -67,7 +69,9 @@ impl TransferService {
             std::fs::File::create(&part)?.sync_all()?;
         }
         if std::fs::metadata(&part)?.len() != entry.size {
-            return Err(AppError::Conflict("Received file size does not match the manifest".into()));
+            return Err(AppError::Conflict(
+                "Received file size does not match the manifest".into(),
+            ));
         }
         if target.exists() {
             if same_file::is_same_file(&part, target).unwrap_or(false) {
@@ -103,7 +107,9 @@ impl TransferService {
         }
         let metadata = std::fs::metadata(target)?;
         if !metadata.is_file() || metadata.len() != entry.size {
-            return Err(AppError::Conflict("Published file is missing or its size does not match the manifest".into()));
+            return Err(AppError::Conflict(
+                "Published file is missing or its size does not match the manifest".into(),
+            ));
         }
         let modified = metadata
             .modified()

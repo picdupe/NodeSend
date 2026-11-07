@@ -184,6 +184,16 @@
       "sourceMissing": "送信元ファイルがありません。受信済みのファイルで完了するか、キャンセルできます",
       "sourceUnavailable": "送信元ファイルに一時的にアクセスできません。再開して再試行できます",
       "peerStatus": "相手のタスク状態を同期しました：{{status}}",
+      "unknownPeerStatus": "不明な状態",
+      "untranslated": "表示に対応していないイベントがあります。",
+      "peerStatusValues": {
+        "resumed": "再開済み",
+        "paused": "一時停止中",
+        "finish": "受信完了",
+        "offline": "相手がオフライン",
+        "cancelled": "キャンセル済み",
+        "rejected": "拒否済み"
+      },
       "partialCompleted": "利用可能なファイルを保持しました。タスクは一部完了です。未受信ファイルは放棄一覧に記録されています",
       "waitingForReceiver": "受信側の続行を待っています",
       "writeFailed": "書き込みに失敗しました：{{error}}"
