@@ -75,7 +75,7 @@ function New-ApiClient([string]$Token, [bool]$UseProxy) {
     return @{ Client = $client; Handler = $handler }
 }
 
-function Send-JsonRequest($Client, [string]$Method, [string]$Uri, $Body = $null) {
+function Send-JsonRequest($Client, [string]$Method, [string]$Uri, $Body = $null, [switch]$AllowNotFound) {
     $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method), $Uri)
     if ($null -ne $Body) {
         $json = $Body | ConvertTo-Json -Depth 20 -Compress
@@ -83,7 +83,12 @@ function Send-JsonRequest($Client, [string]$Method, [string]$Uri, $Body = $null)
     }
     try {
         $response = $Client.SendAsync($request).GetAwaiter().GetResult()
-        if (-not $response.IsSuccessStatusCode) { throw "Release API request failed: $Method ($([int]$response.StatusCode))." }
+        if (-not $response.IsSuccessStatusCode) {
+            if ($AllowNotFound -and [int]$response.StatusCode -eq 404) { return $null }
+            $details = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ($details.Length -gt 1200) { $details = $details.Substring(0, 1200) }
+            throw "Release API request failed: $Method $($request.RequestUri.Host) ($([int]$response.StatusCode)): $details"
+        }
         $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if ($text) { return ($text | ConvertFrom-Json) }
     } finally { $request.Dispose() }
@@ -134,15 +139,31 @@ foreach ($target in $targets) {
     if ($target -eq 'github') {
         $clients.github = New-ApiClient $savedCredentials.github.password $true
         $base = 'https://api.github.com/repos/picdupe/NodeSend'
-        $release = Send-JsonRequest $clients.github.Client 'GET' "$base/releases/tags/$tag"
+        $latestRelease = Send-JsonRequest $clients.github.Client 'GET' "$base/releases/latest" $null -AllowNotFound
+        $release = Send-JsonRequest $clients.github.Client 'GET' "$base/releases/tags/$tag" $null -AllowNotFound
+        $hasCurrentRelease = $null -ne $release
+        if ($null -eq $release) {
+            $release = [pscustomobject]@{ tag_name = $tag; body = ''; assets = @() }
+            $clients.github.NeedsCreate = $true
+        }
         if ($release.tag_name -ne $tag) { throw 'GitHub returned a different release tag.' }
+        $clients.github.LatestRelease = $latestRelease
+        $clients.github.HasCurrentRelease = $hasCurrentRelease
     } else {
         $clients.gitcode = New-ApiClient $null $false
         $token = [uri]::EscapeDataString($savedCredentials.gitcode.password)
         $base = 'https://api.gitcode.com/api/v5/repos/picdupe/NodeSend'
-        $release = Send-JsonRequest $clients.gitcode.Client 'GET' "$base/releases/$tag`?access_token=$token"
+        $latestRelease = Send-JsonRequest $clients.gitcode.Client 'GET' "$base/releases/latest`?access_token=$token" $null -AllowNotFound
+        $release = Send-JsonRequest $clients.gitcode.Client 'GET' "$base/releases/$tag`?access_token=$token" $null -AllowNotFound
+        $hasCurrentRelease = $null -ne $release
+        if ($null -eq $release) {
+            $release = [pscustomobject]@{ tag_name = $tag; body = ''; assets = @() }
+            $clients.gitcode.NeedsCreate = $true
+        }
         if ($release.tag_name -ne $tag) { throw 'GitCode returned a different release tag.' }
         $clients.gitcode.Token = $token
+        $clients.gitcode.LatestRelease = $latestRelease
+        $clients.gitcode.HasCurrentRelease = $hasCurrentRelease
     }
     $clients[$target].Base = $base
     $clients[$target].Release = $release
@@ -154,7 +175,7 @@ if ($updateNotes -cne $gitcodeNotes) {
     throw 'GitHub and GitCode release descriptions produce different update notes. Synchronize both release descriptions before building.'
 }
 if ([string]::IsNullOrWhiteSpace($updateNotes)) {
-    throw "No new release-note entries were found in the $($currentVersion.version) changelog section; refusing to increment the build number."
+    throw "No new release-note entries were found in the $($currentVersion.version) changelog section."
 }
 Write-Output 'New updater notes:'
 $updateNotes -split '\r?\n' | ForEach-Object { Write-Output "  $_" }
@@ -163,9 +184,45 @@ Write-Output 'Checking the remote main branches before building.'
 $originHead = Get-RemoteMainHead 'origin' $originalHead
 $gitcodeHead = Get-RemoteMainHead 'gitcode' $originalHead
 
-Write-Output 'Incrementing the build number once.'
-& $python.Source $versionScript increment
-if ($LASTEXITCODE -ne 0) { throw 'Could not increment and synchronize the release build number.' }
+$githubLatestTag = if ($clients.github.LatestRelease) { [string]$clients.github.LatestRelease.tag_name } else { '' }
+$gitcodeLatestTag = if ($clients.gitcode.LatestRelease) { [string]$clients.gitcode.LatestRelease.tag_name } else { '' }
+$partialCurrentRelease = [bool]$clients.github.HasCurrentRelease -ne [bool]$clients.gitcode.HasCurrentRelease
+if ($githubLatestTag -ine $gitcodeLatestTag -and -not $partialCurrentRelease) {
+    $githubLabel = if ($githubLatestTag) { $githubLatestTag } else { '(none)' }
+    $gitcodeLabel = if ($gitcodeLatestTag) { $gitcodeLatestTag } else { '(none)' }
+    throw "The latest release tags differ between GitHub ($githubLabel) and GitCode ($gitcodeLabel). Synchronize both release pages before building."
+}
+
+$latestTagForVersion = $githubLatestTag
+if ($partialCurrentRelease) {
+    $latestTagForVersion = if ($clients.github.HasCurrentRelease) { $githubLatestTag } else { $gitcodeLatestTag }
+    if ($latestTagForVersion -ine $tag) {
+        throw "A partial release exists for $tag, but that repository's latest release is $latestTagForVersion. Refusing to resume against an older release."
+    }
+    Write-Output "Detected a partially published $tag release; preserving build $($currentVersion.build) while completing both release pages."
+}
+
+$remoteVersionText = $latestTagForVersion -replace '^v', ''
+if ($remoteVersionText -and $remoteVersionText -notmatch '^\d+\.\d+\.\d+$') {
+    throw "The latest release tag is not a semantic product version: $latestTagForVersion."
+}
+$remoteVersion = if ($remoteVersionText) { [version]$remoteVersionText } else { $null }
+$localVersion = [version][string]$currentVersion.version
+if ($remoteVersion -and $remoteVersion -gt $localVersion) {
+    throw "Remote release $latestTagForVersion is newer than local version $($currentVersion.version). Update version.json before publishing."
+}
+
+if ($partialCurrentRelease) {
+    & $python.Source $versionScript sync
+} elseif ($remoteVersion -and $remoteVersion -eq $localVersion) {
+    Write-Output "Remote release $latestTagForVersion already uses version $($currentVersion.version); incrementing the build number."
+    & $python.Source $versionScript increment
+} else {
+    $remoteLabel = if ($latestTagForVersion) { $latestTagForVersion } else { '(none)' }
+    Write-Output "Remote latest release is $remoteLabel; keeping build $($currentVersion.build) for new version $($currentVersion.version)."
+    & $python.Source $versionScript sync
+}
+if ($LASTEXITCODE -ne 0) { throw 'Could not synchronize the release build number.' }
 
 $versionData = Get-Content -LiteralPath (Join-Path $projectRoot 'version.json') -Raw | ConvertFrom-Json
 $version = [string]$versionData.version
@@ -187,6 +244,36 @@ $files = @(
     @{ Name = "NodeSend_${publicVersion}_x64_ja-JP.msi"; Path = Join-Path $msiBundleDir "NodeSend_${publicVersion}_x64_ja-JP.msi"; Kind = 'msi' }
 )
 
+$resumePreparedRelease = $false
+if ($partialCurrentRelease) {
+    $missingArtifacts = @($files | Where-Object { -not (Test-Path -LiteralPath $_.Path -PathType Leaf) })
+    if ($missingArtifacts.Count -gt 0) {
+        throw "A partial $tag release already exists, but prepared artifacts are missing. Refusing to rebuild under an existing tag: $($missingArtifacts.Name -join ', ')."
+    }
+    $preparedManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $apkHash = (Get-FileHash -LiteralPath $files[2].Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $installerSignature = (Get-Content -LiteralPath $files[1].Path -Raw).Trim()
+    $committedVersionJson = & $git.Source -C $projectRoot show 'HEAD:version.json'
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the prepared release version in HEAD.' }
+    $committedVersion = $committedVersionJson | ConvertFrom-Json
+    $preparedVersion = "$($currentVersion.version)-build.$($currentVersion.build)"
+    $manifestMatches =
+        $preparedManifest.version -ceq $preparedVersion -and
+        $preparedManifest.notes -ceq $updateNotes -and
+        $preparedManifest.android.sha256.ToLowerInvariant() -ceq $apkHash -and
+        $preparedManifest.platforms.'windows-x86_64'.signature -ceq $installerSignature -and
+        $preparedManifest.platforms.'windows-x86_64'.url.EndsWith($installerName, [StringComparison]::Ordinal) -and
+        $preparedManifest.android.url.EndsWith($androidName, [StringComparison]::Ordinal)
+    if (-not $manifestMatches -or
+        $committedVersion.version -cne $currentVersion.version -or
+        [int]$committedVersion.build -ne [int]$currentVersion.build) {
+        throw "A partial $tag release exists, but the prepared artifacts do not match the versioned manifest already pushed to main. Refusing to rebuild or move the existing tag."
+    }
+    $resumePreparedRelease = $true
+    Write-Output "Reusing the validated $publicVersion artifacts and manifest already pushed to main."
+}
+
+if (-not $resumePreparedRelease) {
 Write-Output 'Building the Windows release bundle.'
 $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
 if (-not $pwsh) { throw 'PowerShell 7 (pwsh) is required to run the platform build scripts.' }
@@ -203,6 +290,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Android ARM64 release build failed (exit $LASTEXITCODE)." }
 } finally {
     Pop-Location
+}
 }
 
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Updater manifest not found: $manifestPath" }
@@ -223,10 +311,15 @@ if (-not $manifest.platforms.'windows-x86_64'.url.EndsWith($installerName, [Stri
     throw 'Updater manifest download URLs do not match the build artifacts.'
 }
 $manifest.notes = $updateNotes
-$manifest | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+if (-not $resumePreparedRelease) {
+    $manifest | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+}
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.notes -cne $updateNotes) { throw 'Updater notes do not match the new changelog entries.' }
 
+if ($resumePreparedRelease) {
+    Write-Output 'Reusing the updater manifest commit already pushed to both repositories.'
+} else {
 Write-Output 'Preparing the updater manifest commit.'
 & $git.Source -C $projectRoot add -- $releaseCommitFiles
 if ($LASTEXITCODE -ne 0) { throw 'Could not stage the fixed release metadata file list.' }
@@ -244,6 +337,36 @@ Write-Output 'Pushing the amended commit to GitHub and GitCode before publishing
 if ($LASTEXITCODE -ne 0) { throw 'Could not push the amended release commit to GitHub; release publishing stopped.' }
 & $git.Source -C $projectRoot -c http.proxy= push "--force-with-lease=refs/heads/main:$gitcodeHead" gitcode 'HEAD:refs/heads/main'
 if ($LASTEXITCODE -ne 0) { throw 'Could not push the amended release commit to GitCode; release publishing stopped.' }
+}
+
+foreach ($target in $targets) {
+    $entry = $clients[$target]
+    if (-not $entry.NeedsCreate) { continue }
+    if ($target -eq 'github') {
+        $entry.Release = Send-JsonRequest $entry.Client 'POST' "$($entry.Base)/releases" @{
+            tag_name = $tag; target_commitish = 'main'; name = $tag; body = $notes;
+            draft = $false; prerelease = $false
+        }
+    } else {
+        $entry.Release = Send-JsonRequest $entry.Client 'POST' "$($entry.Base)/releases`?access_token=$($entry.Token)" @{
+            tag_name = $tag; target_commitish = 'main'; name = $tag; body = $notes;
+            prerelease = $false
+        }
+    }
+    if ($entry.Release.tag_name -ne $tag) { throw "$target returned a different release tag after creation." }
+    Write-Output "Created the $target release and tag $tag after pushing the release commit."
+}
+
+foreach ($target in $targets) {
+    $entry = $clients[$target]
+    if ([string]$entry.Release.body -ceq $notes) { continue }
+    if ($target -eq 'github') {
+        $entry.Release = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$($entry.Release.id)" @{ body = $notes }
+    } else {
+        $entry.Release = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$tag`?access_token=$($entry.Token)" @{ name = [string]$entry.Release.name; body = $notes }
+    }
+    Write-Output "Updated the $target release description from CHANGELOG.md."
+}
 
 Write-Output "Release: $tag"
 Write-Output "Notes:   $changelogPath [$version]"

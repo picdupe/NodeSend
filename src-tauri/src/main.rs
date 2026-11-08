@@ -1,9 +1,10 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "console")]
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("--service-host") => std::process::exit(nodesend_lib::process_host::run_service()),
         Some("--cli-entry") => std::process::exit(nodesend_lib::process_host::run_cli_entry()),
         Some("--gui-client") => {
+            detach_console();
             nodesend_lib::process_host::init_gui_log();
             tracing::info!(pid = std::process::id(), "GUI entry process started");
             #[cfg(windows)]
@@ -27,7 +28,20 @@ fn main() {
                 eprintln!("{}", nodesend_lib::cli::cli_translate("noGuiEnvironment"));
                 std::process::exit(1);
             }
+            detach_console();
             std::process::exit(nodesend_lib::process_host::launch_gui());
         }
     }
 }
+
+#[cfg(windows)]
+fn detach_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FreeConsole() -> i32;
+    }
+    unsafe { FreeConsole(); }
+}
+
+#[cfg(not(windows))]
+fn detach_console() {}

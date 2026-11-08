@@ -114,9 +114,10 @@ $signingEnv = Join-Path $projectRoot 'signing/.env'
     if (Test-Path -LiteralPath $signingEnv) {
         foreach ($line in Get-Content -LiteralPath $signingEnv -Encoding UTF8) {
             if ($line -match '^\s*(#|$)') { continue }
-            if ($line -notmatch '^\s*(NODESEND_[A-Z_]+)\s*=(.*)$') { throw 'Invalid entry in signing/.env.' }
+            if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$') { throw 'Invalid entry in signing/.env.' }
             $key = $Matches[1]
             $value = $Matches[2].Trim()
+            if ($key -in @('TAURI_SIGNING_PRIVATE_KEY', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD')) { continue }
             if ($key -notin $signingKeys) { throw "Unsupported signing setting: $key" }
             if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
                 $value = $value.Substring(1, $value.Length - 2)

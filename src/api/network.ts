@@ -24,6 +24,9 @@ export const requestMediaLibraryPermission = () => invoke<boolean>('request_medi
 export function errorText(error: unknown): string {
   const raw = typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error);
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  if (/The update signing public key is not configured/i.test(raw)) {
+    return i18next.t('update.unsignedBuild', { ns: 'errors' });
+  }
   if (raw === 'UPDATE_BLOCKED_UNFINISHED_TRANSFERS') {
     return i18next.t('settings.unfinishedTransfers', { ns: 'errors' });
   }

@@ -9,6 +9,9 @@ frontend-dist
 src-tauri/target
 **/target/
 src-tauri/icons/.build-fingerprint.json
+src-tauri/gen/schemas/acl-manifests.json
+src-tauri/icons/icon.icns
+src-tauri/mobile-icons/icon.icns
 src-tauri/gen/android/.gradle/
 src-tauri/gen/android/app/build/
 src-tauri/gen/android/build/

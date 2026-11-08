@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7] - 2026-11-09
+### Added
+- Add accent color customization and localized MSI packages
+### Fixed
+- Improve theme support and update handling, optimize transfer history
+- Fix CLI output ordering and unsigned build update errors
+
 ## [0.1.6] - 2026-11-04
 
 ### Added

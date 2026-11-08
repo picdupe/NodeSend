@@ -36,6 +36,7 @@
     "pauseTransfers": "Pause active transfers before installing the update."
   },
   "update": {
+    "unsignedBuild": "This older debug build has no update verification key and cannot check for updates. Install a signed NodeSend build.",
     "desktopOnly": "Updates are available only in the desktop app.",
     "manifestIncomplete": "The Android update manifest is incomplete."
   },
