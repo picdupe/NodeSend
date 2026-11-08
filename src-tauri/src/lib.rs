@@ -27,6 +27,7 @@ pub mod network;
 #[cfg(desktop)]
 pub mod process_host;
 pub mod registry;
+mod screen_picker;
 pub mod service;
 #[cfg(desktop)]
 pub mod service_rpc;
@@ -218,6 +219,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             service_invoke,
+            screen_picker::pick_screen_color,
             ipc::commands::get_ui_language,
             ipc::commands::set_ui_language,
             ipc::commands::get_node_info,

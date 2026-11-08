@@ -8,10 +8,12 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import './styles/global.css';
 import { initializeI18n } from './i18n';
+import { initializeAccent } from './theme';
 
 document.addEventListener('contextmenu', (event) => event.preventDefault());
 
 void initializeI18n().finally(() => {
+  initializeAccent();
   ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
     <React.StrictMode>
       <App />

@@ -69,5 +69,30 @@
     "installerStarted": "The installer has started. The app will close to complete the update.",
     "previewNotes": "Preview: this text comes from the notes field in the latest.json update manifest.\n· Fix known issues\n· Improve transfer reliability"
   },
-  "loading": "Loading…"
+  "loading": "Loading…",
+  "accent": {
+    "title": "Accent color",
+    "system": "Follow system accent color",
+    "custom": "Choose a color",
+    "color": "Choose color",
+    "spectrum": "Spectrum",
+    "palette": "Palette",
+    "values": "Color values",
+    "hue": "Hue",
+    "saturation": "Saturation",
+    "hex": "HEX value",
+    "red": "Red",
+    "green": "Green",
+    "blue": "Blue",
+    "alpha": "Alpha",
+    "rgb": "RGB",
+    "hsv": "HSV",
+    "brightness": "Value",
+    "darker": "Slightly darker",
+    "darkest": "Darker",
+    "lighter": "Slightly lighter",
+    "lightest": "Lighter",
+    "screenPicker": "Pick a color from the screen",
+    "screenPickerFailed": "Could not pick a screen color. Please try again."
+  }
 }

@@ -69,5 +69,30 @@
     "installerStarted": "安裝程式已啟動，應用程式將關閉以完成更新。",
     "previewNotes": "介面預覽：此處內容來自更新清單 latest.json 的 notes 欄位。\n· 修正已知問題\n· 提升傳輸穩定性"
   },
-  "loading": "載入中…"
+  "loading": "載入中…",
+  "accent": {
+    "title": "主題色",
+    "system": "跟隨系統強調色",
+    "custom": "手動選擇",
+    "color": "選擇顏色",
+    "spectrum": "色彩光譜",
+    "palette": "預設色盤",
+    "values": "色彩數值",
+    "hue": "色相",
+    "saturation": "飽和度",
+    "hex": "HEX 色碼",
+    "red": "紅",
+    "green": "綠",
+    "blue": "藍",
+    "alpha": "透明度",
+    "rgb": "RGB",
+    "hsv": "HSV",
+    "brightness": "明度",
+    "darker": "稍暗",
+    "darkest": "較暗",
+    "lighter": "稍亮",
+    "lightest": "較亮",
+    "screenPicker": "從螢幕選取顏色",
+    "screenPickerFailed": "螢幕取色失敗，請重試。"
+  }
 }

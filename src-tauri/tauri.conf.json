@@ -39,7 +39,13 @@
     ],
     "windows": {
       "wix": {
-        "version": "0.1.6.133"
+        "version": "0.1.6.133",
+        "language": [
+          "zh-CN",
+          "zh-TW",
+          "en-US",
+          "ja-JP"
+        ]
       },
       "nsis": {
         "installMode": "perMachine",

@@ -129,8 +129,20 @@ foreach ($artifact in $artifacts) {
 foreach ($kind in $bundleKinds) {
     $extension = if ($kind -eq 'nsis') { '*.exe' } else { '*.msi' }
     $kindDirectory = Join-Path $bundleRoot $kind
+    $expectedMsiNames = @(
+        "NodeSend_${publicVersion}_x64_zh-CN.msi",
+        "NodeSend_${publicVersion}_x64_zh-TW.msi",
+        "NodeSend_${publicVersion}_x64_en-US.msi",
+        "NodeSend_${publicVersion}_x64_ja-JP.msi"
+    )
     Get-ChildItem -LiteralPath $kindDirectory -Filter $extension -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'NodeSend_*' -and $_.Name -notlike "*${publicVersion}*" } |
+        Where-Object {
+            $obsolete = $_.Name -like 'NodeSend_*' -and $_.Name -notlike "*${publicVersion}*"
+            if ($kind -eq 'msi' -and $_.Name -like "NodeSend_${publicVersion}_x64_*.msi") {
+                $obsolete = $obsolete -or $_.Name -notin $expectedMsiNames
+            }
+            $obsolete
+        } |
         ForEach-Object {
             $staleSignature = "$($_.FullName).sig"
             Remove-Item -LiteralPath $_.FullName -Force

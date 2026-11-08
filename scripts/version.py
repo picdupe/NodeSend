@@ -50,7 +50,7 @@ def sync() -> None:
     replace_one(ROOT / "src-tauri/tauri.conf.json", r'("version"\s*:\s*")[^"]+("\s*,)', rf'\g<1>{semver}\2', "Tauri version")
     replace_one(
         ROOT / "src-tauri/tauri.conf.json",
-        r'("wix"\s*:\s*\{\s*"version"\s*:\s*")[^"]+("\s*\})',
+        r'("wix"\s*:\s*\{\s*"version"\s*:\s*")[^"]+(")',
         rf'\g<1>{version}.{build}\2',
         "MSI version",
     )

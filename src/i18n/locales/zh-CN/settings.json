@@ -69,5 +69,30 @@
     "installerStarted": "安装程序已启动，应用将关闭以完成更新。",
     "previewNotes": "界面预览：此处内容来自更新清单 latest.json 的 notes 字段。\n· 修复已知问题\n· 提升传输稳定性"
   },
-  "loading": "加载中…"
+  "loading": "加载中…",
+  "accent": {
+    "title": "主题色",
+    "system": "跟随系统强调色",
+    "custom": "手动选择",
+    "color": "选择颜色",
+    "spectrum": "色彩光谱",
+    "palette": "预设色板",
+    "values": "颜色数值",
+    "hue": "色相",
+    "saturation": "饱和度",
+    "hex": "HEX 色值",
+    "red": "红",
+    "green": "绿",
+    "blue": "蓝",
+    "alpha": "透明度",
+    "rgb": "RGB",
+    "hsv": "HSV",
+    "brightness": "明度",
+    "darker": "稍暗",
+    "darkest": "更暗",
+    "lighter": "稍亮",
+    "lightest": "更亮",
+    "screenPicker": "从屏幕选取颜色",
+    "screenPickerFailed": "屏幕取色失败，请重试。"
+  }
 }
