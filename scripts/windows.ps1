@@ -59,8 +59,31 @@ if ($Check) {
     exit 0
 }
 
-if (-not $Dev -and -not $Fast) {
-    if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Run scripts/signing.ps1 first, or set TAURI_SIGNING_PRIVATE_KEY to the updater signing key outside the repository.' }
+if (-not $Dev) {
+    $signingEnv = Join-Path $projectRoot 'signing/.env'
+    $signingSettings = @{}
+    if (Test-Path -LiteralPath $signingEnv -PathType Leaf) {
+        foreach ($line in Get-Content -LiteralPath $signingEnv -Encoding UTF8) {
+            if ($line -match '^\s*(#|$)') { continue }
+            if ($line -notmatch '^\s*(TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?)\s*=(.*)$') { continue }
+            $value = $Matches[2].Trim()
+            if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+            $signingSettings[$Matches[1]] = $value
+        }
+    }
+    if (-not $signingSettings.ContainsKey('TAURI_SIGNING_PRIVATE_KEY')) {
+        $signingSettings.TAURI_SIGNING_PRIVATE_KEY = if ($env:TAURI_SIGNING_PRIVATE_KEY) { $env:TAURI_SIGNING_PRIVATE_KEY } else { 'signing/nodesend-updater.key' }
+    }
+    if (-not $signingSettings.ContainsKey('TAURI_SIGNING_PRIVATE_KEY_PASSWORD')) {
+        $signingSettings.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = if ($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD } else { '' }
+    }
+    $privateKeyPath = [string]$signingSettings.TAURI_SIGNING_PRIVATE_KEY
+    if (-not [IO.Path]::IsPathRooted($privateKeyPath)) { $privateKeyPath = Join-Path $projectRoot $privateKeyPath }
+    if (-not (Test-Path -LiteralPath $privateKeyPath -PathType Leaf)) { throw "Updater signing key not found: $privateKeyPath. Run scripts/signing.ps1 first." }
+    $env:TAURI_SIGNING_PRIVATE_KEY = $privateKeyPath
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = [string]$signingSettings.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
     $tauriConfig = Get-Content -LiteralPath (Join-Path $projectRoot 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json
     $env:NODESEND_UPDATER_PUBLIC_KEY = [string]$tauriConfig.plugins.updater.pubkey
     if (-not $env:NODESEND_UPDATER_PUBLIC_KEY.Trim()) { throw 'The updater public key is missing from src-tauri/tauri.conf.json. Run scripts/signing.ps1 first.' }
@@ -77,7 +100,7 @@ $profileDir = Join-Path $projectRoot "src-tauri/target/$profile"
 if (-not $Dev) {
     Get-ChildItem -LiteralPath $profileDir -Filter 'nodesend-cli*' -File -ErrorAction SilentlyContinue | Remove-Item -Force
 }
-$command = if ($Dev) { "`"$msvcScript`" npm.cmd run tauri -- dev" } else { "`"$msvcScript`" npm.cmd run tauri -- build --bundles $bundleArg" }
+$command = if ($Dev) { "`"$msvcScript`" npm.cmd run tauri -- dev" } else { "`"$msvcScript`" npm.cmd run tauri -- build --ci --bundles $bundleArg" }
 if ($Fast -and -not $Dev) { $command += ' --debug --config src-tauri/tauri.windows.fast.json' }
 Push-Location $projectRoot
 try {

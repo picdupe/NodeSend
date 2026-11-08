@@ -36,6 +36,7 @@
     "pauseTransfers": "请先暂停进行中的传输，再安装更新。"
   },
   "update": {
+    "unsignedBuild": "当前安装的是未配置更新验证签名的调试版本，无法使用应用内检查更新。请安装已签名的 NodeSend 版本。",
     "desktopOnly": "更新功能仅在桌面应用中可用。",
     "manifestIncomplete": "Android 更新清单内容不完整。"
   },

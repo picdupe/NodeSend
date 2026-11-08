@@ -564,15 +564,6 @@ async fn remote_once(request: Request) -> Result<Value, String> {
     }
 }
 pub fn run(owner: bool) -> i32 {
-    #[cfg(windows)]
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn AttachConsole(process: u32) -> i32;
-    }
-    #[cfg(windows)]
-    unsafe {
-        AttachConsole(u32::MAX);
-    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(value) => value,
         Err(error) => {
@@ -591,6 +582,7 @@ pub fn run(owner: bool) -> i32 {
     let _ = io::stderr().flush();
     exit_code
 }
+
 async fn run_command(_owner: bool) -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());

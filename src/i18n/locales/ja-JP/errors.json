@@ -36,6 +36,7 @@
     "pauseTransfers": "進行中の転送を一時停止してから、アップデートをインストールしてください。"
   },
   "update": {
+    "unsignedBuild": "この旧デバッグ版には更新検証キーがなく、更新を確認できません。署名済みの NodeSend をインストールしてください。",
     "desktopOnly": "更新機能はデスクトップアプリでのみ利用できます。",
     "manifestIncomplete": "Android の更新マニフェストが不完全です。"
   },

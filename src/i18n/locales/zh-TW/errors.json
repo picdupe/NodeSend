@@ -36,6 +36,7 @@
     "pauseTransfers": "請先暫停進行中的傳輸，再安裝更新。"
   },
   "update": {
+    "unsignedBuild": "這個舊版除錯套件沒有更新驗證金鑰，無法檢查更新。請安裝已簽署的 NodeSend 版本。",
     "desktopOnly": "更新功能僅適用於桌面應用程式。",
     "manifestIncomplete": "Android 更新清單內容不完整。"
   },

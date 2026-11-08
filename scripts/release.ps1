@@ -75,7 +75,7 @@ function New-ApiClient([string]$Token, [bool]$UseProxy) {
     return @{ Client = $client; Handler = $handler }
 }
 
-function Send-JsonRequest($Client, [string]$Method, [string]$Uri, $Body = $null) {
+function Send-JsonRequest($Client, [string]$Method, [string]$Uri, $Body = $null, [switch]$AllowNotFound) {
     $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method), $Uri)
     if ($null -ne $Body) {
         $json = $Body | ConvertTo-Json -Depth 20 -Compress
@@ -83,7 +83,10 @@ function Send-JsonRequest($Client, [string]$Method, [string]$Uri, $Body = $null)
     }
     try {
         $response = $Client.SendAsync($request).GetAwaiter().GetResult()
-        if (-not $response.IsSuccessStatusCode) { throw "Release API request failed: $Method ($([int]$response.StatusCode))." }
+        if (-not $response.IsSuccessStatusCode) {
+            if ($AllowNotFound -and [int]$response.StatusCode -eq 404) { return $null }
+            throw "Release API request failed: $Method ($([int]$response.StatusCode))."
+        }
         $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if ($text) { return ($text | ConvertFrom-Json) }
     } finally { $request.Dispose() }
@@ -134,13 +137,27 @@ foreach ($target in $targets) {
     if ($target -eq 'github') {
         $clients.github = New-ApiClient $savedCredentials.github.password $true
         $base = 'https://api.github.com/repos/picdupe/NodeSend'
-        $release = Send-JsonRequest $clients.github.Client 'GET' "$base/releases/tags/$tag"
+        $release = Send-JsonRequest $clients.github.Client 'GET' "$base/releases/tags/$tag" $null -AllowNotFound
+        if ($null -eq $release) {
+            $release = Send-JsonRequest $clients.github.Client 'POST' "$base/releases" @{
+                tag_name = $tag; target_commitish = $originalHead; name = $tag; body = '';
+                draft = $false; prerelease = $false
+            }
+            Write-Output "Created GitHub release and tag $tag at $originalHead."
+        }
         if ($release.tag_name -ne $tag) { throw 'GitHub returned a different release tag.' }
     } else {
         $clients.gitcode = New-ApiClient $null $false
         $token = [uri]::EscapeDataString($savedCredentials.gitcode.password)
         $base = 'https://api.gitcode.com/api/v5/repos/picdupe/NodeSend'
-        $release = Send-JsonRequest $clients.gitcode.Client 'GET' "$base/releases/$tag`?access_token=$token"
+        $release = Send-JsonRequest $clients.gitcode.Client 'GET' "$base/releases/$tag`?access_token=$token" $null -AllowNotFound
+        if ($null -eq $release) {
+            $release = Send-JsonRequest $clients.gitcode.Client 'POST' "$base/releases`?access_token=$token" @{
+                tag_name = $tag; target_commitish = $originalHead; name = $tag; body = '';
+                prerelease = $false
+            }
+            Write-Output "Created GitCode release and tag $tag at $originalHead."
+        }
         if ($release.tag_name -ne $tag) { throw 'GitCode returned a different release tag.' }
         $clients.gitcode.Token = $token
     }
