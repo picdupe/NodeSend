@@ -44,6 +44,116 @@ pub fn set_ui_language(state: State<'_, Arc<AppService>>, language: String) -> A
     state.set_setting("ui_language", &language)
 }
 
+#[tauri::command]
+pub fn get_system_accent_color() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        return windows_system_accent_color();
+    }
+    #[cfg(not(target_os = "windows"))]
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_system_accent_color() -> Option<String> {
+    use windows::{
+        core::PCWSTR,
+        Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+    };
+
+    fn read_dword(key: &str, value_name: &str) -> Option<u32> {
+        let key = key
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let name = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut value = 0u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_DWORD,
+                None,
+                Some((&mut value as *mut u32).cast()),
+                Some(&mut bytes),
+            )
+        };
+        (result.0 == 0 && bytes == std::mem::size_of::<u32>() as u32).then_some(value)
+    }
+
+    let value = read_dword(
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent",
+        "AccentColorMenu",
+    )
+    .or_else(|| read_dword(r"Software\Microsoft\Windows\DWM", "AccentColor"))?;
+    let red = value & 0xff;
+    let green = (value >> 8) & 0xff;
+    let blue = (value >> 16) & 0xff;
+    Some(format!("#{red:02X}{green:02X}{blue:02X}"))
+}
+
+#[cfg(target_os = "windows")]
+pub fn start_system_accent_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use tauri::Emitter;
+        use windows::{
+            core::PCWSTR,
+            Win32::System::Registry::{
+                RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER,
+                KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET,
+            },
+        };
+
+        let path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut key = HKEY::default();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(path.as_ptr()),
+                None,
+                KEY_NOTIFY,
+                &mut key,
+            )
+        };
+        if opened.0 != 0 {
+            tracing::warn!(
+                error = opened.0,
+                "Could not watch Windows accent color settings"
+            );
+            return;
+        }
+
+        let mut previous = windows_system_accent_color();
+        loop {
+            let result = unsafe {
+                RegNotifyChangeKeyValue(key, false, REG_NOTIFY_CHANGE_LAST_SET, None, false)
+            };
+            if result.0 != 0 {
+                tracing::warn!(error = result.0, "Windows accent color watch failed");
+                break;
+            }
+            let current = windows_system_accent_color();
+            if current.is_some() && current != previous {
+                previous = current.clone();
+                if let Some(color) = current {
+                    let _ = app.emit("nodesend-system-accent-changed", color);
+                }
+            }
+        }
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+    });
+}
+
 /// 查询本机 Node 身份与 HTTP 服务配置。
 #[tauri::command]
 pub async fn get_node_info(

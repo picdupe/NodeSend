@@ -9,8 +9,10 @@ import App from './App';
 import './styles/global.css';
 import { initializeI18n } from './i18n';
 import { initializeAccent } from './theme';
+import { initializeAppearance } from './appearance';
 
 document.addEventListener('contextmenu', (event) => event.preventDefault());
+initializeAppearance();
 
 void initializeI18n().finally(() => {
   initializeAccent();

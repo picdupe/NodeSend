@@ -86,14 +86,23 @@ if [[ "$PROFILE" == "release" ]]; then
     python3 - <<'PY'
 import json
 import os
+import re
 from pathlib import Path
 
 path = Path(os.environ["NODESEND_MANIFEST_PATH"])
 path.parent.mkdir(parents=True, exist_ok=True)
 version = os.environ["NODESEND_MANIFEST_VERSION"]
 platform = os.environ["NODESEND_MANIFEST_PLATFORM"]
+tuning_source = (Path(__file__).resolve().parent.parent / "src-tauri" / "src" / "tuning.rs").read_text(encoding="utf-8")
+protocol_match = re.search(
+    r"(?m)^\s*pub\(crate\)\s+const\s+PROTOCOL_VERSION:\s*u16\s*=\s*(\d+);",
+    tuning_source,
+)
+if not protocol_match:
+    raise SystemExit("Cannot read PROTOCOL_VERSION from src-tauri/src/tuning.rs.")
+protocol_version = int(protocol_match.group(1))
 
-manifest = {"version": version, "platforms": {}}
+manifest = {"version": version, "protocol_version": protocol_version, "platforms": {}}
 if path.exists():
     try:
         existing = json.loads(path.read_text(encoding="utf-8-sig"))

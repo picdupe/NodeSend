@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +39,14 @@ def main() -> None:
             digest.update(chunk)
 
     internal_version = f"{version}-build.{build}"
+    tuning_source = (ROOT / "src-tauri" / "src" / "tuning.rs").read_text(encoding="utf-8")
+    protocol_match = re.search(
+        r"(?m)^\s*pub\(crate\)\s+const\s+PROTOCOL_VERSION:\s*u16\s*=\s*(\d+);",
+        tuning_source,
+    )
+    if not protocol_match:
+        raise SystemExit("Cannot read PROTOCOL_VERSION from src-tauri/src/tuning.rs.")
+    protocol_version = int(protocol_match.group(1))
     manifest_path = ROOT / "updates" / args.channel / "latest.json"
     if manifest_path.exists():
         try:
@@ -59,6 +68,7 @@ def main() -> None:
         manifest = {"version": internal_version, "notes": "", "platforms": {}}
 
     manifest.setdefault("version", internal_version)
+    manifest["protocol_version"] = protocol_version
     manifest.setdefault("notes", "")
     manifest.setdefault("platforms", {})
     manifest["android"] = {

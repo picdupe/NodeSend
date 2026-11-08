@@ -32,7 +32,8 @@
     "saveFailed": "保存设置失败：{{reason}}",
     "favoriteSaveFailed": "无法保存收藏夹，请检查应用存储空间后重试。",
     "invalidLanguage": "不支持所选语言。",
-    "unfinishedTransfers": "请先完成或取消所有未完成的传输，再安装更新。"
+    "unfinishedTransfers": "传输协议已更新。请先完成或取消所有未完成的传输，再安装更新。",
+    "pauseTransfers": "请先暂停进行中的传输，再安装更新。"
   },
   "update": {
     "desktopOnly": "更新功能仅在桌面应用中可用。",

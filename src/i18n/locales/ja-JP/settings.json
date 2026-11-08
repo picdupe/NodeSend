@@ -17,6 +17,12 @@
   "localAddresses": "ローカルアドレス",
   "discovery": "デバイス検出",
   "version": "バージョン",
+  "appearance": {
+    "title": "テーマモード",
+    "system": "システムに従う",
+    "light": "ライト",
+    "dark": "ダーク"
+  },
   "language": {
     "title": "アプリの言語",
     "description": "NodeSend の表示言語を選択",

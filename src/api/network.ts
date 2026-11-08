@@ -27,6 +27,9 @@ export function errorText(error: unknown): string {
   if (raw === 'UPDATE_BLOCKED_UNFINISHED_TRANSFERS') {
     return i18next.t('settings.unfinishedTransfers', { ns: 'errors' });
   }
+  if (raw === 'UPDATE_BLOCKED_ACTIVE_TRANSFERS') {
+    return i18next.t('settings.pauseTransfers', { ns: 'errors' });
+  }
   const sourceIssues = [
     ['The source file changed. Resuming will retransmit the current version', 'sourceChangedResume'],
     ['The source file is missing. You can finish with the received files or cancel', 'sourceMissingResume'],

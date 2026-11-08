@@ -17,6 +17,12 @@
   "localAddresses": "Local addresses",
   "discovery": "Discovery",
   "version": "Version",
+  "appearance": {
+    "title": "Theme mode",
+    "system": "Follow system",
+    "light": "Light",
+    "dark": "Dark"
+  },
   "language": {
     "title": "App language",
     "description": "Choose the language used in NodeSend",

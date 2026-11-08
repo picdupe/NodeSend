@@ -86,8 +86,13 @@ pub fn init(app: &App) -> tauri::Result<()> {
                 show_main(tray.app_handle());
             }
         });
-    // 复用应用图标（tauri.conf.json 的 bundle.icon），不额外打包图片资源。
-    if let Some(icon) = app.default_window_icon().cloned() {
+    // 运行时从 PNG 读取图标，保留重新着色所需的透明度。
+    let png_icon = Image::from_bytes(include_bytes!("../icons/icon.png")).ok();
+    let base_icon = png_icon.or_else(|| {
+        app.default_window_icon()
+            .map(|icon| Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height()))
+    });
+    if let Some(icon) = base_icon.clone() {
         builder = builder.icon(icon);
     }
     let tray = builder.build(app)?;
@@ -105,17 +110,38 @@ pub fn init(app: &App) -> tauri::Result<()> {
         let _ = quit_for_event.set_text(quit_text);
     });
     let app_handle: AppHandle = AppHandle::clone(tray.app_handle());
-    let base_icon = app
-        .default_window_icon()
-        .map(|icon| Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height()));
-    start_pending_monitor(app_handle, tray, base_icon, language);
+    let active_icon = std::sync::Arc::new(std::sync::Mutex::new(base_icon.clone()));
+    let icon_for_event = active_icon.clone();
+    let tray_for_event = tray.clone();
+    let app_for_event = app_handle.clone();
+    let source_icon = base_icon.clone();
+    app.listen("nodesend-accent-changed", move |event| {
+        let color = event.payload().trim_matches('"').to_string();
+        let Some(source) = source_icon.as_ref() else {
+            return;
+        };
+        let icon = tint_icon(source, &color);
+        if let Ok(mut current) = icon_for_event.lock() {
+            *current = Some(icon.clone());
+        }
+        let _ = tray_for_event.set_icon(Some(icon.clone()));
+        if let Some(window) = app_for_event.get_webview_window(MAIN_WINDOW) {
+            #[cfg(target_os = "windows")]
+            if let Err(error) = set_native_window_icon(&window, &icon) {
+                tracing::warn!(%error, "Failed to update the native window icon");
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = window.set_icon(icon);
+        }
+    });
+    start_pending_monitor(app_handle, tray, active_icon, language);
     Ok(())
 }
 
 fn start_pending_monitor<R: Runtime>(
     app: AppHandle<R>,
     tray: TrayIcon<R>,
-    base_icon: Option<Image<'static>>,
+    active_icon: std::sync::Arc<std::sync::Mutex<Option<Image<'static>>>>,
     language: std::sync::Arc<std::sync::Mutex<String>>,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -152,7 +178,8 @@ fn start_pending_monitor<R: Runtime>(
                 flash_on = false;
             }
             if count != previous_count || flashing || previous_flashing {
-                if let Some(icon) = base_icon.as_ref() {
+                let icon = active_icon.lock().ok().and_then(|current| current.clone());
+                if let Some(icon) = icon.as_ref() {
                     let frame = if flashing && !flash_on {
                         blank_icon(icon)
                     } else {
@@ -188,6 +215,38 @@ fn start_pending_monitor<R: Runtime>(
     });
 }
 
+fn tint_icon(icon: &Image<'_>, color: &str) -> Image<'static> {
+    let Some([red, green, blue, alpha]) = parse_accent_color(color) else {
+        return Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height());
+    };
+    let mut rgba = icon.rgba().to_vec();
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            continue;
+        }
+        let luminance =
+            (u16::from(pixel[0]) * 54 + u16::from(pixel[1]) * 183 + u16::from(pixel[2]) * 19) >> 8;
+        let highlight = ((f32::from(luminance) - 90.0) / 165.0).clamp(0.0, 1.0) * 0.42;
+        for (channel, target) in pixel[..3].iter_mut().zip([red, green, blue]) {
+            *channel = (f32::from(target) * (1.0 - highlight) + 255.0 * highlight).round() as u8;
+        }
+        pixel[3] = (u16::from(pixel[3]) * u16::from(alpha) / 255) as u8;
+    }
+    Image::new_owned(rgba, icon.width(), icon.height())
+}
+
+fn parse_accent_color(value: &str) -> Option<[u8; 4]> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 && hex.len() != 8 {
+        return None;
+    }
+    let mut channels = [255; 4];
+    for (index, channel) in channels.iter_mut().enumerate().take(hex.len() / 2) {
+        *channel = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(channels)
+}
+
 /// 闪烁的“灭”帧：整帧几乎完全透明（alpha = 1/255）。
 ///
 /// 参考微信：图标是“看不见”而不是被移除，托盘按钮位置始终保留，相邻图标
@@ -202,6 +261,141 @@ fn blank_icon(icon: &Image<'_>) -> Image<'static> {
         pixel[3] = 1;
     }
     Image::new_owned(rgba, icon.width(), icon.height())
+}
+
+#[cfg(target_os = "windows")]
+fn set_native_window_icon(window: &tauri::WebviewWindow, image: &Image<'_>) -> Result<(), String> {
+    use std::{ffi::c_void, sync::Mutex};
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{DestroyIcon, HICON, ICON_BIG, ICON_SMALL, WM_SETICON},
+    };
+
+    fn create_icon(image: &Image<'_>, size: u32) -> Result<HICON, String> {
+        use std::{ffi::c_void, mem::size_of, ptr};
+        use windows::Win32::Graphics::Gdi::{
+            CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+        let width = image.width() as usize;
+        let height = image.height() as usize;
+        let pixels = image.rgba();
+        if width == 0 || height == 0 || pixels.len() != width * height * 4 {
+            return Err("Invalid icon image dimensions".into());
+        }
+
+        let mut bgra = vec![0u8; size as usize * size as usize * 4];
+        let mask_stride = ((size as usize + 15) / 16) * 2;
+        let mut and_mask = vec![0u8; mask_stride * size as usize];
+        for y in 0..size as usize {
+            let source_y = y * height / size as usize;
+            for x in 0..size as usize {
+                let source_x = x * width / size as usize;
+                let source = (source_y * width + source_x) * 4;
+                let destination = (y * size as usize + x) * 4;
+                let alpha = u16::from(pixels[source + 3]);
+                bgra[destination..destination + 4].copy_from_slice(&[
+                    (u16::from(pixels[source + 2]) * alpha / 255) as u8,
+                    (u16::from(pixels[source + 1]) * alpha / 255) as u8,
+                    (u16::from(pixels[source]) * alpha / 255) as u8,
+                    alpha as u8,
+                ]);
+                if pixels[source + 3] == 0 {
+                    and_mask[y * mask_stride + x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+
+        let bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size as i32,
+                biHeight: -(size as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = ptr::null_mut();
+        let color_bitmap =
+            unsafe { CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .map_err(|error| error.to_string())?;
+        if bits.is_null() {
+            let _ = unsafe { DeleteObject(color_bitmap.into()) };
+            return Err("Windows did not allocate the icon bitmap".into());
+        }
+        unsafe {
+            std::slice::from_raw_parts_mut(bits.cast::<u8>(), bgra.len()).copy_from_slice(&bgra);
+        }
+
+        let mask_bitmap = unsafe {
+            CreateBitmap(
+                size as i32,
+                size as i32,
+                1,
+                1,
+                Some(and_mask.as_ptr().cast::<c_void>()),
+            )
+        };
+        if mask_bitmap.is_invalid() {
+            let _ = unsafe { DeleteObject(color_bitmap.into()) };
+            return Err("Windows could not create the icon transparency mask".into());
+        }
+
+        let info = ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bitmap,
+            hbmColor: color_bitmap,
+        };
+        let result = unsafe { CreateIconIndirect(&info) }.map_err(|error| error.to_string());
+        unsafe {
+            let _ = DeleteObject(mask_bitmap.into());
+            let _ = DeleteObject(color_bitmap.into());
+        }
+        result
+    }
+
+    static ACTIVE_WINDOW_ICONS: Mutex<[isize; 2]> = Mutex::new([0; 2]);
+    let hwnd = HWND(window.hwnd().map_err(|error| error.to_string())?.0);
+    let mut active = ACTIVE_WINDOW_ICONS
+        .lock()
+        .map_err(|_| "Window icon state is unavailable".to_string())?;
+    let small = create_icon(image, 16)?;
+    let big = match create_icon(image, 32) {
+        Ok(icon) => icon,
+        Err(error) => {
+            let _ = unsafe { DestroyIcon(small) };
+            return Err(error);
+        }
+    };
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(small.0 as isize)),
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(big.0 as isize)),
+        );
+    }
+
+    let previous = std::mem::replace(&mut *active, [small.0 as isize, big.0 as isize]);
+    for handle in previous {
+        if handle != 0 {
+            let _ = unsafe { DestroyIcon(HICON(handle as *mut c_void)) };
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

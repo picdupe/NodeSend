@@ -1,6 +1,40 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $versionScript = Join-Path $PSScriptRoot 'version.py'
+$releaseCommitFiles = @(
+    'CHANGELOG.md',
+    'version.json',
+    'package.json',
+    'package-lock.json',
+    'src-tauri/tauri.conf.json',
+    'src-tauri/Cargo.toml',
+    'src-tauri/Cargo.lock',
+    'scripts/nsis-hooks.nsh',
+    'updates/stable/latest.json'
+)
+$git = Get-Command git -ErrorAction SilentlyContinue
+if (-not $git) { throw 'Git is required to commit and push the updater manifest before publishing.' }
+$branch = (& $git.Source -C $projectRoot branch --show-current).Trim()
+if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') { throw "Release publishing must run from the main branch (current: '$branch')." }
+& $git.Source -C $projectRoot diff --cached --quiet
+if ($LASTEXITCODE -ne 0) { throw 'The Git index has staged changes. Commit or unstage them before running the release script.' }
+$originalHead = (& $git.Source -C $projectRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $originalHead) { throw 'Could not determine the current Git commit.' }
+
+function Get-RemoteMainHead([string]$Remote, [string]$ExpectedHead) {
+    if ($Remote -eq 'gitcode') {
+        & $git.Source -C $projectRoot -c http.proxy= fetch $Remote '+refs/heads/main:refs/remotes/gitcode/main'
+    } else {
+        & $git.Source -C $projectRoot fetch $Remote '+refs/heads/main:refs/remotes/origin/main'
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Could not fetch $Remote/main before release." }
+    $remoteHead = (& $git.Source -C $projectRoot rev-parse "refs/remotes/$Remote/main").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $remoteHead) { throw "Could not read $Remote/main after fetching." }
+    & $git.Source -C $projectRoot merge-base --is-ancestor $remoteHead $ExpectedHead
+    if ($LASTEXITCODE -ne 0) { throw "$Remote/main contains commits that are not in the local release branch. Integrate them before publishing." }
+    return $remoteHead
+}
+
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) { throw 'Python 3 is required to increment the release build number.' }
 
@@ -125,6 +159,10 @@ if ([string]::IsNullOrWhiteSpace($updateNotes)) {
 Write-Output 'New updater notes:'
 $updateNotes -split '\r?\n' | ForEach-Object { Write-Output "  $_" }
 
+Write-Output 'Checking the remote main branches before building.'
+$originHead = Get-RemoteMainHead 'origin' $originalHead
+$gitcodeHead = Get-RemoteMainHead 'gitcode' $originalHead
+
 Write-Output 'Incrementing the build number once.'
 & $python.Source $versionScript increment
 if ($LASTEXITCODE -ne 0) { throw 'Could not increment and synchronize the release build number.' }
@@ -138,20 +176,26 @@ $manifestPath = Join-Path $projectRoot 'updates/stable/latest.json'
 $installerName = "NodeSend_${publicVersion}_x64-setup.exe"
 $androidName = "NodeSend_v${publicVersion}-arm64-v8a-release.apk"
 $bundleDir = Join-Path $projectRoot 'src-tauri/target/release/bundle/nsis'
+$msiBundleDir = Join-Path $projectRoot 'src-tauri/target/release/bundle/msi'
 $files = @(
     @{ Name = $installerName; Path = Join-Path $bundleDir $installerName; Kind = 'installer' },
     @{ Name = "$installerName.sig"; Path = Join-Path $bundleDir "$installerName.sig"; Kind = 'signature' },
-    @{ Name = $androidName; Path = Join-Path $projectRoot "dist/Android/$androidName"; Kind = 'android' }
+    @{ Name = $androidName; Path = Join-Path $projectRoot "dist/Android/$androidName"; Kind = 'android' },
+    @{ Name = "NodeSend_${publicVersion}_x64_zh-CN.msi"; Path = Join-Path $msiBundleDir "NodeSend_${publicVersion}_x64_zh-CN.msi"; Kind = 'msi' },
+    @{ Name = "NodeSend_${publicVersion}_x64_zh-TW.msi"; Path = Join-Path $msiBundleDir "NodeSend_${publicVersion}_x64_zh-TW.msi"; Kind = 'msi' },
+    @{ Name = "NodeSend_${publicVersion}_x64_en-US.msi"; Path = Join-Path $msiBundleDir "NodeSend_${publicVersion}_x64_en-US.msi"; Kind = 'msi' },
+    @{ Name = "NodeSend_${publicVersion}_x64_ja-JP.msi"; Path = Join-Path $msiBundleDir "NodeSend_${publicVersion}_x64_ja-JP.msi"; Kind = 'msi' }
 )
 
 Write-Output 'Building the Windows release bundle.'
 $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
 if (-not $pwsh) { throw 'PowerShell 7 (pwsh) is required to run the platform build scripts.' }
-$windowsBuildScript = Join-Path $PSScriptRoot 'windows.ps1'
+$npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $npm) { throw 'npm.cmd was not found. Install Node.js and ensure npm is on PATH.' }
 $androidBuildScript = Join-Path $PSScriptRoot 'android.ps1'
 Push-Location $projectRoot
 try {
-    & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $windowsBuildScript -Bundle nsis -Channel stable
+    & $npm.Source run windows:build
     if ($LASTEXITCODE -ne 0) { throw "Windows release build failed (exit $LASTEXITCODE)." }
 
     Write-Output 'Building the Android ARM64 release package.'
@@ -183,6 +227,24 @@ $manifest | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $manifestPath -E
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.notes -cne $updateNotes) { throw 'Updater notes do not match the new changelog entries.' }
 
+Write-Output 'Preparing the updater manifest commit.'
+& $git.Source -C $projectRoot add -- $releaseCommitFiles
+if ($LASTEXITCODE -ne 0) { throw 'Could not stage the fixed release metadata file list.' }
+$stagedFiles = @(& $git.Source -C $projectRoot diff --cached --name-only)
+if ($LASTEXITCODE -ne 0) { throw 'Could not verify the staged release metadata file list.' }
+$unexpectedStagedFiles = @($stagedFiles | Where-Object { $_ -notin $releaseCommitFiles })
+if ($unexpectedStagedFiles.Count -gt 0) { throw "Unexpected staged files: $($unexpectedStagedFiles -join ', ')" }
+& $git.Source -C $projectRoot diff --cached --quiet
+if ($LASTEXITCODE -eq 0) { throw 'No release metadata changes were staged; refusing to amend an unchanged commit.' }
+& $git.Source -C $projectRoot commit --amend --no-edit
+if ($LASTEXITCODE -ne 0) { throw 'Could not amend the current commit with the updater manifest and version metadata.' }
+
+Write-Output 'Pushing the amended commit to GitHub and GitCode before publishing release assets.'
+& $git.Source -C $projectRoot push "--force-with-lease=refs/heads/main:$originHead" origin 'HEAD:refs/heads/main'
+if ($LASTEXITCODE -ne 0) { throw 'Could not push the amended release commit to GitHub; release publishing stopped.' }
+& $git.Source -C $projectRoot -c http.proxy= push "--force-with-lease=refs/heads/main:$gitcodeHead" gitcode 'HEAD:refs/heads/main'
+if ($LASTEXITCODE -ne 0) { throw 'Could not push the amended release commit to GitCode; release publishing stopped.' }
+
 Write-Output "Release: $tag"
 Write-Output "Notes:   $changelogPath [$version]"
 Write-Output 'Validated release artifacts:'
@@ -209,6 +271,7 @@ function Get-ManagedOldAssets($Assets, [string[]]$CurrentNames) {
     $patterns = @(
         '^NodeSend_\d+\.\d+\.\d+\.\d+_x64-setup\.exe$',
         '^NodeSend_\d+\.\d+\.\d+\.\d+_x64-setup\.exe\.sig$',
+        '^NodeSend_\d+\.\d+\.\d+\.\d+_x64_(zh-CN|zh-TW|en-US|ja-JP)\.msi$',
         '^NodeSend_v\d+\.\d+\.\d+\.\d+-arm64-v8a-release\.apk$'
     )
     return @($Assets | Where-Object {
@@ -270,7 +333,7 @@ try {
     }
 
     Write-Output "Updated existing release $tag on: $($targets -join ', ')"
-    Write-Output 'Uploaded the current Windows installer, signature, and Android ARM64 APK; replaced older matching attachments and synchronized the local release notes.'
+    Write-Output 'Uploaded the current NSIS installer, signature, four localized MSI packages, and Android ARM64 APK; replaced older matching attachments and synchronized the local release notes.'
 } finally {
     foreach ($entry in $clients.Values) {
         if ($entry.Client) { $entry.Client.Dispose() }

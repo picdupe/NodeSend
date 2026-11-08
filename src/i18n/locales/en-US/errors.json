@@ -32,7 +32,8 @@
     "saveFailed": "Could not save settings: {{reason}}",
     "favoriteSaveFailed": "Could not save favorites. Check the app's available storage and try again.",
     "invalidLanguage": "The selected language is not supported.",
-    "unfinishedTransfers": "Complete or cancel all unfinished transfers before installing the update."
+    "unfinishedTransfers": "The transfer protocol has changed. Complete or cancel all unfinished transfers before installing the update.",
+    "pauseTransfers": "Pause active transfers before installing the update."
   },
   "update": {
     "desktopOnly": "Updates are available only in the desktop app.",

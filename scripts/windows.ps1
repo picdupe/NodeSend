@@ -206,6 +206,10 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         $manifestPath = Join-Path $projectRoot "updates/$Channel/latest.json"
         $manifestDirectory = Split-Path -Parent $manifestPath
         New-Item -ItemType Directory -Path $manifestDirectory -Force | Out-Null
+        $tuningPath = Join-Path $projectRoot 'src-tauri/src/tuning.rs'
+        $protocolMatch = [regex]::Match((Get-Content -LiteralPath $tuningPath -Raw), '(?m)^\s*pub\(crate\)\s+const\s+PROTOCOL_VERSION:\s*u16\s*=\s*(\d+);')
+        if (-not $protocolMatch.Success) { throw "Cannot read the transfer protocol version from $tuningPath." }
+        $protocolVersion = [int]$protocolMatch.Groups[1].Value
 
         # Keep platform entries produced by other OS build scripts when they
         # target the exact same release version/build. A different version
@@ -235,6 +239,7 @@ if (-not $Fast -and ($bundleKinds -contains 'nsis')) {
         }
         $manifest = [ordered]@{
             version = $internalVersion
+            protocol_version = $protocolVersion
             notes = $releaseNotes
             platforms = $platforms
             release_page_url = "https://gitcode.com/picdupe/NodeSend/releases"

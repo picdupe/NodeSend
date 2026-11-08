@@ -38,6 +38,7 @@ pub mod transfer;
 #[cfg(desktop)]
 pub mod tray;
 pub(crate) mod tuning;
+pub(crate) mod update_policy;
 #[cfg(desktop)]
 pub mod update_sources;
 #[cfg(desktop)]
@@ -103,6 +104,8 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 tracing::info!("Starting desktop GUI setup");
+                #[cfg(target_os = "windows")]
+                ipc::commands::start_system_accent_watcher(app.handle().clone());
                 app.manage(updater::PendingUpdateState::default());
                 if let Err(error) = update_sources::initialize(app.handle()) {
                     tracing::warn!(%error, "Update source initialization failed; continuing startup");
@@ -127,10 +130,6 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 if let Err(error) = app.run_on_main_thread(move || {
                     if let Some(window) = app_handle.get_webview_window("main") {
-                        #[cfg(target_os = "windows")]
-                        if let Err(error) = set_native_window_icon(&window) {
-                            tracing::warn!(%error, "Failed to set the native window icon");
-                        }
                         if let Err(error) = window.show() {
                             tracing::error!(%error, "Failed to show the main window on the UI thread");
                         }
@@ -222,6 +221,7 @@ pub fn run() {
             screen_picker::pick_screen_color,
             ipc::commands::get_ui_language,
             ipc::commands::set_ui_language,
+            ipc::commands::get_system_accent_color,
             ipc::commands::get_node_info,
             ipc::commands::start_share_link,
             ipc::commands::set_http_config,
@@ -290,54 +290,6 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start NodeSend");
-}
-
-#[cfg(target_os = "windows")]
-fn set_native_window_icon(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use windows::{
-        core::PCWSTR,
-        Win32::{
-            Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
-            System::LibraryLoader::GetModuleHandleW,
-            UI::WindowsAndMessaging::{
-                LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, WM_SETICON,
-            },
-        },
-    };
-
-    let instance = HINSTANCE(
-        unsafe { GetModuleHandleW(PCWSTR::null()) }
-            .map_err(|error| error.to_string())?
-            .0,
-    );
-    let load_icon = |size| unsafe {
-        LoadImageW(
-            Some(instance),
-            PCWSTR::from_raw(32_512usize as *const u16),
-            IMAGE_ICON,
-            size,
-            size,
-            LR_SHARED,
-        )
-    };
-    let small_icon = load_icon(16).map_err(|error| error.to_string())?;
-    let large_icon = load_icon(32).map_err(|error| error.to_string())?;
-    let hwnd = HWND(window.hwnd().map_err(|error| error.to_string())?.0);
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_SETICON,
-            Some(WPARAM(ICON_SMALL as usize)),
-            Some(LPARAM(small_icon.0 as isize)),
-        );
-        SendMessageW(
-            hwnd,
-            WM_SETICON,
-            Some(WPARAM(ICON_BIG as usize)),
-            Some(LPARAM(large_icon.0 as isize)),
-        );
-    }
-    Ok(())
 }
 
 /// 初始化日志（tracing）。RUST_LOG 环境变量可覆盖级别，默认 info。

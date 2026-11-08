@@ -30,7 +30,7 @@ embed-resource = "3"
 
 [dependencies]
 # --- Tauri ---
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["image-png"] }
 tauri-plugin-os = "2"
 
 # --- 异步运行时 / HTTP 服务（内嵌共享 HTTP，基线 §12）---

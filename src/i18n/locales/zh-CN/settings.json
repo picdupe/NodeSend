@@ -23,6 +23,12 @@
   "localAddresses": "本机地址",
   "discovery": "自动发现",
   "version": "版本号",
+  "appearance": {
+    "title": "主题模式",
+    "system": "跟随系统",
+    "light": "浅色",
+    "dark": "深色"
+  },
   "language": {
     "title": "应用语言",
     "description": "选择 NodeSend 的界面显示语言",

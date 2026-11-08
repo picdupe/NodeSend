@@ -84,7 +84,22 @@ pub async fn download_android_update<R: Runtime>(
 pub async fn install_android_update<R: Runtime>(
     app: AppHandle<R>,
     path: String,
+    protocol_version: Option<u16>,
 ) -> Result<(), String> {
+    let requires_idle = crate::update_policy::requires_idle_transfers(protocol_version);
+    let network = app.state::<std::sync::Arc<crate::network::NetworkManager>>();
+    let tasks = network.transfers.snapshots();
+    if crate::update_policy::has_blocking_transfers(
+        tasks.iter().map(|task| task.status.as_str()),
+        requires_idle,
+    ) {
+        let code = if requires_idle {
+            crate::update_policy::BLOCKED_UNFINISHED
+        } else {
+            crate::update_policy::BLOCKED_ACTIVE
+        };
+        return Err(code.into());
+    }
     app.state::<AndroidUpdater<R>>()
         .0
         .run_mobile_plugin_async("installUpdate", InstallArgs { path })

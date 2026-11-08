@@ -46,7 +46,7 @@ export function UpdateDialog({ update, onClose, onSkip }: {
         }
         const path = await downloadAndroidUpdate(update.downloadUrl, update.sha256, update.fallbackUrls ?? []);
         setPhase('installing');
-        await installAndroidUpdate(path);
+        await installAndroidUpdate(path, update.protocolVersion ?? null);
         setPhase('done');
         setMessage(t('updateDialog.androidInstall'));
       } else {

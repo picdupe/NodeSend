@@ -16,6 +16,7 @@ export interface UpdateInfo {
   downloadUrl: string;
   releasePageUrl: string;
   channel: UpdateChannel;
+  protocolVersion?: number | null;
   sha256?: string;
   versionCode?: number;
   fallbackUrls?: string[];
@@ -49,6 +50,7 @@ export async function checkAndroidUpdate(channel: UpdateChannel): Promise<(Updat
     sha256?: string;
     versionCode?: number;
     fallbackUrls?: string[];
+    protocolVersion?: number;
   }>('check_android_update', { channel });
   if (!result.updateAvailable) return null;
   if (!result.version || !result.downloadUrl || !result.sha256 || !result.versionCode) {
@@ -62,6 +64,9 @@ export async function checkAndroidUpdate(channel: UpdateChannel): Promise<(Updat
     downloadUrl: result.downloadUrl,
     releasePageUrl: result.downloadUrl,
     channel,
+    protocolVersion: result.protocolVersion !== undefined && result.protocolVersion >= 0
+      ? result.protocolVersion
+      : null,
     sha256: result.sha256,
     versionCode: result.versionCode,
     fallbackUrls: result.fallbackUrls ?? [],
@@ -72,8 +77,8 @@ export function downloadAndroidUpdate(url: string, sha256: string, fallbackUrls:
   return invoke<string>('download_android_update', { url, sha256, fallbackUrls });
 }
 
-export function installAndroidUpdate(path: string) {
-  return invoke<void>('install_android_update', { path });
+export function installAndroidUpdate(path: string, protocolVersion: number | null = null) {
+  return invoke<void>('install_android_update', { path, protocolVersion });
 }
 
 export function downloadUpdate(onProgress: (progress: UpdateDownloadProgress) => void) {

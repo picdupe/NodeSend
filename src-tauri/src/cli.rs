@@ -580,13 +580,16 @@ pub fn run(owner: bool) -> i32 {
             return 1;
         }
     };
-    match runtime.block_on(run_command(owner)) {
+    let exit_code = match runtime.block_on(run_command(owner)) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("{error}");
             1
         }
-    }
+    };
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    exit_code
 }
 async fn run_command(_owner: bool) -> Result<(), String> {
     let mut args = env::args().skip(1);

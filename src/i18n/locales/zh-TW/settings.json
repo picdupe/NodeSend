@@ -17,6 +17,12 @@
   "localAddresses": "本機位址",
   "discovery": "自動探索",
   "version": "版本",
+  "appearance": {
+    "title": "主題模式",
+    "system": "跟隨系統",
+    "light": "淺色",
+    "dark": "深色"
+  },
   "language": {
     "title": "應用程式語言",
     "description": "選擇 NodeSend 介面顯示語言",

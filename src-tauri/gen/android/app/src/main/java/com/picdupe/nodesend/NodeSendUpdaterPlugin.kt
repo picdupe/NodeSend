@@ -66,7 +66,8 @@ class NodeSendUpdaterPlugin(private val activity: android.app.Activity) : Plugin
                         .put("currentVersion", packageInfo.versionName ?: "").put("currentVersionCode", currentCode)
                         .put("notes", payload.optString("notes", "")).put("downloadUrl", downloadUrl)
                         .put("fallbackUrls", androidUpdate.optJSONArray("fallbackUrls") ?: org.json.JSONArray())
-                        .put("sha256", sha256))
+                        .put("sha256", sha256)
+                        .put("protocolVersion", payload.optInt("protocol_version", -1)))
                 }
             } catch (e: Exception) { invoke.reject(e.message ?: "检查 Android 更新失败。") }
         }

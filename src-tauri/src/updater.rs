@@ -21,6 +21,7 @@ struct PendingUpdate {
     downloaded: Option<Vec<u8>>,
     fallback_endpoints: Vec<String>,
     fallback_download_urls: Vec<String>,
+    protocol_version: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +34,7 @@ pub struct UpdateInfo {
     pub download_url: String,
     pub release_page_url: String,
     pub channel: String,
+    pub protocol_version: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +217,7 @@ pub async fn check_update(
         let Some(update) = update else {
             return Ok(None);
         };
+        let protocol_version = manifest_protocol_version(&update.raw_json);
         let fallback_download_urls = update
             .raw_json
             .get("platforms")
@@ -249,23 +252,29 @@ pub async fn check_update(
             download_url: update.download_url.to_string(),
             release_page_url,
             channel,
+            protocol_version,
         };
         *pending
             .0
             .lock()
-            .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(PendingUpdate {
-            update,
-            downloaded: None,
-            fallback_endpoints: ordered.iter().skip(index + 1).cloned().collect(),
-            fallback_download_urls,
-        });
+            .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+            Some(PendingUpdate {
+                update,
+                downloaded: None,
+                fallback_endpoints: ordered.iter().skip(index + 1).cloned().collect(),
+                fallback_download_urls,
+                protocol_version,
+            });
         return Ok(Some(info));
     }
 
     Err(if failures.is_empty() {
         "No update sources are configured.".into()
     } else {
-        format!("All update sources are unavailable: {}", failures.join("；"))
+        format!(
+            "All update sources are unavailable: {}",
+            failures.join("；")
+        )
     })
 }
 
@@ -288,7 +297,8 @@ pub async fn download_update(
             *pending
                 .0
                 .lock()
-                .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+                .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+                Some(current);
             Ok(())
         }
         Err(original_error) => {
@@ -303,8 +313,11 @@ pub async fn download_update(
                 *pending
                     .0
                     .lock()
-                    .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
-                return Err(format!("Update package signature or version validation failed: {original_error}"));
+                    .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+                    Some(current);
+                return Err(format!(
+                    "Update package signature or version validation failed: {original_error}"
+                ));
             }
             let original_url = current.update.download_url.clone();
             for fallback_url in current.fallback_download_urls.clone() {
@@ -317,7 +330,8 @@ pub async fn download_update(
                     *pending
                         .0
                         .lock()
-                        .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+                        .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+                        Some(current);
                     return Ok(());
                 }
             }
@@ -333,7 +347,9 @@ pub async fn download_update(
                 let Ok(Some(candidate)) = check_source(&app, &endpoint, public_key).await else {
                     continue;
                 };
-                if candidate.version != expected_version {
+                if candidate.version != expected_version
+                    || manifest_protocol_version(&candidate.raw_json) != current.protocol_version
+                {
                     continue;
                 }
                 let _ = on_progress.send(DownloadProgress {
@@ -347,14 +363,16 @@ pub async fn download_update(
                     *pending
                         .0
                         .lock()
-                        .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+                        .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+                        Some(current);
                     return Ok(());
                 }
             }
             *pending
                 .0
                 .lock()
-                .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+                .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+                Some(current);
             Err(format!(
                 "Update source download failed, and no backup source provided the same version: {original_error}"
             ))
@@ -372,11 +390,29 @@ pub async fn install_update(
     if !confirmed {
         return Err("User confirmation is required before installing the update.".into());
     }
+    let requires_idle = {
+        let guard = pending
+            .0
+            .lock()
+            .map_err(|_| "Update status is temporarily unavailable.".to_string())?;
+        let current = guard
+            .as_ref()
+            .ok_or_else(|| "Check for updates and finish downloading first.".to_string())?;
+        crate::update_policy::requires_idle_transfers(current.protocol_version)
+    };
     let status = crate::cli::service_invoke(app, "get_network_status".into(), Value::Null).await?;
-    let unfinished = has_unfinished_transfers(&status)?;
-    if unfinished {
-        tracing::warn!("Update installation blocked because unfinished transfers exist");
-        return Err("UPDATE_BLOCKED_UNFINISHED_TRANSFERS".into());
+    let blocked = has_blocking_transfers(&status, requires_idle)?;
+    if blocked {
+        let code = if requires_idle {
+            crate::update_policy::BLOCKED_UNFINISHED
+        } else {
+            crate::update_policy::BLOCKED_ACTIVE
+        };
+        tracing::warn!(
+            requires_idle,
+            "Update installation blocked by transfer activity"
+        );
+        return Err(code.into());
     }
     let mut current = pending
         .0
@@ -391,7 +427,10 @@ pub async fn install_update(
             .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
         return Err("Update download is incomplete.".into());
     };
-    tracing::info!(bytes = bytes.len(), "Downloaded update package; launching installer");
+    tracing::info!(
+        bytes = bytes.len(),
+        "Downloaded update package; launching installer"
+    );
     match current.update.install(&bytes) {
         Ok(()) => {
             tracing::info!("Update installer started");
@@ -403,13 +442,14 @@ pub async fn install_update(
             *pending
                 .0
                 .lock()
-                .map_err(|_| "Update status is temporarily unavailable.".to_string())? = Some(current);
+                .map_err(|_| "Update status is temporarily unavailable.".to_string())? =
+                Some(current);
             Err(format!("Failed to launch the update installer: {error}"))
         }
     }
 }
 
-fn has_unfinished_transfers(response: &Value) -> Result<bool, String> {
+fn has_blocking_transfers(response: &Value, requires_idle: bool) -> Result<bool, String> {
     if response.get("handled").and_then(Value::as_bool) != Some(true) {
         return Err("The background network service is unavailable.".into());
     }
@@ -417,12 +457,21 @@ fn has_unfinished_transfers(response: &Value) -> Result<bool, String> {
         .pointer("/value/tasks")
         .and_then(Value::as_array)
         .ok_or_else(|| "The background network service returned an invalid status.".to_string())?;
-    Ok(tasks.iter().any(|task| {
-        !matches!(
-            task.get("status").and_then(Value::as_str),
-            Some("completed" | "cancelled" | "rejected" | "partial_completed" | "incompatible")
-        )
-    }))
+    let statuses = tasks
+        .iter()
+        .map(|task| task.get("status").and_then(Value::as_str).unwrap_or(""));
+    Ok(crate::update_policy::has_blocking_transfers(
+        statuses,
+        requires_idle,
+    ))
+}
+
+fn manifest_protocol_version(manifest: &Value) -> Option<u16> {
+    manifest
+        .get("protocol_version")
+        .or_else(|| manifest.get("protocolVersion"))
+        .and_then(Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
 }
 
 #[cfg(test)]
@@ -430,27 +479,32 @@ mod install_update_tests {
     use super::*;
 
     #[test]
-    fn active_transfers_are_read_from_the_shared_service_response() {
+    fn active_transfers_block_updates_when_protocol_is_unchanged_or_changed() {
         let response = serde_json::json!({
             "handled": true,
             "value": {"tasks": [{"status": "transferring"}]}
         });
-        assert!(has_unfinished_transfers(&response).unwrap());
+        assert!(has_blocking_transfers(&response, false).unwrap());
+        assert!(has_blocking_transfers(&response, true).unwrap());
     }
 
     #[test]
-    fn paused_tasks_block_update_installation() {
+    fn paused_tasks_are_allowed_only_when_protocol_is_unchanged() {
         let response = serde_json::json!({
             "handled": true,
             "value": {"tasks": [{"status": "paused"}, {"status": "completed"}]}
         });
-        assert!(has_unfinished_transfers(&response).unwrap());
+        assert!(!has_blocking_transfers(&response, false).unwrap());
+        assert!(has_blocking_transfers(&response, true).unwrap());
     }
 
     #[test]
     fn missing_service_status_is_reported_instead_of_panicking() {
-        assert!(has_unfinished_transfers(&serde_json::json!({"handled": false})).is_err());
-        assert!(has_unfinished_transfers(&serde_json::json!({"handled": true, "value": {}})).is_err());
+        assert!(has_blocking_transfers(&serde_json::json!({"handled": false}), false).is_err());
+        assert!(
+            has_blocking_transfers(&serde_json::json!({"handled": true, "value": {}}), false)
+                .is_err()
+        );
     }
 }
 

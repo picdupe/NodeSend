@@ -8,6 +8,7 @@
 //!    使用 embed-resource 的 compile_for_tests + manifest_required，
 //!    由其负责覆盖 rustc 默认嵌入的清单，只影响测试目标，不污染主程序。
 fn main() {
+    println!("cargo:rerun-if-changed=icons/icon.ico");
     println!("cargo:rerun-if-env-changed=STATIC_VCRUNTIME");
     let mut attributes = tauri_build::Attributes::new();
     // Older CLI versions still inject this variable. Translate it into the
