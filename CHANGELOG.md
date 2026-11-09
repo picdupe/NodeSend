@@ -6,6 +6,7 @@
 ### Fixed
 - Improve theme support and update handling, optimize transfer history
 - Fix CLI output ordering and unsigned build update errors
+- Refine window controls and page header masks
 
 ## [0.1.6] - 2026-11-04
 

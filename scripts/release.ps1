@@ -208,6 +208,56 @@ if ($remoteVersionText -and $remoteVersionText -notmatch '^\d+\.\d+\.\d+$') {
 }
 $remoteVersion = if ($remoteVersionText) { [version]$remoteVersionText } else { $null }
 $localVersion = [version][string]$currentVersion.version
+
+$assetBuilds = @()
+$assetPattern = '^NodeSend_(?:v)?' + [regex]::Escape([string]$currentVersion.version) + '\.(\d+)(?:_x64-setup\.exe(?:\.sig)?|_x64_(?:zh-CN|zh-TW|en-US|ja-JP)\.msi|-arm64-v8a-release\.apk)$'
+foreach ($target in $targets) {
+    foreach ($asset in @($clients[$target].Release.assets)) {
+        $assetName = [string]$asset.name
+        $assetMatch = [regex]::Match($assetName, $assetPattern)
+        if ($assetMatch.Success) {
+            $assetBuilds += [int]$assetMatch.Groups[1].Value
+        }
+    }
+}
+
+$publishedBuild = $null
+if ($assetBuilds.Count -gt 0) {
+    $publishedBuild = ($assetBuilds | Measure-Object -Maximum).Maximum
+    Write-Output "Found published build $publishedBuild in release attachment names."
+} elseif ($githubLatestTag -or $gitcodeLatestTag) {
+    $remoteManifestBuilds = @()
+    foreach ($remoteHead in @($originHead, $gitcodeHead)) {
+        $remoteManifestJson = & $git.Source -C $projectRoot show "${remoteHead}:updates/stable/latest.json" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $remoteManifestJson) { continue }
+        try { $remoteManifest = ($remoteManifestJson -join [Environment]::NewLine) | ConvertFrom-Json } catch { continue }
+        $manifestMatch = [regex]::Match([string]$remoteManifest.version, '^' + [regex]::Escape([string]$currentVersion.version) + '-build\.(\d+)$')
+        if ($manifestMatch.Success) { $remoteManifestBuilds += [int]$manifestMatch.Groups[1].Value }
+    }
+    if ($remoteManifestBuilds.Count -gt 0) {
+        $publishedBuild = ($remoteManifestBuilds | Measure-Object -Maximum).Maximum
+        Write-Output "Release attachments did not expose a build number; using remote latest.json build $publishedBuild."
+    } elseif ($remoteVersion -and $remoteVersion -eq [version][string]$currentVersion.version) {
+        throw 'Could not determine the published build from release attachment names or remote latest.json; refusing to guess and increment.'
+    }
+}
+
+$resumeBuild = $null
+if ($null -ne $publishedBuild) {
+    $localBuild = [int]$currentVersion.build
+    $localManifestPath = Join-Path $projectRoot 'updates/stable/latest.json'
+    $localManifestBuild = $null
+    if (Test-Path -LiteralPath $localManifestPath -PathType Leaf) {
+        $localManifest = Get-Content -LiteralPath $localManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $localManifestMatch = [regex]::Match([string]$localManifest.version, '^' + [regex]::Escape([string]$currentVersion.version) + '-build\.(\d+)$')
+        if ($localManifestMatch.Success) { $localManifestBuild = [int]$localManifestMatch.Groups[1].Value }
+    }
+    if ($null -ne $localManifestBuild -and $localManifestBuild -gt $publishedBuild -and $localManifestBuild -le $localBuild) {
+        $resumeBuild = $localManifestBuild
+    } elseif ($localBuild -gt $publishedBuild) {
+        $resumeBuild = $localBuild
+    }
+}
 if ($remoteVersion -and $remoteVersion -gt $localVersion) {
     throw "Remote release $latestTagForVersion is newer than local version $($currentVersion.version). Update version.json before publishing."
 }
@@ -215,8 +265,24 @@ if ($remoteVersion -and $remoteVersion -gt $localVersion) {
 if ($partialCurrentRelease) {
     & $python.Source $versionScript sync
 } elseif ($remoteVersion -and $remoteVersion -eq $localVersion) {
-    Write-Output "Remote release $latestTagForVersion already uses version $($currentVersion.version); incrementing the build number."
-    & $python.Source $versionScript increment
+    if ($null -ne $resumeBuild) {
+        if ([int]$currentVersion.build -ne $resumeBuild) {
+            $versionPath = Join-Path $projectRoot 'version.json'
+            $currentVersion.build = $resumeBuild
+            [System.IO.File]::WriteAllText($versionPath, (($currentVersion | ConvertTo-Json) + "`n"), [System.Text.UTF8Encoding]::new($false))
+        }
+        Write-Output "A release build $resumeBuild is already prepared locally; reusing it."
+        & $python.Source $versionScript sync
+    } else {
+        if ($null -ne $publishedBuild -and [int]$currentVersion.build -le $publishedBuild) {
+            $currentVersion.build = $publishedBuild
+            $versionPath = Join-Path $projectRoot 'version.json'
+            [System.IO.File]::WriteAllText($versionPath, (($currentVersion | ConvertTo-Json) + "`n"), [System.Text.UTF8Encoding]::new($false))
+        }
+        $publishedLabel = if ($null -ne $publishedBuild) { " after published build $publishedBuild" } else { '' }
+        Write-Output "Remote release $latestTagForVersion already uses version $($currentVersion.version); incrementing the build number$publishedLabel."
+        & $python.Source $versionScript increment
+    }
 } else {
     $remoteLabel = if ($latestTagForVersion) { $latestTagForVersion } else { '(none)' }
     Write-Output "Remote latest release is $remoteLabel; keeping build $($currentVersion.build) for new version $($currentVersion.version)."

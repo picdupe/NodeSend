@@ -7,7 +7,7 @@
 
 [package]
 name = "nodesend"
-version = "0.1.7-build.134"
+version = "0.1.7-build.135"
 default-run = "nodesend"
 description = "NodeSend 跨平台文件传输与共享 Service"
 authors = ["NodeSend"]

@@ -1,24 +1,24 @@
 {
-  "version": "0.1.7-build.134",
+  "version": "0.1.7-build.135",
   "protocol_version": 8,
-  "notes": "Add accent color customization and localized MSI packages\r\nImprove theme support and update handling, optimize transfer history\r\nFix CLI output ordering and unsigned build update errors",
+  "notes": "Refine window controls and page header masks",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0tZdDJpUlFGeFcxbVA0N0EyZUlwQ29RYlNSNzF2U0pHeHBFVHI4MDhwcHNFWUxsTlUxdE9GMEc5amd0L0hPTFk1TGhvV1JGeCtLYk4wbWNLUkM2ZXd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0MTg4Mjc5CWZpbGU6Tm9kZVNlbmRfMC4xLjctYnVpbGQuMTM0X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNy1idWlsZC4xMzQKZDBtRGUyV2J1UGJ4REgrR2dzNTRNaXVra2VteGN6Nmt5NW9TbnpldGZjS1hZa3RVZ0Y5cU4zWlpPUk5kNFRDaFQvdFVQODlYbzh3SS9CeXFpTy9HQUE9PQo=",
-      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_0.1.7.134_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0JKOUE0Mi95OC9NRDV4cUZTTlliSW02eVhURVRLK2NVRnZTcjJsZ085Z2k1aHVWSTB4TUl1TzdLUmY4aWhOUlFaN3I0eHM4TkJxK3JBN2FnS1ZaSFFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0MjM5NDAzCWZpbGU6Tm9kZVNlbmRfMC4xLjctYnVpbGQuMTM1X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNy1idWlsZC4xMzUKWGJaUkd0aXNQUEwxQXEwL29WZHNNUFAwMWs2YVVSdThrOHJOMzhjaGVwblZNT3A2N01IbzBhTW1Wa1o5YWREYTNMcWc0TmYvem9hZ01oL0wzS3VqQVE9PQo=",
+      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_0.1.7.135_x64-setup.exe",
       "fallback_urls": [
-        "https://github.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_0.1.7.134_x64-setup.exe"
+        "https://github.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_0.1.7.135_x64-setup.exe"
       ]
     }
   },
   "release_page_url": "https://gitcode.com/picdupe/NodeSend/releases",
   "android": {
-    "version": "0.1.7.134",
-    "versionCode": 1070134,
-    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_v0.1.7.134-arm64-v8a-release.apk",
+    "version": "0.1.7.135",
+    "versionCode": 1070135,
+    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_v0.1.7.135-arm64-v8a-release.apk",
     "fallbackUrls": [
-      "https://github.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_v0.1.7.134-arm64-v8a-release.apk"
+      "https://github.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_v0.1.7.135-arm64-v8a-release.apk"
     ],
-    "sha256": "69d916b231030f529c58782b055f96ba7fef1ab7487e2274156e43e3183d78ef"
+    "sha256": "df5079ae4f04accf22050bbf93a64fb6dd7a438f45a3a7f2eb5d505aa5cb6e9a"
   }
 }
