@@ -1,8 +1,8 @@
 //! 文件功能：共享访问控制（基线 §16）。
 //!
 //! - 访问者两类：识别出的 NodeSend Node（携带 X-NodeSend-Node-ID）与匿名第三方；
-//! - 根据共享的 [`AccessMode`] 判定：open / token / trusted / deny；
-//! - trusted 模式查 trusted_nodes 表；token 模式比对共享令牌；
+//! - 根据共享的 [`AccessMode`] 判定：open / temporary token / password / trusted；
+//! - trusted 模式查 trusted_nodes 表；令牌与密码模式都校验共享凭据；
 //! - 只影响新访问/新请求，已接受任务不受影响（基线 §16，任务体系为后续迭代）。
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
@@ -33,16 +33,19 @@ pub fn authorize(share: &ShareConfig, caller: &Caller, db: &Db) -> AppResult<()>
     }
 
     match share.access_mode {
-        AccessMode::Deny => Err(AppError::Forbidden("This share denies all access".into())),
         AccessMode::Open => Ok(()),
-        AccessMode::Token => {
+        AccessMode::Token | AccessMode::Password => {
             let expected = share.access_token.as_deref().unwrap_or_default();
             if expected.is_empty() {
-                return Err(AppError::Forbidden("The share has no access token configured".into()));
+                return Err(AppError::Forbidden(
+                    "The share has no access token configured".into(),
+                ));
             }
             match &caller.token {
                 Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => Ok(()),
-                _ => Err(AppError::Forbidden("Access token is missing or incorrect".into())),
+                _ => Err(AppError::Forbidden(
+                    "Access token is missing or incorrect".into(),
+                )),
             }
         }
         AccessMode::Trusted => match &caller.node_id {

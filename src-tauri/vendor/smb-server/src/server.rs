@@ -447,7 +447,26 @@ impl SmbServer {
         if let Some(l) = bound.as_ref() {
             return l.local_addr();
         }
-        let listener = TcpListener::bind(self.state.config.listen_addr).await?;
+        let addr = self.state.config.listen_addr;
+        let socket = socket2::Socket::new(
+            if addr.is_ipv6() {
+                socket2::Domain::IPV6
+            } else {
+                socket2::Domain::IPV4
+            },
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        if addr.is_ipv6() {
+            // Keep IPv6 listeners separate from IPv4 wildcard listeners so
+            // `::` and `0.0.0.0` can safely share a port.
+            socket.set_only_v6(true)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        let listener: std::net::TcpListener = socket.into();
+        let listener = TcpListener::from_std(listener)?;
         let addr = listener.local_addr()?;
         *bound = Some(listener);
         *self.local_addr.lock().await = Some(addr);

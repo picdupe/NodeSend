@@ -205,6 +205,8 @@ pub enum Request {
         share_id: String,
         path: String,
         token: Option<String>,
+        #[serde(default)]
+        offset: u64,
     },
     Put {
         share_id: String,

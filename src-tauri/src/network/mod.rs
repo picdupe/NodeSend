@@ -5,6 +5,7 @@ pub mod protocol;
 pub(crate) mod state;
 pub mod tls;
 pub mod transport;
+pub mod web_downloads;
 use crate::locks::MutexExt;
 use crate::{
     error::{AppError, AppResult},
@@ -54,6 +55,7 @@ pub struct NetworkManager {
     app: Arc<AppService>,
     pub transfers: Arc<TransferService>,
     pub peers: Arc<PeerStore>,
+    pub web_downloads: Arc<web_downloads::WebDownloadManager>,
     pub tcp_port: u16,
     pub quic_port: u16,
     discovery: Option<Discovery>,
@@ -104,14 +106,15 @@ impl NetworkManager {
             }
         }
         let listeners = listeners.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
-                AppError::Other("Failed to bind a TCP listener".into())
-            })
+            last_error.unwrap_or_else(|| AppError::Other("Failed to bind a TCP listener".into()))
         })?;
         let tcp_port = listeners.tcp_port;
         let quic_port = listeners.quic_port;
+        app.set_setting("network_tcp_port", &tcp_port.to_string())?;
+        app.set_setting("network_quic_port", &quic_port.to_string())?;
         let peers = PeerStore::new(app.clone())?;
         let transfers = TransferService::new(app.clone())?;
+        let web_downloads = web_downloads::WebDownloadManager::new(app.clone())?;
         let discovery = options.discovery.then(|| {
             Discovery::start(
                 Announcement {
@@ -140,6 +143,7 @@ impl NetworkManager {
             app,
             transfers,
             peers,
+            web_downloads,
             tcp_port,
             quic_port,
             discovery,
@@ -232,7 +236,12 @@ impl NetworkManager {
                 .collect(),
             discovery,
             peers: self.peers.list(),
-            tasks: self.transfers.snapshots(),
+            tasks: {
+                let mut tasks = self.transfers.snapshots();
+                tasks.extend(self.web_downloads.snapshots());
+                tasks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                tasks
+            },
             receive_directory: self.transfers.default_destination(),
             receive_policy: self
                 .app
@@ -373,7 +382,9 @@ impl NetworkManager {
                         }
                     };
                     if channel.peer_id == self.app.identity.node_id {
-                        return Err(AppError::BadRequest("Cannot add this device as a remote device".into()));
+                        return Err(AppError::BadRequest(
+                            "Cannot add this device as a remote device".into(),
+                        ));
                     }
                     let node_id = channel.peer_id.clone();
                     self.peers.upsert(
@@ -535,7 +546,7 @@ impl NetworkManager {
             }
             tracing::debug!(%peer_id, %last_error, "Pre-send connection check failed");
             return Err(AppError::Other(
-                "Could not connect to this device. Make sure NodeSend is open on the other device and both devices are on the same network.".into(),
+                format!("Could not connect to this device. Make sure NodeSend is open on the other device and both devices are on the same network. Connection detail: {last_error}"),
             ));
         }
         let peer = self.peers.get(&peer_id)?;
@@ -604,11 +615,16 @@ impl NetworkManager {
         Ok(())
     }
     pub async fn action(&self, id: String, action: String) -> AppResult<()> {
+        if self.web_downloads.contains(&id) {
+            return self.web_downloads.action(&id, &action);
+        }
         #[cfg(target_os = "android")]
         if action == "save" {
             let task = self.transfers.record(&id)?;
             if task.direction != "receive" || task.completed_count != task.chunk_count {
-                return Err(AppError::BadRequest("File has not been fully received".into()));
+                return Err(AppError::BadRequest(
+                    "File has not been fully received".into(),
+                ));
             }
             if task.status == "completed" {
                 return crate::android_import::export_received(task)
@@ -806,17 +822,14 @@ impl NetworkManager {
             }
         });
     }
-    pub fn settings(
-        &self,
-        name: String,
-        directory: String,
-        policy: String,
-    ) -> AppResult<()> {
+    pub fn settings(&self, name: String, directory: String, policy: String) -> AppResult<()> {
         if name.trim().is_empty()
             || name.len() > 128
             || !["ask", "trusted", "reject"].contains(&policy.as_str())
         {
-            return Err(AppError::BadRequest("Invalid device name or receive policy".into()));
+            return Err(AppError::BadRequest(
+                "Invalid device name or receive policy".into(),
+            ));
         }
         // 目录允许尚不存在：保存时只做词法校验，真正接收/缓存时才创建。
         crate::transfer::paths::validate_destination(&directory)?;
@@ -966,7 +979,8 @@ async fn refresh_send_addresses(
             error: None,
         };
         if !allow_public && !transport::is_local(ip) {
-            endpoint.error = Some("Peer-advertised address; connectivity has not been verified".into());
+            endpoint.error =
+                Some("Peer-advertised address; connectivity has not been verified".into());
             verified.push(endpoint);
             continue;
         }
@@ -1015,7 +1029,11 @@ async fn resolve_manual_endpoints(node_id: &str, input: &str) -> AppResult<Vec<E
                 error: None,
             })
             .collect();
-        tracing::info!(input, candidates = endpoints.len(), "Using an explicit port");
+        tracing::info!(
+            input,
+            candidates = endpoints.len(),
+            "Using an explicit port"
+        );
         return Ok(endpoints);
     }
 
@@ -1103,11 +1121,11 @@ fn discovery_address(input: &str) -> String {
     if input.starts_with('[') && input.contains("]:") {
         input.to_string()
     } else if input.starts_with('[') {
-        format!("{input}:{}", discovery::UDP_PORT)
+        format!("{input}:{}", discovery::UDP_PORT_START)
     } else if input.matches(':').count() > 1 {
-        format!("[{input}]:{}", discovery::UDP_PORT)
+        format!("[{input}]:{}", discovery::UDP_PORT_START)
     } else {
-        format!("{input}:{}", discovery::UDP_PORT)
+        format!("{input}:{}", discovery::UDP_PORT_START)
     }
 }
 impl Drop for NetworkManager {

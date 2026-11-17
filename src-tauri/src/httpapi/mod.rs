@@ -8,12 +8,18 @@
 //! - 为 [`AppError`] 实现 axum 的 IntoResponse，统一映射为 HTTP 状态码与错误 JSON；
 //! - 对外提供：HELLO、共享列表、目录树、目录列表、文件信息、下载、上传、
 //!   QA Integration 动态 URL（§49）。
+pub mod events;
 pub mod handlers;
 pub mod security;
 pub mod tree;
+pub mod uploads;
+pub mod web_download_ack;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
+};
 
 use axum::{
     http::StatusCode,
@@ -32,11 +38,106 @@ use crate::service::AppService;
 pub struct HttpState {
     pub db: Arc<Db>,
     pub identity: Arc<NodeIdentity>,
+    pub events: Arc<events::ShareEvents>,
+    pub uploads: Arc<uploads::UploadSessions>,
+    pub directory_tree: Option<Arc<RwLock<Vec<tree::DirectoryNode>>>>,
+    pub directory_trees:
+        Option<Arc<RwLock<HashMap<String, Arc<RwLock<Vec<tree::DirectoryNode>>>>>>>,
+    pub dav_handlers: Option<Arc<RwLock<HashMap<String, dav_server::DavHandler>>>>,
+    pub share_scope: Option<String>,
+    pub protocol_scope: Option<crate::share::ShareProtocol>,
+    pub allowed_share_ids: Option<Arc<RwLock<HashSet<String>>>>,
 }
 
 impl HttpState {
-    pub fn new(db: Arc<Db>, identity: Arc<NodeIdentity>) -> Self {
-        Self { db, identity }
+    pub fn new(db: Arc<Db>, identity: Arc<NodeIdentity>, data_dir: &std::path::Path) -> Self {
+        Self {
+            db,
+            identity,
+            events: Arc::new(events::ShareEvents::new()),
+            uploads: Arc::new(uploads::UploadSessions::new(data_dir.join("http-uploads"))),
+            directory_tree: None,
+            directory_trees: None,
+            dav_handlers: None,
+            share_scope: None,
+            protocol_scope: None,
+            allowed_share_ids: None,
+        }
+    }
+
+    pub fn scoped_to_share(mut self, id: String, protocol: crate::share::ShareProtocol) -> Self {
+        self.share_scope = Some(id);
+        self.protocol_scope = Some(protocol);
+        self
+    }
+
+    pub fn scoped_to_protocol(mut self, protocol: crate::share::ShareProtocol) -> Self {
+        self.protocol_scope = Some(protocol);
+        self
+    }
+
+    pub fn with_allowed_share_ids(
+        mut self,
+        allowed_share_ids: Arc<RwLock<HashSet<String>>>,
+    ) -> Self {
+        self.allowed_share_ids = Some(allowed_share_ids);
+        self
+    }
+
+    pub fn with_directory_tree(
+        mut self,
+        directory_tree: Arc<RwLock<Vec<tree::DirectoryNode>>>,
+    ) -> Self {
+        self.directory_tree = Some(directory_tree);
+        self
+    }
+
+    pub fn with_directory_trees(
+        mut self,
+        directory_trees: Arc<RwLock<HashMap<String, Arc<RwLock<Vec<tree::DirectoryNode>>>>>>,
+    ) -> Self {
+        self.directory_trees = Some(directory_trees);
+        self
+    }
+
+    pub fn with_dav_handlers(
+        mut self,
+        dav_handlers: Arc<RwLock<HashMap<String, dav_server::DavHandler>>>,
+    ) -> Self {
+        self.dav_handlers = Some(dav_handlers);
+        self
+    }
+
+    pub fn directory_tree_for(&self, id: &str) -> Option<Arc<RwLock<Vec<tree::DirectoryNode>>>> {
+        self.directory_trees
+            .as_ref()
+            .and_then(|trees| trees.read().ok()?.get(id).cloned())
+            .or_else(|| self.directory_tree.clone())
+    }
+
+    pub fn allows_share(&self, share: &crate::share::ShareConfig) -> bool {
+        if self.allowed_share_ids.as_ref().is_some_and(|ids| {
+            !ids.read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&share.id)
+        }) {
+            return false;
+        }
+        if self
+            .share_scope
+            .as_deref()
+            .is_some_and(|id| id != share.id.as_str())
+        {
+            return false;
+        }
+        match (self.share_scope.as_deref(), self.protocol_scope) {
+            (None, Some(crate::share::ShareProtocol::Http)) => {
+                share.protocol == crate::share::ShareProtocol::Http
+            }
+            (_, Some(protocol)) => share.protocol == protocol,
+            (Some(_), None) => share.protocol == crate::share::ShareProtocol::Nodesend,
+            (None, None) => share.protocol == crate::share::ShareProtocol::Nodesend,
+        }
     }
 }
 
@@ -51,7 +152,12 @@ pub async fn start(state: HttpState, addr: SocketAddr) {
         }
     };
     tracing::info!("HTTP share server started: http://{addr}");
-    if let Err(err) = axum::serve(listener, app).await {
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
         tracing::error!("HTTP share server exited unexpectedly: {err}");
     }
 }
@@ -96,13 +202,21 @@ impl ShareLinkManager {
         if let Some((port, _, _)) = guard.as_ref() {
             return Ok(*port);
         }
-        let state = HttpState::new(Arc::clone(&service.db), Arc::clone(&service.identity));
+        let state = HttpState::new(
+            Arc::clone(&service.db),
+            Arc::clone(&service.identity),
+            &service.paths.data_dir,
+        );
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?;
         let port = listener.local_addr()?.port();
         let app = handlers::router(state);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tauri::async_runtime::spawn(async move {
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
             if let Err(err) = server.await {
@@ -133,7 +247,11 @@ impl HttpManager {
             return Ok(());
         }
 
-        let state = HttpState::new(Arc::clone(&service.db), Arc::clone(&service.identity));
+        let state = HttpState::new(
+            Arc::clone(&service.db),
+            Arc::clone(&service.identity),
+            &service.paths.data_dir,
+        );
         let app = handlers::router(state);
         // 在 spawn 前完成端口绑定：失败直接把错误返回给 UI，而不是静默失败。
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -141,7 +259,11 @@ impl HttpManager {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tauri::async_runtime::spawn(async move {
             tracing::info!("HTTP share server started: http://{addr}");
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
             match server.await {

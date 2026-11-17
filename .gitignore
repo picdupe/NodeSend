@@ -58,6 +58,7 @@ docs/benchmarks/*.jsonl
 # Browser QA
 playwright-report/
 test-results/
+/src-tauri/resources/share-browser/.edge-profile/
 
 # Local signing keys and credentials
 /signing/

@@ -1,0 +1,6 @@
+<WixLocalization Culture="ja-JP" xmlns="http://schemas.microsoft.com/wix/2006/localization">
+  <String Id="LaunchApp">NodeSendを起動</String>
+  <String Id="DowngradeErrorMessage">新しいバージョンのNodeSendがすでにインストールされています。</String>
+  <String Id="PathEnvVarFeature">NodeSend実行ファイルのインストール先をPATHシステム環境変数に追加します。これにより、任意の場所からNodeSendを実行できます。</String>
+  <String Id="InstallAppFeature">NodeSendをインストールします。</String>
+</WixLocalization>

@@ -49,6 +49,22 @@ export function rotateShareToken(id: string): Promise<ShareConfig> {
   return invoke<ShareConfig>('rotate_share_token', { id });
 }
 
+/** 修改密码共享的访问密码 */
+export function changeSharePassword(id: string, password: string): Promise<ShareConfig> {
+  return invoke<ShareConfig>('change_share_password', { id, password });
+}
+
+export function updateShareConnection(input: {
+  id: string;
+  username?: string;
+  password?: string;
+  port: number;
+  bind_ips: string;
+}): Promise<ShareConfig> {
+  const { bind_ips, ...connection } = input;
+  return invoke<ShareConfig>('update_share_connection', { ...connection, bindIps: bind_ips });
+}
+
 /** 删除共享配置 */
 export function deleteShare(id: string): Promise<void> {
   return invoke('delete_share', { id });

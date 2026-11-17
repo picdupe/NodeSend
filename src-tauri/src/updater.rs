@@ -510,6 +510,11 @@ mod install_update_tests {
 
 #[tauri::command]
 pub fn open_update_url(url: String) -> Result<(), String> {
+    open_external_url(url)
+}
+
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
     let url = validate_endpoint(&url)?;
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("rundll32.exe")

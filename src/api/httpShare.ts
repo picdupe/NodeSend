@@ -9,6 +9,7 @@
  */
 import type { ListResponse, ShareConfig, TreeNode } from '../types';
 import i18next from 'i18next';
+import { invoke } from './runtime';
 
 /** 由 NodeInfo.http_listen（如 0.0.0.0:58080）得到浏览器可访问的基地址 */
 export function toHttpBase(httpListen: string): string {
@@ -36,7 +37,7 @@ async function safeFetchJson<T>(url: string): Promise<T> {
 function withToken(share: ShareConfig, url: string): string {
   if (share.access_mode === 'token' && share.access_token) {
     const sep = url.includes('?') ? '&' : '?';
-    return `${url}${sep}access_token=${encodeURIComponent(share.access_token)}`;
+    return `${url}${sep}token=${encodeURIComponent(share.access_token)}`;
   }
   return url;
 }
@@ -85,4 +86,130 @@ export function downloadUrl(
     `${base}/api/v1/shares/${encodeURIComponent(share.id)}/download` +
       `?path=${encodeURIComponent(virtualPath)}`,
   );
+}
+
+export interface ShareSearchResult {
+  name: string;
+  path: string;
+  type: 'file' | 'dir';
+  size: number;
+  modified: string;
+}
+
+export interface UploadSession {
+  id: string;
+  offset: number;
+  size: number;
+  complete: boolean;
+}
+
+export function shareUrl(base: string, share: ShareConfig, endpoint: string, params: Record<string, string> = {}): string {
+  const url = new URL(`${base}/api/v1/shares/${encodeURIComponent(share.id)}/${endpoint}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  return withToken(share, url.toString());
+}
+
+/** Browser directory tree and file actions for a shared folder. */
+export function shareBrowserUrl(base: string, share: ShareConfig): string {
+  return shareUrl(base, share, 'browser');
+}
+
+/** Stable HTTP listener URL; the named path selects the shared directory. */
+export function protocolShareBrowserUrl(base: string, share: ShareConfig): string {
+  const pathParts = share.path.split(/[\\/]/).filter(Boolean);
+  const folderName = pathParts[pathParts.length - 1] || share.name;
+  const url = new URL(`${base.replace(/\/+$/, '')}/${encodeURIComponent(share.protocol_share_name || folderName)}`);
+  return withToken(share, url.toString());
+}
+
+/** Open a share page in the system browser. */
+export function openShareUrl(url: string): Promise<void> {
+  return invoke<void>('open_external_url', { url });
+}
+
+/** Search directory names from the cached tree and files in the current directory. */
+export async function searchShare(
+  base: string,
+  share: ShareConfig,
+  query: string,
+  type?: 'file' | 'dir',
+  limit = 50,
+  path = '',
+): Promise<ShareSearchResult[]> {
+  return safeFetchJson<ShareSearchResult[]>(shareUrl(base, share, 'search', {
+    q: query,
+    path,
+    ...(type ? { type } : {}),
+    limit: String(limit),
+  }));
+}
+
+/** Direct links for browser preview and streamed directory ZIP download. */
+export function previewUrl(base: string, share: ShareConfig, path: string): string {
+  return shareUrl(base, share, 'preview', { path });
+}
+
+export function downloadFolderUrl(base: string, share: ShareConfig, path: string): string {
+  return shareUrl(base, share, 'download-folder', { path });
+}
+
+/** The server sends tree_changed notifications for this share over WebSocket. */
+export function shareEventsUrl(base: string, share: ShareConfig): string {
+  const http = shareUrl(base, share, 'events');
+  return http.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+}
+
+export async function startShareUpload(
+  base: string,
+  share: ShareConfig,
+  name: string,
+  size: number,
+  directory = '',
+  uploadId?: string,
+): Promise<UploadSession> {
+  const response = await fetch(shareUrl(base, share, 'upload/init'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, size, directory, upload_id: uploadId ?? null }),
+  });
+  if (!response.ok) throw new Error(await response.text().catch(() => `HTTP ${response.status}`));
+  return await response.json() as UploadSession;
+}
+
+export async function getShareUpload(
+  base: string,
+  share: ShareConfig,
+  uploadId: string,
+): Promise<UploadSession> {
+  return safeFetchJson<UploadSession>(shareUrl(base, share, `upload/${encodeURIComponent(uploadId)}`));
+}
+
+/** Upload sequential chunks so a reconnect can resume from the server offset. */
+export async function uploadShareFile(
+  base: string,
+  share: ShareConfig,
+  file: File,
+  directory = '',
+  uploadId?: string,
+  onProgress?: (uploaded: number, total: number) => void,
+): Promise<UploadSession> {
+  const session = await startShareUpload(base, share, file.name, file.size, directory, uploadId);
+  if (session.complete) return session;
+  const chunkSize = 4 * 1024 * 1024;
+  let offset = session.offset;
+  while (offset < file.size) {
+    const end = Math.min(offset + chunkSize, file.size);
+    const response = await fetch(shareUrl(base, share, `upload/${encodeURIComponent(session.id)}`), {
+      method: 'PUT',
+      headers: { 'content-range': `bytes=${offset}-${end - 1}/${file.size}` },
+      body: file.slice(offset, end),
+    });
+    if (!response.ok) throw new Error(await response.text().catch(() => `HTTP ${response.status}`));
+    const next = await response.json() as UploadSession;
+    if (next.offset <= offset && !next.complete) throw new Error('Upload made no progress');
+    offset = next.offset;
+    onProgress?.(offset, file.size);
+    if (next.complete) return next;
+  }
+  return getShareUpload(base, share, session.id);
 }

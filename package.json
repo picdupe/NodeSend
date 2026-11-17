@@ -1,13 +1,14 @@
 {
   "name": "nodesend",
   "private": true,
-  "version": "0.1.7-build.135",
+  "version": "0.1.8-build.135",
   "type": "module",
   "description": "NodeSend - 跨平台去中心化 Node ↔ Node 文件传输与共享工具",
   "scripts": {
     "dev": "vite",
     "dev:lan": "vite --host 0.0.0.0",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && npm run build:share-browser",
+    "build:share-browser": "node scripts/build-share-browser.mjs",
     "check:i18n": "node scripts/check-i18n.mjs",
     "preview": "vite preview",
     "tauri": "tauri",

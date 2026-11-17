@@ -61,9 +61,7 @@ pub fn remove(db: &Db, node_id: &str) -> AppResult<()> {
             params![node_id],
         )?;
         if affected == 0 {
-            return Err(AppError::NotFound(format!(
-                "Untrusted Node: {node_id}"
-            )));
+            return Err(AppError::NotFound(format!("Untrusted Node: {node_id}")));
         }
         conn.execute(
             "DELETE FROM settings WHERE key=?1",

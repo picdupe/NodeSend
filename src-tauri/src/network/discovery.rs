@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 pub const SERVICE_TYPE: &str = "_nodesend._tcp.local.";
-pub const UDP_PORT: u16 = 58081;
+pub const UDP_PORT_START: u16 = 8192;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Announcement {
     pub app: String,
@@ -158,7 +158,13 @@ async fn mdns(
             event=receiver.recv_async()=>match event {
                 Ok(ServiceEvent::ServiceResolved(info))=>{
                     let props=info.get_properties();
-                    if props.get("version").map(|v|v.val_str())!=Some("1"){continue;}
+                    if props
+                        .get("version")
+                        .and_then(|value| value.val_str().parse::<u16>().ok())
+                        != Some(VERSION)
+                    {
+                        continue;
+                    }
                     let Some(raw_id)=props.get("node_id").map(|v|v.val_str()) else{continue;};
                     let Some(id)=crate::identity::node_identity::normalize_node_id(raw_id) else{continue;};
                     if id==hello.node_id{continue;}
@@ -195,24 +201,11 @@ async fn udp(
     status: Arc<Mutex<DiscoveryStatus>>,
     stop: tokio_util::sync::CancellationToken,
 ) -> AppResult<()> {
-    #[cfg(target_os = "android")]
-    let socket = {
-        let raw = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, UDP_PORT)))?;
-        raw.set_broadcast(true)?;
-        raw.set_nonblocking(true)?;
-        UdpSocket::from_std(raw)?
-    };
-
-    #[cfg(not(target_os = "android"))]
-    let socket = {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        raw.set_reuse_address(true)?;
-        raw.set_broadcast(true)?;
-        raw.set_nonblocking(true)?;
-        raw.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, UDP_PORT)).into())?;
-        UdpSocket::from_std(raw.into())?
-    };
+    let raw = tokio::task::spawn_blocking(|| bind_udp_socket(UDP_PORT_START))
+        .await
+        .map_err(other)??;
+    let socket = UdpSocket::from_std(raw)?;
+    tracing::info!(port = UDP_PORT_START, "UDP discovery listener started");
     let group = Ipv4Addr::new(239, 255, 58, 81);
     let _ = socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED);
     socket.set_multicast_ttl_v4(1)?;
@@ -224,8 +217,8 @@ async fn udp(
         tokio::select! {
             _=stop.cancelled()=>break,
             _=tick.tick()=>{
-                let _=socket.send_to(&data,(Ipv4Addr::BROADCAST,UDP_PORT)).await;
-                let _=socket.send_to(&data,(group,UDP_PORT)).await;
+                let _=socket.send_to(&data,(Ipv4Addr::BROADCAST,UDP_PORT_START)).await;
+                let _=socket.send_to(&data,(group,UDP_PORT_START)).await;
 
             },
             packet=socket.recv_from(&mut buf)=>{
@@ -259,6 +252,27 @@ async fn udp(
     crate::locks::lock(&status).udp = false;
     Ok(())
 }
+
+fn bind_udp_socket(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    #[cfg(target_os = "android")]
+    {
+        let socket = std::net::UdpSocket::bind(address)?;
+        socket.set_broadcast(true)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_broadcast(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        Ok(socket.into())
+    }
+}
+
 fn other(e: impl std::fmt::Display) -> AppError {
     AppError::Other(e.to_string())
 }

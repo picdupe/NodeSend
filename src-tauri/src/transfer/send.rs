@@ -473,6 +473,15 @@ impl TransferService {
     }
     fn queue_for_file_repair(&self, id: &str, files: &[usize]) -> AppResult<()> {
         let task = self.record(id)?;
+        if !super::recovery::processing(&task.status) || task.status == "finishing" {
+            tracing::debug!(
+                task = %id,
+                status = %task.status,
+                repair_files = files.len(),
+                "Ignored a late file repair request for a task that is no longer active"
+            );
+            return Ok(());
+        }
         let mut ranges = Vec::with_capacity(files.len());
         for file in files {
             let entry = task.manifest.entries.get(*file).ok_or_else(|| {
@@ -484,7 +493,12 @@ impl TransferService {
                 start.saturating_add(entry.size.div_ceil(task.chunk_size) as usize),
             ));
         }
+        let mut queued = false;
         self.edit(id, |task| {
+            if !super::recovery::processing(&task.status) || task.status == "finishing" {
+                return;
+            }
+            queued = true;
             task.completed.retain(|index| {
                 !ranges
                     .iter()
@@ -504,6 +518,14 @@ impl TransferService {
                 ranges.len()
             ));
         })?;
+        if !queued {
+            tracing::debug!(
+                task = %id,
+                repair_files = files.len(),
+                "Ignored a file repair request that arrived after task completion"
+            );
+            return Ok(());
+        }
         self.save_decision(id)?;
         Ok(())
     }

@@ -44,7 +44,7 @@ export function FavoritesDialog({ favorites, peers, error, selectedId, canSend, 
           </button>;
         })}
       </div>}
-      <div className="modal-actions"><button type="button" disabled={!selected} onClick={() => onRemove(selectedId)}>{t('favorites.cancelFavorite')}</button><button type="button" className="primary" disabled={!selected || !canSend} onClick={onSend}>{t('actions.send')}</button></div>
+      <div className="modal-actions"><button type="button" className="primary" disabled={!selected} onClick={() => onRemove(selectedId)}>{t('favorites.cancelFavorite')}</button><button type="button" className="primary" disabled={!selected || !canSend} onClick={onSend}>{t('actions.send')}</button></div>
     </section>
   </div>;
 }

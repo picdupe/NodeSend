@@ -41,7 +41,9 @@ pub fn set_ui_language(state: State<'_, Arc<AppService>>, language: String) -> A
             "Unsupported UI language".into(),
         ));
     }
-    state.set_setting("ui_language", &language)
+    state.set_setting("ui_language", &language)?;
+    crate::httpapi::events::notify_language_changed(&language);
+    Ok(())
 }
 
 #[tauri::command]
@@ -259,14 +261,25 @@ pub(crate) async fn share_protocol_status_service(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateShareInput {
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
     pub path: String,
     #[serde(default = "default_mode")]
     pub access_mode: AccessMode,
     #[serde(default)]
+    pub access_username: Option<String>,
+    #[serde(default)]
+    pub access_password: Option<String>,
+    #[serde(default)]
     pub protocol: ShareProtocol,
     #[serde(default)]
     pub port: u16,
+    #[serde(default = "default_bind_ips")]
+    pub bind_ips: String,
+}
+
+fn default_bind_ips() -> String {
+    String::new()
 }
 
 fn default_mode() -> AccessMode {
@@ -290,15 +303,80 @@ pub(crate) async fn create_share_service(
     let id = generate_id();
     if input.protocol != ShareProtocol::Nodesend && input.access_mode == AccessMode::Trusted {
         return Err(crate::error::AppError::BadRequest(
-            "Choose password or open access for third-party protocols.".into(),
+            "Third-party protocols do not support trusted-device access.".into(),
         ));
     }
-    share_repo::create(&state.db, &id, &input.name, &input.path, input.access_mode)?;
-    let share = share_repo::set_protocol(&state.db, &id, input.protocol, input.port)?;
+    if input.access_mode == AccessMode::Token
+        && !matches!(input.protocol, ShareProtocol::Nodesend | ShareProtocol::Http)
+    {
+        return Err(crate::error::AppError::BadRequest(
+            "Token access is supported only for NodeSend and HTTP shares.".into(),
+        ));
+    }
+    let name = crate::share::resolve_share_name(&input.path, input.name.as_deref())?;
+    let requested_port = match input.protocol {
+        ShareProtocol::Http => 8193,
+        ShareProtocol::Ftp => 21,
+        _ => input.port,
+    };
+    share_repo::create(
+        &state.db,
+        &id,
+        &name,
+        &input.path,
+        input.protocol,
+        requested_port,
+        &input.bind_ips,
+        input.access_mode,
+        input.access_username.as_deref(),
+        input.access_password.as_deref(),
+    )?;
+    let share = match share_repo::get_by_id(&state.db, &id) {
+        Ok(share) => share,
+        Err(error) => {
+            if let Err(cleanup_error) = share_repo::delete(&state.db, &id) {
+                let disable_error = share_repo::set_enabled(&state.db, &id, false).err();
+                tracing::error!(
+                    share_id = %id,
+                    %error,
+                    %cleanup_error,
+                    ?disable_error,
+                    "Failed to load a newly created share and clean up its configuration"
+                );
+            }
+            return Err(error);
+        }
+    };
     match manager.start(state.clone(), &share).await {
-        Ok(port) => share_repo::set_protocol(&state.db, &id, input.protocol, port),
+        Ok(port) => match share_repo::set_protocol(&state.db, &id, input.protocol, port) {
+            Ok(share) => Ok(share),
+            Err(error) => {
+                manager.stop(&id).await;
+                if let Err(cleanup_error) = share_repo::delete(&state.db, &id) {
+                    let disable_error = share_repo::set_enabled(&state.db, &id, false).err();
+                    tracing::error!(
+                        share_id = %id,
+                        %error,
+                        %cleanup_error,
+                        ?disable_error,
+                        "Failed to persist the new share's effective port and clean up its configuration"
+                    );
+                }
+                Err(error)
+            }
+        },
         Err(err) => {
-            let _ = share_repo::delete(&state.db, &id);
+            manager.stop(&id).await;
+            if let Err(cleanup_error) = share_repo::delete(&state.db, &id) {
+                let disable_error = share_repo::set_enabled(&state.db, &id, false).err();
+                tracing::error!(
+                    share_id = %id,
+                    error = %err,
+                    %cleanup_error,
+                    ?disable_error,
+                    "Failed to clean up a share whose listener could not start"
+                );
+            }
             Err(err)
         }
     }
@@ -338,8 +416,15 @@ pub(crate) async fn update_share_service(
             "Third-party protocols do not support trusted-device access.".into(),
         ));
     }
+    if input.access_mode == Some(AccessMode::Token)
+        && !matches!(previous.protocol, ShareProtocol::Nodesend | ShareProtocol::Http)
+    {
+        return Err(crate::error::AppError::BadRequest(
+            "Token access is supported only for NodeSend and HTTP shares.".into(),
+        ));
+    }
     let share = share_repo::update(&state.db, &id, input.name, input.path, input.access_mode)?;
-    restart_share(&state, &manager, share).await
+    restart_share_with_rollback(&state, &manager, share, previous).await
 }
 
 #[tauri::command]
@@ -358,8 +443,9 @@ pub(crate) async fn toggle_share_service(
     id: String,
     enabled: bool,
 ) -> AppResult<ShareConfig> {
+    let previous = share_repo::get_by_id(&state.db, &id)?;
     let share = share_repo::set_enabled(&state.db, &id, enabled)?;
-    restart_share(&state, &manager, share).await
+    restart_share_with_rollback(&state, &manager, share, previous).await
 }
 
 #[tauri::command]
@@ -376,8 +462,106 @@ pub(crate) async fn rotate_share_token_service(
     manager: Arc<ProtocolManager>,
     id: String,
 ) -> AppResult<ShareConfig> {
+    let previous = share_repo::get_by_id(&state.db, &id)?;
     let share = share_repo::rotate_token(&state.db, &id)?;
-    restart_share(&state, &manager, share).await
+    restart_share_with_rollback(&state, &manager, share, previous).await
+}
+
+#[tauri::command]
+pub async fn change_share_password(
+    state: State<'_, Arc<AppService>>,
+    manager: State<'_, Arc<ProtocolManager>>,
+    id: String,
+    password: String,
+) -> AppResult<ShareConfig> {
+    change_share_password_service(state.inner().clone(), manager.inner().clone(), id, password)
+        .await
+}
+
+pub(crate) async fn change_share_password_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
+    id: String,
+    password: String,
+) -> AppResult<ShareConfig> {
+    let previous = share_repo::get_by_id(&state.db, &id)?;
+    let share = share_repo::change_password(&state.db, &id, &password)?;
+    restart_share_with_rollback(&state, &manager, share, previous).await
+}
+
+#[tauri::command]
+pub async fn update_share_connection(
+    state: State<'_, Arc<AppService>>,
+    manager: State<'_, Arc<ProtocolManager>>,
+    id: String,
+    username: Option<String>,
+    password: Option<String>,
+    port: u16,
+    bind_ips: String,
+) -> AppResult<ShareConfig> {
+    update_share_connection_service(
+        state.inner().clone(),
+        manager.inner().clone(),
+        id,
+        username,
+        password,
+        port,
+        bind_ips,
+    )
+    .await
+}
+
+pub(crate) async fn update_share_connection_service(
+    state: Arc<AppService>,
+    manager: Arc<ProtocolManager>,
+    id: String,
+    username: Option<String>,
+    password: Option<String>,
+    port: u16,
+    bind_ips: String,
+) -> AppResult<ShareConfig> {
+    let previous = share_repo::get_by_id(&state.db, &id)?;
+    let share = share_repo::update_connection(
+        &state.db,
+        &id,
+        username.as_deref(),
+        password.as_deref(),
+        port,
+        &bind_ips,
+    )?;
+    restart_share_with_rollback(&state, &manager, share, previous).await
+}
+
+async fn restart_share_with_rollback(
+    state: &Arc<AppService>,
+    manager: &ProtocolManager,
+    updated: ShareConfig,
+    previous: ShareConfig,
+) -> AppResult<ShareConfig> {
+    match restart_share(state, manager, updated).await {
+        Ok(updated) => Ok(updated),
+        Err(update_error) => {
+            let recovery = async {
+                let restored = share_repo::restore_share_config(&state.db, &previous)?;
+                restart_share(state, manager, restored).await.map(|_| ())
+            }
+            .await;
+            match recovery {
+                Ok(()) => Err(update_error),
+                Err(recovery_error) => {
+                    tracing::error!(
+                        share_id = %previous.id,
+                        %update_error,
+                        %recovery_error,
+                        "Failed to apply edited share settings and could not restore the previous configuration"
+                    );
+                    Err(crate::error::AppError::Other(format!(
+                        "Failed to apply share settings: {update_error}; restoring the previous settings also failed: {recovery_error}"
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -394,6 +578,7 @@ pub(crate) async fn delete_share_service(
     manager: Arc<ProtocolManager>,
     id: String,
 ) -> AppResult<()> {
+    share_repo::set_enabled(&state.db, &id, false)?;
     manager.stop(&id).await;
     share_repo::delete(&state.db, &id)
 }

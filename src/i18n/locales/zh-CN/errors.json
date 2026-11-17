@@ -23,6 +23,9 @@
     "sourceUnavailableResume": "源文件暂时无法访问，可恢复重试：{{file}}",
     "noFiles": "没有可发送的文件。",
     "connectionUnreachable": "暂时无法连接这台设备。请确认对方已打开 NodeSend，并且两台设备连接到同一网络。",
+    "connectionUnreachableDetail": "暂时无法连接这台设备。请确认对方已打开 NodeSend，并且两台设备连接到同一网络。连接详情：{{detail}}",
+    "protocolMismatch": "无法连接：两台设备的 NodeSend 通信协议版本不一致。请在两台设备上安装相同版本。",
+    "protocolHandshakeClosed": "NodeSend 握手被对端关闭，可能是两端协议版本不一致。请确认两台设备使用兼容的 NodeSend 版本后重试。",
     "connectionRefused": "对方设备没有接受连接。请确认 NodeSend 正在运行，并检查防火墙设置。",
     "receiveDirectorySpace": "接收目录空间不足（已计入其他任务的预留空间）。请释放磁盘空间或更换接收目录后重试。",
     "timedOut": "连接设备超时。请确认对方在线，并检查网络和防火墙。",
@@ -34,6 +37,13 @@
     "invalidLanguage": "不支持所选语言。",
     "unfinishedTransfers": "传输协议已更新。请先完成或取消所有未完成的传输，再安装更新。",
     "pauseTransfers": "请先暂停进行中的传输，再安装更新。"
+  },
+  "shares": {
+    "duplicatePathProtocol": "此文件夹已通过所选协议共享，不能重复添加。",
+    "smbCredentialConflict": "同一 SMB 监听器中，相同用户名不能设置不同密码。请为此共享使用不同用户名，或修改监听端口。",
+    "connectionChangedDuringReopen": "连接信息已更改，请重新打开连接。",
+    "invalidListenIp": "监听 IP 格式无效：{{ip}}",
+    "bindIpWildcardConflict": "通配监听 IP 不能与同一地址族的具体 IP 同时使用。"
   },
   "update": {
     "unsignedBuild": "当前安装的是未配置更新验证签名的调试版本，无法使用应用内检查更新。请安装已签名的 NodeSend 版本。",
