@@ -18,20 +18,25 @@ export interface HttpConfigInput {
 }
 
 /** 共享访问模式（对应 Rust AccessMode） */
-export type AccessMode = 'open' | 'token' | 'trusted' | 'deny';
-export type ShareProtocol = 'nodesend' | 'webdav' | 'smb' | 'ftp';
+export type AccessMode = 'open' | 'token' | 'password' | 'trusted';
+export type ShareProtocol = 'nodesend' | 'http' | 'smb' | 'ftp';
 export interface ProtocolStatus { id: string; running: boolean; port: number; error: string | null }
 
 /** 共享目录配置（对应 Rust ShareConfig） */
 export interface ShareConfig {
   protocol: ShareProtocol;
   port: number;
+  port_explicit: boolean;
+  requested_port: number;
+  protocol_share_name: string;
+  bind_ips: string;
   id: string;
   name: string;
   path: string;
   enabled: boolean;
   access_mode: AccessMode;
   access_token: string | null;
+  access_username: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -40,9 +45,12 @@ export interface ShareConfig {
 export interface CreateShareInput {
   protocol?: ShareProtocol;
   port?: number;
-  name: string;
+  name?: string;
   path: string;
   access_mode?: AccessMode;
+  access_username?: string;
+  access_password?: string;
+  bind_ips?: string;
 }
 
 /** 已信任 Node（对应 Rust registry::TrustedNode） */

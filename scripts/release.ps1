@@ -133,6 +133,7 @@ $savedCredentials = @{
 }
 
 $tag = "v$($currentVersion.version)"
+$releaseName = "NodeSend $tag"
 $targets = @('github', 'gitcode')
 $clients = @{}
 foreach ($target in $targets) {
@@ -410,12 +411,12 @@ foreach ($target in $targets) {
     if (-not $entry.NeedsCreate) { continue }
     if ($target -eq 'github') {
         $entry.Release = Send-JsonRequest $entry.Client 'POST' "$($entry.Base)/releases" @{
-            tag_name = $tag; target_commitish = 'main'; name = $tag; body = $notes;
+            tag_name = $tag; target_commitish = 'main'; name = $releaseName; body = $notes;
             draft = $false; prerelease = $false
         }
     } else {
         $entry.Release = Send-JsonRequest $entry.Client 'POST' "$($entry.Base)/releases`?access_token=$($entry.Token)" @{
-            tag_name = $tag; target_commitish = 'main'; name = $tag; body = $notes;
+            tag_name = $tag; target_commitish = 'main'; name = $releaseName; body = $notes;
             prerelease = $false
         }
     }
@@ -425,11 +426,11 @@ foreach ($target in $targets) {
 
 foreach ($target in $targets) {
     $entry = $clients[$target]
-    if ([string]$entry.Release.body -ceq $notes) { continue }
+    if ([string]$entry.Release.body -ceq $notes -and [string]$entry.Release.name -ceq $releaseName) { continue }
     if ($target -eq 'github') {
-        $entry.Release = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$($entry.Release.id)" @{ body = $notes }
+        $entry.Release = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$($entry.Release.id)" @{ name = $releaseName; body = $notes }
     } else {
-        $entry.Release = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$tag`?access_token=$($entry.Token)" @{ name = [string]$entry.Release.name; body = $notes }
+        $entry.Release = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$tag`?access_token=$($entry.Token)" @{ name = $releaseName; body = $notes }
     }
     Write-Output "Updated the $target release description from CHANGELOG.md."
 }
@@ -510,14 +511,14 @@ try {
         if ($target -eq 'github') {
             $oldAssets = Get-ManagedOldAssets $updated.assets $currentNames
             foreach ($asset in $oldAssets) { $null = Send-JsonRequest $entry.Client 'DELETE' "$($entry.Base)/releases/assets/$($asset.id)" }
-            $null = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$($updated.id)" @{ body = $notes }
+            $null = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$($updated.id)" @{ name = $releaseName; body = $notes }
         } else {
             $oldAssets = Get-ManagedOldAssets $updated.assets $currentNames
             foreach ($asset in $oldAssets) {
                 $deleteUri = "$($entry.Base)/releases/$tag/attach_files/$($asset.id)`?access_token=$($entry.Token)"
                 $null = Send-JsonRequest $entry.Client 'DELETE' $deleteUri
             }
-            $null = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$tag`?access_token=$($entry.Token)" @{ name = [string]$updated.name; body = $notes }
+            $null = Send-JsonRequest $entry.Client 'PATCH' "$($entry.Base)/releases/$tag`?access_token=$($entry.Token)" @{ name = $releaseName; body = $notes }
         }
     }
 

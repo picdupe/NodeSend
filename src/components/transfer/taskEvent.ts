@@ -140,7 +140,7 @@ export function translateTaskEvent(value: string, t: Translate): string {
       cancelled: 'cancelled', rejected: 'rejected',
     };
     const statusKey = statusKeys[dynamic[1].toLowerCase()];
-    const status = statusKey ? t(`transfer:tasks.peerStatusValues.${statusKey}`) : t('transfer:tasks.events.unknownPeerStatus');
+    const status = statusKey ? t(`transfer:tasks.events.peerStatusValues.${statusKey}`) : t('transfer:tasks.events.unknownPeerStatus');
     return t('transfer:tasks.events.peerStatus', { status });
   }
 

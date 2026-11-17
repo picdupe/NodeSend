@@ -44,6 +44,19 @@ impl GuardedFs {
     }
 }
 impl DavFileSystem for GuardedFs {
+    fn get_quota(&'_ self) -> FsFuture<'_, (u64, Option<u64>)> {
+        let root = self.root.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let total = fs2::total_space(&root).map_err(|_| FsError::GeneralFailure)?;
+                let available = fs2::available_space(&root).map_err(|_| FsError::GeneralFailure)?;
+                Ok((total.saturating_sub(available), Some(total)))
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?
+        })
+    }
+
     fn open<'a>(
         &'a self,
         path: &'a DavPath,

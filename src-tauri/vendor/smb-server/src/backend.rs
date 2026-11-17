@@ -158,6 +158,12 @@ pub struct BackendCapabilities {
 /// per-request handlers freely.
 #[async_trait]
 pub trait ShareBackend: Send + Sync + 'static {
+    /// Total and currently available bytes on the filesystem containing this
+    /// share. Backends without a real filesystem can leave this unavailable.
+    fn volume_space(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Open or create a file or directory. Returns a fresh handle.
     async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>>;
 

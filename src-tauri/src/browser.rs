@@ -80,6 +80,7 @@ pub struct BrowserListing {
 struct Session {
     public: BrowserConnection,
     password: Option<String>,
+    revision: u64,
 }
 
 pub struct BrowserManager {
@@ -109,6 +110,7 @@ impl BrowserManager {
                 Session {
                     public,
                     password: None,
+                    revision: 0,
                 },
             );
         }
@@ -141,9 +143,10 @@ impl BrowserManager {
             connected: true,
             saved_credential: None,
         };
-        let session = Session {
+        let mut session = Session {
             public: public.clone(),
             password: input.password.clone(),
+            revision: 0,
         };
         self.check_connection(&session).await?;
         public.saved_credential = input
@@ -151,6 +154,7 @@ impl BrowserManager {
             .as_deref()
             .map(|value| self.encrypt_credential(value))
             .transpose()?;
+        session.public.saved_credential = public.saved_credential.clone();
         self.persist(&public)?;
         crate::locks::lock(&self.sessions).insert(id, session);
         Ok(public)
@@ -169,12 +173,15 @@ impl BrowserManager {
 
     pub fn close(&self, id: &str) -> AppResult<()> {
         let mut sessions = crate::locks::lock(&self.sessions);
-        let session = sessions
-            .get_mut(id)
+        let mut session = sessions
+            .get(id)
+            .cloned()
             .ok_or_else(|| AppError::NotFound("Connection label not found".into()))?;
         session.public.connected = false;
         session.password = None;
+        session.revision = session.revision.wrapping_add(1);
         self.persist(&session.public)?;
+        sessions.insert(id.to_string(), session);
         Ok(())
     }
 
@@ -185,6 +192,7 @@ impl BrowserManager {
             .get(id)
             .cloned()
             .ok_or_else(|| AppError::NotFound("Connection configuration does not exist".into()))?;
+        let expected_revision = session.revision;
         let entered_password = password.filter(|value| !value.is_empty());
         session.password = match entered_password.clone() {
             Some(value) => Some(value),
@@ -195,10 +203,18 @@ impl BrowserManager {
         if let Some(value) = entered_password.as_deref() {
             session.public.saved_credential = Some(self.encrypt_credential(value)?);
         }
+        let mut sessions = crate::locks::lock(&self.sessions);
+        let current = sessions
+            .get(id)
+            .ok_or_else(|| AppError::NotFound("Connection configuration does not exist".into()))?;
+        if current.revision != expected_revision {
+            return Err(AppError::Conflict(
+                "BROWSER_CONNECTION_CHANGED_DURING_REOPEN".into(),
+            ));
+        }
+        session.revision = expected_revision.wrapping_add(1);
         self.persist(&session.public)?;
-        self.sessions
-            .lock_or_recover()
-            .insert(id.to_string(), session.clone());
+        sessions.insert(id.to_string(), session.clone());
         Ok(session.public)
     }
 
@@ -220,6 +236,7 @@ impl BrowserManager {
                 saved_credential: None,
             },
             password: input.password,
+            revision: 0,
         };
         self.check_connection(&session).await
     }
@@ -231,29 +248,31 @@ impl BrowserManager {
         }
         validate_address(input.protocol, &address)?;
         let mut sessions = crate::locks::lock(&self.sessions);
-        let session = sessions
-            .get_mut(id)
+        let mut session = sessions
+            .get(id)
+            .cloned()
             .ok_or_else(|| AppError::NotFound("Connection configuration does not exist".into()))?;
         session.public.name = input.name.trim().to_string();
         session.public.protocol = input.protocol;
         session.public.address = address;
         session.public.username = input.username;
-        if input.password.is_some() {
-            session.password = input.password.clone();
+        if let Some(password) = input.password.filter(|value| !value.is_empty()) {
+            session.password = Some(password.clone());
+            session.public.saved_credential = Some(self.encrypt_credential(&password)?);
+        } else if let Some(password) = session.password.as_deref() {
+            session.public.saved_credential = Some(self.encrypt_credential(password)?);
         }
-        session.public.saved_credential = session
-            .password
-            .as_deref()
-            .map(|value| self.encrypt_credential(value))
-            .transpose()?;
         session.public.connected = false;
+        session.password = None;
+        session.revision = session.revision.wrapping_add(1);
         self.persist(&session.public)?;
-        Ok(session.public.clone())
+        sessions.insert(id.to_string(), session.clone());
+        Ok(session.public)
     }
 
     pub fn remove_connection(&self, id: &str) -> AppResult<()> {
-        let removed = crate::locks::lock(&self.sessions).remove(id);
-        if removed.is_none() {
+        let mut sessions = crate::locks::lock(&self.sessions);
+        if !sessions.contains_key(id) {
             return Err(AppError::NotFound("Connection configuration does not exist".into()));
         }
         self.app.db.with_conn(|conn| {
@@ -262,7 +281,9 @@ impl BrowserManager {
                 rusqlite::params![id],
             )?;
             Ok(())
-        })
+        })?;
+        sessions.remove(id);
+        Ok(())
     }
 
     pub async fn browse(&self, id: &str, path: String) -> AppResult<BrowserListing> {
@@ -736,7 +757,12 @@ fn join_url(root: &str, path: &str) -> String {
 fn ftp_path(s: &Session, path: &str) -> AppResult<String> {
     let url =
         url::Url::parse(&s.public.address).map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let base = url.path().trim_end_matches('/');
+    let decoded_base = urlencoding::decode(url.path())
+        .map_err(|_| AppError::BadRequest("FTP address path is invalid".into()))?;
+    if decoded_base.chars().any(char::is_control) {
+        return Err(AppError::BadRequest("FTP address path is invalid".into()));
+    }
+    let base = decoded_base.trim_end_matches('/');
     if path.is_empty() {
         Ok(if base.is_empty() {
             "/".into()

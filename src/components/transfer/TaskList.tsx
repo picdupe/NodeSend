@@ -17,7 +17,11 @@ export function TaskList({ tasks, refresh, toolbarOnly = false, hideToolbar = fa
   const [busy, setBusy] = useState<string[]>([]);
   async function action(id: string, op: string) { setBusy(old => [...old, id]); try { await transferAction(id, op); setError(null); await refresh(); } catch (e) { setError({ taskId: id, message: errorText(e) }); } finally { setBusy(old => old.filter(v => v !== id)); } }
   useEffect(() => { if (error && tasks.some(task => task.id === error.taskId && (['accepted', 'transferring', 'completed', 'interrupted', 'remote_offline'].includes(task.status) || task.error === error.message))) setError(null); }, [tasks, error]);
-  const visible = tasks.filter(t => (filter === 'all' || filter === t.direction || (filter === 'active' && !terminal(t.status))) && (t.peer_name + ' ' + t.peer_id).toLowerCase().includes(search.toLowerCase()));
+  const query = search.trim().toLocaleLowerCase();
+  const visible = tasks.filter(task =>
+    (filter === 'all' || filter === task.direction || (filter === 'active' && !terminal(task.status)))
+    && `${task.peer_name} ${task.peer_id} ${task.file_name}`.toLocaleLowerCase().includes(query),
+  );
   const toolbar = <div className="task-toolbar task-toolbar-fixed"><div className="segments" role="group" aria-label={t('transfer:tasks.all')}>{[['all', 'transfer:tasks.all'], ['active', 'transfer:tasks.active'], ['send', 'transfer:tasks.send'], ['receive', 'transfer:tasks.receive']].map(([key, label]) => <button key={key} aria-pressed={filter === key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{t(label)}</button>)}</div><input className="search-field" aria-label={t('common:actions.search')} placeholder={t('transfer:tasks.search')} value={search} onChange={e => setSearch(e.target.value)} /></div>;
   if (toolbarOnly) return toolbar;
   return <>

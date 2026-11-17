@@ -13,6 +13,161 @@ use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryNode {
+    pub name: String,
+    /// 相对共享根的虚拟路径（始终以 / 风格表示）。
+    pub path: String,
+}
+
+/// Build a directory-only tree snapshot for a newly created HTTP share.
+/// Files are not added to the snapshot or inspected beyond checking entry types.
+pub fn build_directory_tree(real_root: &Path) -> AppResult<Vec<DirectoryNode>> {
+    let base_real = real_root.canonicalize()?;
+    collect_directory_tree(&base_real, &base_real, "")
+}
+
+fn collect_directory_tree(
+    base_real: &Path,
+    start_real: &Path,
+    virtual_root: &str,
+) -> AppResult<Vec<DirectoryNode>> {
+    let mut pending = vec![(start_real.to_path_buf(), virtual_root.to_owned())];
+    let mut directories = Vec::new();
+
+    while let Some((real_parent, virtual_parent)) = pending.pop() {
+        let entries = match std::fs::read_dir(&real_parent) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(directory = %real_parent.display(), "Directory tree skipped an unreadable directory: {error}");
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let Ok(real_path) = entry.path().canonicalize() else {
+                continue;
+            };
+            if !real_path.starts_with(base_real) {
+                continue;
+            }
+
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if crate::httpapi::security::is_upload_staging_name(&name) {
+                continue;
+            }
+            let path = if virtual_parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{virtual_parent}/{name}")
+            };
+            directories.push(DirectoryNode {
+                name,
+                path: path.clone(),
+            });
+            pending.push((real_path, path));
+        }
+    }
+
+    directories.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+    Ok(directories)
+}
+
+/// Refresh cached directory branches affected by filesystem watcher events.
+pub fn refresh_directory_tree_paths(
+    real_root: &Path,
+    snapshot: &mut Vec<DirectoryNode>,
+    paths: &[String],
+) {
+    let Ok(base_real) = real_root.canonicalize() else {
+        return;
+    };
+    for path in paths {
+        let Ok(relative) = crate::httpapi::security::validate_virtual(path) else {
+            continue;
+        };
+        let virtual_path = normalize_virt(&relative.to_string_lossy());
+        if virtual_path.is_empty() {
+            continue;
+        }
+        snapshot.retain(|directory| {
+            directory.path != virtual_path
+                && !directory.path.starts_with(&format!("{virtual_path}/"))
+        });
+
+        let candidate = base_real.join(&relative);
+        let Ok(real_path) = candidate.canonicalize() else {
+            continue;
+        };
+        if !real_path.starts_with(&base_real) || !real_path.is_dir() {
+            continue;
+        }
+        let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        snapshot.push(DirectoryNode {
+            name: name.to_owned(),
+            path: virtual_path.clone(),
+        });
+        if let Ok(mut descendants) = collect_directory_tree(&base_real, &real_path, &virtual_path) {
+            snapshot.append(&mut descendants);
+        }
+    }
+    snapshot.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+}
+
+/// Refresh the immediate directory children of a browsed directory in a cached snapshot.
+pub fn merge_directory_listing(
+    snapshot: &mut Vec<DirectoryNode>,
+    parent: &str,
+    entries: &[TreeNode],
+) {
+    let parent = normalize_virt(parent);
+    let child_directories = entries
+        .iter()
+        .filter(|entry| entry.node_type == NodeType::Dir)
+        .map(|entry| DirectoryNode {
+            name: entry.name.clone(),
+            path: normalize_virt(&entry.path),
+        })
+        .collect::<Vec<_>>();
+    let current_paths = child_directories
+        .iter()
+        .map(|directory| directory.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let removed_paths = snapshot
+        .iter()
+        .filter(|directory| parent_path(&directory.path) == parent)
+        .filter(|directory| !current_paths.contains(&directory.path))
+        .map(|directory| directory.path.clone())
+        .collect::<Vec<_>>();
+
+    snapshot.retain(|directory| {
+        !removed_paths.iter().any(|removed| {
+            directory.path == *removed || directory.path.starts_with(&format!("{removed}/"))
+        })
+    });
+    for directory in child_directories {
+        if !snapshot.iter().any(|known| known.path == directory.path) {
+            snapshot.push(directory);
+        }
+    }
+}
+
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
@@ -86,6 +241,13 @@ fn collect_children(
     // 先收集 (真实路径, 虚拟路径, 是否目录)，再排序，保证顺序稳定。
     let mut items: Vec<(PathBuf, String, bool)> = Vec::new();
     for entry in entries.flatten() {
+        let child_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        if crate::httpapi::security::is_upload_staging_name(&child_name) {
+            continue;
+        }
         let child_real = match entry.path().canonicalize() {
             Ok(path) => path,
             Err(_) => continue,
@@ -94,10 +256,6 @@ fn collect_children(
             tracing::warn!(path = %child_real.display(), "Detected a path traversal (possibly a symbolic link); skipped");
             continue;
         }
-        let child_name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => continue,
-        };
         let child_virt = join_virt(virt, &child_name);
         let is_dir = child_real.is_dir();
         items.push((child_real, child_virt, is_dir));

@@ -1,13 +1,13 @@
 # =============================================================================
 # 文件功能：NodeSend Rust Service 的 Cargo 清单。
-# - 声明 Rust 后端全部依赖；不使用 Node.js 作为后端（基线 §1）；
+# - 声明 Rust 后端全部依赖；
 # - crate 划分：db / identity / share / access / httpapi / service / ipc；
 # - rusqlite 使用 bundled 特性（源码编译 SQLite，不依赖系统库）。
 # =============================================================================
 
 [package]
 name = "nodesend"
-version = "0.1.7-build.135"
+version = "0.1.8-build.136"
 default-run = "nodesend"
 description = "NodeSend 跨平台文件传输与共享 Service"
 authors = ["NodeSend"]
@@ -35,9 +35,15 @@ tauri-plugin-os = "2"
 
 # --- 异步运行时 / HTTP 服务（内嵌共享 HTTP，基线 §12）---
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.7", features = ["multipart", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+notify = "8"
+mime_guess = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+rawler = "0.8.0"
+zip = { version = "4.6.1", default-features = false }
 crossterm = "0.29"
 
 # --- 本地 Node 发现与原生传输 ---
@@ -103,7 +109,7 @@ rfd = "0.15"
 tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 smb2 = "0.27"
@@ -140,6 +146,14 @@ opt-level = 3
 # Hardware SHA instructions still need optimized surrounding code. Keep chunk
 # SHA-256 fast in debug builds without changing the wire format or verification.
 [profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.rawler]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
 opt-level = 3
 
 [profile.release]

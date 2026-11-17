@@ -17,7 +17,7 @@ CREATE TABLE trusted_nodes (
 -- 共享目录配置（共享虚拟根，不暴露绝对路径；基线 §11）。
 CREATE TABLE shares (
     id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,           -- 自定义共享名称
+    name         TEXT NOT NULL,                  -- 自定义共享名称
     path         TEXT NOT NULL,                 -- 本机绝对路径（仅服务端使用）
     enabled      INTEGER NOT NULL DEFAULT 1,    -- 0/1
     access_mode  TEXT NOT NULL DEFAULT 'token', -- open | token | trusted | deny（§16）

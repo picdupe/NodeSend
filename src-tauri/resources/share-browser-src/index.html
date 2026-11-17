@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" type="image/svg+xml" href="/share-ui/favicon.svg" />
+    <title>NodeSend</title>
+    <script type="module" crossorigin src="/src/main.js"></script>
+    <link rel="stylesheet" crossorigin href="/share-ui/webui.css">
+    <script type="module" src="/share-ui/language.js"></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --share-menu-surface: #fff;
+        --share-menu-border: #dfe5ed;
+        --share-trigger-border: #c9d4e2;
+        --share-menu-text: #344256;
+        --share-menu-muted: #687385;
+        --share-menu-hover: #edf3ff;
+        --share-menu-accent: #1f6feb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --share-menu-surface: #202939;
+          --share-menu-border: #344052;
+          --share-trigger-border: #465570;
+          --share-menu-text: #e0e5ef;
+          --share-menu-muted: #9ba8bc;
+          --share-menu-hover: #293247;
+          --share-menu-accent: #8ebcff;
+        }
+      }
+      img.brand-mark { background: transparent; box-shadow: none; object-fit: contain; }
+      .native-sort-select, .native-language-select { display: none !important; }
+      .sort-dropdown { position: relative; flex: none; z-index: 25; }
+      .view-switch .sort-dropdown-trigger, .language-dropdown .sort-dropdown-trigger { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-width: 136px; height: 34px; padding: 0 11px; border: 1px solid var(--share-trigger-border); border-radius: 8px; background: var(--share-menu-surface); color: var(--share-menu-muted); font: inherit; font-size: 12px; cursor: pointer; }
+      .sort-dropdown-trigger:hover, .sort-dropdown-trigger:focus-visible { border-color: var(--share-menu-accent); }
+      .sort-dropdown-trigger:focus-visible, .sort-dropdown-option:focus-visible { outline: 2px solid var(--share-menu-accent); outline-offset: 2px; }
+      .language-dropdown { min-width: 150px; }
+      .language-dropdown .sort-dropdown-trigger { width: 100%; min-width: 150px; height: 32px; }
+      .sort-dropdown-chevron { width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg) translateY(-2px); flex: none; }
+      .sort-dropdown-menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 100%; padding: 5px; border: 1px solid var(--share-menu-border); border-radius: 9px; background: var(--share-menu-surface); color: var(--share-menu-text); box-shadow: 0 10px 28px #0004; display: none; }
+      .sort-dropdown.open .sort-dropdown-menu { display: grid; }
+      .sort-dropdown-option { width: 100%; min-height: 32px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 12px; text-align: left; white-space: nowrap; cursor: pointer; }
+      .sort-dropdown-option:hover, .sort-dropdown-option[aria-selected="true"] { background: var(--share-menu-hover); color: var(--share-menu-accent); }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      (() => {
+        const observeToolbarLayout = () => {
+          const toolbar = document.querySelector('.toolbar');
+          const search = toolbar?.querySelector('.search-box');
+          const controls = toolbar?.querySelector('.view-switch');
+          if (!toolbar || !search || !controls || controls.dataset.layoutObserved) return;
+          controls.dataset.layoutObserved = 'true';
+          const update = () => {
+            const separateRow = controls.getBoundingClientRect().top > search.getBoundingClientRect().top + 1;
+            controls.classList.toggle('full-row', separateRow);
+          };
+          const observer = new ResizeObserver(update);
+          controls._layoutObserver = observer;
+          observer.observe(toolbar);
+          observer.observe(search);
+          observer.observe(controls);
+          update();
+        };
+
+        const enhanceSelect = select => {
+          let dropdown = select.nextElementSibling;
+          if (!select.dataset.customDropdown) {
+            select.dataset.customDropdown = 'true';
+            select.classList.add(select.classList.contains('language-select') ? 'native-language-select' : 'native-sort-select');
+            dropdown = document.createElement('div');
+            dropdown.className = `sort-dropdown${select.classList.contains('language-select') ? ' language-dropdown' : ''}`;
+
+            const trigger = document.createElement('button');
+            trigger.type = 'button';
+            trigger.className = 'sort-dropdown-trigger';
+            trigger.setAttribute('aria-haspopup', 'listbox');
+            trigger.setAttribute('aria-expanded', 'false');
+            const label = document.createElement('span');
+            label.className = 'sort-dropdown-label';
+            const chevron = document.createElement('span');
+            chevron.className = 'sort-dropdown-chevron';
+            chevron.setAttribute('aria-hidden', 'true');
+            trigger.append(label, chevron);
+
+            const menu = document.createElement('div');
+            menu.className = 'sort-dropdown-menu';
+            menu.setAttribute('role', 'listbox');
+            for (const source of select.options) {
+              const option = document.createElement('button');
+              option.type = 'button';
+              option.className = 'sort-dropdown-option';
+              option.setAttribute('role', 'option');
+              option.dataset.value = source.value;
+              option.addEventListener('click', () => {
+                select.value = source.value;
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+                closeMenu();
+                trigger.focus();
+              });
+              menu.append(option);
+            }
+
+            const closeMenu = () => {
+              dropdown.classList.remove('open');
+              trigger.setAttribute('aria-expanded', 'false');
+            };
+            trigger.addEventListener('click', event => {
+              event.stopPropagation();
+              const isOpen = dropdown.classList.toggle('open');
+              trigger.setAttribute('aria-expanded', String(isOpen));
+              if (isOpen) menu.querySelector(`[data-value="${CSS.escape(select.value)}"]`)?.focus();
+            });
+            document.addEventListener('click', event => {
+              if (!dropdown.contains(event.target)) closeMenu();
+            });
+            document.addEventListener('keydown', event => {
+              if (event.key === 'Escape' && dropdown.classList.contains('open')) {
+                closeMenu();
+                trigger.focus();
+              }
+            });
+            select.addEventListener('change', () => syncSelect(select));
+            dropdown.append(trigger, menu);
+            select.after(dropdown);
+          }
+          syncSelect(select);
+        };
+
+        const syncSelect = select => {
+          const dropdown = select.nextElementSibling;
+          const trigger = dropdown?.querySelector('.sort-dropdown-trigger');
+          const label = dropdown?.querySelector('.sort-dropdown-label');
+          const options = dropdown?.querySelectorAll('.sort-dropdown-option') || [];
+          if (!trigger || !label) return;
+          const ariaLabel = select.getAttribute('aria-label');
+          if (ariaLabel && trigger.getAttribute('aria-label') !== ariaLabel) {
+            trigger.setAttribute('aria-label', ariaLabel);
+          } else if (!ariaLabel && trigger.hasAttribute('aria-label')) {
+            trigger.removeAttribute('aria-label');
+          }
+          const selected = select.selectedOptions[0];
+          if (label.textContent !== (selected?.textContent ?? '')) label.textContent = selected?.textContent ?? '';
+          options.forEach((option, index) => {
+            const source = select.options[index];
+            if (!source) return;
+            if (option.textContent !== source.textContent) option.textContent = source.textContent;
+            const isSelected = String(source.value === select.value);
+            if (option.getAttribute('aria-selected') !== isSelected) option.setAttribute('aria-selected', isSelected);
+          });
+        };
+
+        const observePage = () => {
+          observeToolbarLayout();
+          document.querySelectorAll('select.sort-select, select.language-select').forEach(enhanceSelect);
+        };
+
+        new MutationObserver(observePage).observe(document.documentElement, {
+          childList: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ['aria-label'],
+          subtree: true,
+        });
+        observePage();
+      })();
+    </script>
+  </body>
+</html>
+

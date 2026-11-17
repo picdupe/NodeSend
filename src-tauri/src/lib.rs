@@ -231,6 +231,8 @@ pub fn run() {
             ipc::commands::update_share,
             ipc::commands::toggle_share,
             ipc::commands::rotate_share_token,
+            ipc::commands::change_share_password,
+            ipc::commands::update_share_connection,
             ipc::commands::delete_share,
             ipc::commands::list_trusted_nodes,
             ipc::commands::add_trusted_node,
@@ -287,6 +289,8 @@ pub fn run() {
             updater::install_update,
             #[cfg(desktop)]
             updater::open_update_url,
+            #[cfg(desktop)]
+            updater::open_external_url,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start NodeSend");

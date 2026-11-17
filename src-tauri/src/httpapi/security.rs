@@ -12,7 +12,9 @@ use crate::error::{AppError, AppResult};
 /// 校验虚拟相对路径，返回规范化的相对 PathBuf。
 pub fn validate_virtual(rel: &str) -> AppResult<PathBuf> {
     if rel.contains('\0') {
-        return Err(AppError::BadRequest("The path contains invalid characters".into()));
+        return Err(AppError::BadRequest(
+            "The path contains invalid characters".into(),
+        ));
     }
     let trimmed = rel.trim();
 
@@ -24,12 +26,21 @@ pub fn validate_virtual(rel: &str) -> AppResult<PathBuf> {
     let path = PathBuf::from(trimmed);
     for component in path.components() {
         match component {
-            Component::Normal(_) | Component::CurDir => {}
+            Component::Normal(segment) => {
+                if segment.to_str().is_some_and(is_upload_staging_name) {
+                    return Err(AppError::BadRequest(
+                        "The path uses a reserved upload staging name".into(),
+                    ));
+                }
+            }
+            Component::CurDir => {}
             Component::ParentDir => {
                 return Err(AppError::BadRequest("The path cannot contain ..".into()))
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(AppError::BadRequest("Absolute paths are not allowed".into()))
+                return Err(AppError::BadRequest(
+                    "Absolute paths are not allowed".into(),
+                ))
             }
         }
     }
@@ -68,11 +79,44 @@ pub fn resolve_for_write(base: &Path, rel: &str) -> AppResult<(PathBuf, String)>
     Ok((real_parent.join(&file_name), file_name))
 }
 
+/// Create a validated directory below a share root for browser folder uploads.
+pub fn create_write_directory(base: &Path, rel: &str) -> AppResult<PathBuf> {
+    let relative = validate_virtual(rel)?;
+    let real_base = base.canonicalize()?;
+    let mut current = real_base.clone();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        current.push(segment);
+        match std::fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let real = current.canonicalize()?;
+        ensure_inside(&real_base, &real)?;
+        if !real.is_dir() {
+            return Err(AppError::BadRequest(
+                "Upload destination is not a directory".into(),
+            ));
+        }
+        current = real;
+    }
+    Ok(current)
+}
+
+pub fn is_upload_staging_name(name: &str) -> bool {
+    name.starts_with(".nodesend-upload-") && name.ends_with(".tmp")
+}
+
 fn ensure_inside(real_base: &Path, real_target: &Path) -> AppResult<()> {
     if real_target.starts_with(real_base) {
         Ok(())
     } else {
-        Err(AppError::Forbidden("Path escapes the share directory boundary".into()))
+        Err(AppError::Forbidden(
+            "Path escapes the share directory boundary".into(),
+        ))
     }
 }
 

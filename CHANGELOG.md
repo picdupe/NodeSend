@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.8] - 2026-11-17
+### Added
+- Expanded the HTTP share browser with login, file search, upload, download, and WebDAV support.
+- Added NodeSend download tasks initiated from the browser, with cache handling.
+### Fixed
+- Improved HTTP, FTP, and SMB share configuration, including share names, listen IPs, ports, and credential management.
+- Updated transfer recovery, connection status, and related UI messages.
+
 ## [0.1.7] - 2026-11-09
 ### Added
 - Add accent color customization and localized MSI packages

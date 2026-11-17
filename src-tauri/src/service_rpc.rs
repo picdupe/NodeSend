@@ -71,6 +71,7 @@ impl Backend {
                 self.service
                     .set_setting("ui_language", &language)
                     .map_err(|e| e.to_string())?;
+                crate::httpapi::events::notify_language_changed(&language);
                 serde_json::to_value(()).map_err(|e| e.to_string())
             }
             "get_node_info" => serde_json::to_value(
@@ -155,6 +156,31 @@ impl Backend {
                 .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string()),
+            "change_share_password" => serde_json::to_value(
+                crate::ipc::commands::change_share_password_service(
+                    self.service.clone(),
+                    self.protocol.clone(),
+                    argument(&args, "id")?,
+                    argument(&args, "password")?,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string()),
+            "update_share_connection" => serde_json::to_value(
+                crate::ipc::commands::update_share_connection_service(
+                    self.service.clone(),
+                    self.protocol.clone(),
+                    argument(&args, "id")?,
+                    argument(&args, "username")?,
+                    argument(&args, "password")?,
+                    argument(&args, "port")?,
+                    argument(&args, "bind_ips")?,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string()),
             "delete_share" => serde_json::to_value(
                 crate::ipc::commands::delete_share_service(
                     self.service.clone(),
@@ -231,6 +257,43 @@ impl Backend {
                 .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string()),
+            "download_web_share" => {
+                let node_id: String = argument(&args, "nodeId")?;
+                let endpoint: crate::network::peers::Endpoint = argument(&args, "endpoint")?;
+                let share_id: String = argument(&args, "shareId")?;
+                let path: String = argument(&args, "path")?;
+                let token: Option<String> = argument(&args, "token")?;
+                let directory: bool = argument(&args, "directory")?;
+                let expected_size: Option<u64> = argument(&args, "expectedSize")?;
+                serde_json::to_value(
+                    self.network
+                        .web_downloads
+                        .enqueue(
+                            node_id,
+                            endpoint,
+                            share_id,
+                            path,
+                            token,
+                            directory,
+                            expected_size,
+                        )
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+            }
+            "web_download_task_status" => {
+                let task_id: String = argument(&args, "taskId")?;
+                let status = self
+                    .network
+                    .web_downloads
+                    .snapshots()
+                    .into_iter()
+                    .find(|task| task.id == task_id)
+                    .map(|task| task.status)
+                    .ok_or_else(|| "Web download task was not found".to_string())?;
+                serde_json::to_value(serde_json::json!({"status": status}))
+                    .map_err(|error| error.to_string())
+            }
             "cancel_send_preflight" => serde_json::to_value(
                 crate::ipc::network::cancel_send_preflight_service(
                     self.network.clone(),
@@ -447,6 +510,8 @@ pub fn is_service_command(command: &str) -> bool {
             | "update_share"
             | "toggle_share"
             | "rotate_share_token"
+            | "change_share_password"
+            | "update_share_connection"
             | "delete_share"
             | "list_trusted_nodes"
             | "add_trusted_node"
@@ -455,6 +520,8 @@ pub fn is_service_command(command: &str) -> bool {
             | "get_network_status"
             | "add_endpoint"
             | "send_files"
+            | "download_web_share"
+            | "web_download_task_status"
             | "cancel_send_preflight"
             | "decide_incoming_transfer"
             | "transfer_action"

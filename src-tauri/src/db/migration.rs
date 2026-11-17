@@ -18,6 +18,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
         6,
         include_str!("../../migrations/0006_file_cache_names.sql"),
     ),
+    (7, include_str!("../../migrations/0007_web_downloads.sql")),
+    (8, include_str!("../../migrations/0008_protocol_share_names.sql")),
+    (9, include_str!("../../migrations/0009_remove_share_name_unique.sql")),
+    (10, include_str!("../../migrations/0010_share_bind_ips.sql")),
+    (11, include_str!("../../migrations/0011_explicit_share_ports.sql")),
+    (12, include_str!("../../migrations/0012_share_requested_ports.sql")),
 ];
 
 pub fn run_migrations(db: &Db) -> AppResult<()> {
@@ -43,5 +49,6 @@ pub fn run_migrations(db: &Db) -> AppResult<()> {
         })?;
         tracing::info!(version = version, "Database migration applied");
     }
+    crate::share::repository::initialize_protocol_share_names(db)?;
     Ok(())
 }

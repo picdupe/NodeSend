@@ -23,6 +23,9 @@
     "sourceUnavailableResume": "The source file is temporarily unavailable. Resume to try again: {{file}}",
     "noFiles": "There are no files to send.",
     "connectionUnreachable": "Could not reach this device. Make sure NodeSend is open on the other device and both devices are on the same network.",
+    "connectionUnreachableDetail": "Could not reach this device. Make sure NodeSend is open on the other device and both devices are on the same network. Connection details: {{detail}}",
+    "protocolMismatch": "Could not connect because the NodeSend protocol versions differ. Install the same NodeSend version on both devices.",
+    "protocolHandshakeClosed": "The peer closed the NodeSend handshake. The devices may use different protocol versions. Make sure both use compatible NodeSend versions, then try again.",
     "connectionRefused": "The other device refused the connection. Make sure NodeSend is running and check the firewall settings.",
     "receiveDirectorySpace": "There is not enough space in the receive directory, including space reserved for other tasks. Free disk space or choose another receive directory, then try again.",
     "timedOut": "The connection timed out. Make sure the other device is online and check the network and firewall.",
@@ -34,6 +37,13 @@
     "invalidLanguage": "The selected language is not supported.",
     "unfinishedTransfers": "The transfer protocol has changed. Complete or cancel all unfinished transfers before installing the update.",
     "pauseTransfers": "Pause active transfers before installing the update."
+  },
+  "shares": {
+    "duplicatePathProtocol": "This folder is already shared using the selected protocol.",
+    "smbCredentialConflict": "The same username cannot use different passwords on one SMB listener. Use a different username or change this share's port.",
+    "connectionChangedDuringReopen": "The connection settings changed. Reopen the connection and try again.",
+    "invalidListenIp": "Invalid listen IP address: {{ip}}",
+    "bindIpWildcardConflict": "A wildcard listen IP cannot be combined with a specific IP from the same address family."
   },
   "update": {
     "unsignedBuild": "This older debug build has no update verification key and cannot check for updates. Install a signed NodeSend build.",

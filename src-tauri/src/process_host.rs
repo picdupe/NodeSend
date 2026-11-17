@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Copy)]
 struct Entry {
     pid: u32,
+    #[cfg(not(windows))]
     seen: Instant,
     exit: bool,
     ready: bool,
@@ -28,6 +29,10 @@ fn registry() -> std::sync::MutexGuard<'static, Entries> {
 }
 impl Entries {
     fn reap(&mut self) {
+        #[cfg(windows)]
+        self.entries
+            .retain(|_, entry| crate::cli::process_alive(entry.pid));
+        #[cfg(not(windows))]
         self.entries.retain(|_, entry| {
             entry.seen.elapsed() < Duration::from_secs(if entry.ready { 10 } else { 60 })
                 && crate::cli::process_alive(entry.pid)
@@ -37,7 +42,7 @@ impl Entries {
         if self.closing {
             return Err("The NodeSend service is shutting down".into());
         }
-        if !matches!(kind, "gui" | "cli") {
+        if !matches!(kind, "gui" | "cli") && !kind.starts_with("web:") {
             return Err("Invalid process entry kind".into());
         }
         self.reap();
@@ -49,6 +54,7 @@ impl Entries {
             kind.into(),
             Entry {
                 pid,
+                #[cfg(not(windows))]
                 seen: Instant::now(),
                 exit,
                 ready: true,
@@ -85,18 +91,15 @@ fn spawn(arguments: &[&str]) -> Result<u32, String> {
 }
 
 pub async fn ensure_service() -> Result<(), String> {
-    let mut last_spawn = None;
+    let mut spawned = false;
     for _ in 0..50 {
         match crate::cli::control("role_probe", vec![]).await {
             Ok(value) if value.get("accepting_entries").and_then(Value::as_bool) != Some(false) => {
                 return Ok(())
             }
-            Err(_)
-                if last_spawn
-                    .is_none_or(|last: Instant| last.elapsed() > Duration::from_secs(1)) =>
-            {
+            Err(_) if !spawned => {
                 spawn(&["--service-host"])?;
-                last_spawn = Some(Instant::now());
+                spawned = true;
             }
             _ => {}
         }
@@ -128,6 +131,33 @@ pub async fn control(command: &str, args: &[String]) -> Option<Result<Value, Str
         return Some(Err("The NodeSend service is shutting down".into()));
     }
     let result = match command {
+        "spawn_web_entry" => {
+            let parsed = (|| {
+                let uri = args.first().ok_or("Missing web download URI")?;
+                let parsed = url::Url::parse(uri).map_err(|error| error.to_string())?;
+                if parsed.scheme() != "ns" || parsed.host_str() != Some("download") {
+                    return Err("Unsupported NodeSend web download URI".into());
+                }
+                let mut entries = registry();
+                entries.reap();
+                if entries.closing {
+                    return Err("The NodeSend service is shutting down".into());
+                }
+                let pid = spawn(&["--web-entry", uri])?;
+                entries.entries.insert(
+                    format!("web:{pid}"),
+                    Entry {
+                        pid,
+                        #[cfg(not(windows))]
+                        seen: Instant::now(),
+                        exit: false,
+                        ready: false,
+                    },
+                );
+                Ok(json!({"pid":pid}))
+            })();
+            parsed
+        }
         "role_probe" => {
             Ok(json!({"pid":std::process::id(),"accepting_entries":!registry().closing}))
         }
@@ -176,6 +206,7 @@ pub async fn control(command: &str, args: &[String]) -> Option<Result<Value, Str
                             "cli".into(),
                             Entry {
                                 pid,
+                                #[cfg(not(windows))]
                                 seen: Instant::now(),
                                 exit: false,
                                 ready: false,
@@ -200,6 +231,7 @@ pub async fn control(command: &str, args: &[String]) -> Option<Result<Value, Str
                                 "gui".into(),
                                 Entry {
                                     pid,
+                                    #[cfg(not(windows))]
                                     seen: Instant::now(),
                                     exit: false,
                                     ready: false,
@@ -241,6 +273,7 @@ fn runtime(work: impl std::future::Future<Output = Result<(), String>>) -> i32 {
         Ok(runtime) => match runtime.block_on(work) {
             Ok(()) => 0,
             Err(error) => {
+                tracing::error!(%error, "Process host request failed");
                 eprintln!("{error}");
                 1
             }
@@ -261,6 +294,200 @@ pub fn launch_gui() -> i32 {
         spawn(&["--gui-client"])?;
         Ok(())
     })
+}
+
+pub fn run_web_protocol(uri: String) -> i32 {
+    match url::Url::parse(&uri)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        Some(host) if host.eq_ignore_ascii_case("download") => run_web_download(uri),
+        _ => 1,
+    }
+}
+
+pub fn launch_web_protocol(uri: String) -> i32 {
+    runtime(async move {
+        ensure_service().await?;
+        crate::cli::control("spawn_web_entry", vec![uri]).await?;
+        Ok(())
+    })
+}
+
+pub fn run_web_download(uri: String) -> i32 {
+    init_web_download_log();
+    tracing::info!("Received a NodeSend web download link");
+    runtime(async move {
+        let parsed = url::Url::parse(&uri).map_err(|error| error.to_string())?;
+        if parsed.scheme() != "ns" || parsed.host_str() != Some("download") {
+            return Err("Unsupported NodeSend download link".into());
+        }
+        let value = |name: &str| {
+            parsed
+                .query_pairs()
+                .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+                .ok_or_else(|| format!("Missing download link parameter: {name}"))
+        };
+        let node_id = value("node")?;
+        let host = value("host")?;
+        let tcp_port = value("tcp")?
+            .parse::<u16>()
+            .map_err(|_| "Invalid TCP port in download link")?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let address = match host.parse::<std::net::IpAddr>() {
+            Ok(address) => address.to_string(),
+            Err(_) => tokio::net::lookup_host((host, tcp_port))
+                .await
+                .map_err(|error| format!("Could not resolve NodeSend download host: {error}"))?
+                .next()
+                .map(|address| address.ip().to_string())
+                .ok_or_else(|| "NodeSend download host has no IP address".to_string())?,
+        };
+        let quic_port = value("quic")?
+            .parse::<u16>()
+            .map_err(|_| "Invalid QUIC port in download link")?;
+        let share_id = value("share")?;
+        let path = value("path")?;
+        let directory = value("directory")? == "1";
+        let expected_size = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "size").then(|| value.into_owned()))
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "Invalid file size in download link")
+            })
+            .transpose()?;
+        let token = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "token").then(|| value.into_owned()));
+        let acknowledgement_token = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "ack").then(|| value.into_owned()));
+        let acknowledgement_url = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "ackUrl").then(|| value.into_owned()));
+        if let (Some(ack_token), Some(ack_url)) = (
+            acknowledgement_token.as_deref(),
+            acknowledgement_url.as_deref(),
+        ) {
+            validate_ack_url(host, ack_token, ack_url)?;
+        }
+        ensure_service().await?;
+        let pid = std::process::id().to_string();
+        let kind = format!("web:{pid}");
+        crate::cli::control("entry_heartbeat", vec![kind.clone(), pid.clone()]).await?;
+        tracing::info!(node_id = %node_id, host = %address, tcp_port, quic_port, share_id = %share_id, path = %path, directory, "Starting web share download through NodeSend");
+        let args = json!({
+            "nodeId": node_id,
+            "endpoint": crate::network::peers::Endpoint {
+                address,
+                tcp_port,
+                quic_port,
+                source: "web_share".into(),
+                last_seen: chrono::Utc::now().timestamp(),
+                error: None,
+            },
+            "shareId": share_id,
+            "path": path,
+            "token": token,
+            "directory": directory,
+            "expectedSize": expected_size,
+        });
+        let result = crate::cli::invoke_service("download_web_share", args).await;
+        match result {
+            Ok(value) => {
+                let task_id: String = match serde_json::from_value(value) {
+                    Ok(task_id) => task_id,
+                    Err(error) => {
+                        let _ = crate::cli::control("entry_detach", vec![kind, pid]).await;
+                        return Err(format!("Invalid web download task response: {error}"));
+                    }
+                };
+                tracing::info!(
+                    task_id,
+                    "Web share download was added to the NodeSend transfer list"
+                );
+                if let Some(ack_url) = acknowledgement_url {
+                    if let Err(error) = send_ack(&ack_url).await {
+                        tracing::debug!(%error, "Could not acknowledge the web download launch");
+                    }
+                }
+                let wait_result = wait_for_web_download(&task_id, &kind, &pid).await;
+                let _ = crate::cli::control("entry_detach", vec![kind, pid]).await;
+                wait_result?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = crate::cli::control("entry_detach", vec![kind, pid]).await;
+                tracing::error!(%error, "Web share download could not be started in NodeSend");
+                Err(error)
+            }
+        }
+    })
+}
+
+async fn wait_for_web_download(task_id: &str, kind: &str, pid: &str) -> Result<(), String> {
+    loop {
+        crate::cli::control("entry_heartbeat", vec![kind.to_string(), pid.to_string()]).await?;
+        let result =
+            crate::cli::invoke_service("web_download_task_status", json!({"taskId": task_id}))
+                .await?;
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or("NodeSend returned no web download task status")?;
+        if matches!(
+            status,
+            "completed"
+                | "failed"
+                | "cancelled"
+                | "rejected"
+                | "partial_completed"
+                | "incompatible"
+                | "paused"
+                | "offline"
+        ) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn validate_ack_url(host: &str, token: &str, ack_url: &str) -> Result<(), String> {
+    if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid download acknowledgement token".into());
+    }
+    let callback = url::Url::parse(ack_url).map_err(|_| "Invalid download acknowledgement URL")?;
+    let callback_host = callback
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(['[', ']']);
+    let expected_host = host.trim_matches(['[', ']']);
+    if callback.scheme() != "http"
+        || !callback_host.eq_ignore_ascii_case(expected_host)
+        || callback.path() != format!("/api/web-downloads/ack/{token}")
+        || callback.query().is_some()
+    {
+        return Err("Invalid download acknowledgement URL".into());
+    }
+    Ok(())
+}
+
+async fn send_ack(ack_url: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        match client.post(ack_url).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => last_error = format!("HTTP {}", response.status()),
+            Err(error) => last_error = error.to_string(),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Err(last_error)
 }
 
 pub fn run_cli_entry() -> i32 {
@@ -339,7 +566,6 @@ pub fn run_service() -> i32 {
         crate::cli::start_server(backend.network.clone(), backend.clone())
             .map_err(|e| e.to_string())?;
         let started = Instant::now();
-        let mut idle_since = None;
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let (empty, attached) = {
@@ -348,14 +574,9 @@ pub fn run_service() -> i32 {
                 (entries.entries.is_empty(), entries.ever_attached)
             };
             if !empty {
-                idle_since = None;
                 continue;
             }
             if !attached && started.elapsed() < Duration::from_secs(15) {
-                continue;
-            }
-            let idle = idle_since.get_or_insert_with(Instant::now);
-            if idle.elapsed() < Duration::from_secs(2) {
                 continue;
             }
             backend.network.notify_live_tasks_offline().await;
@@ -372,7 +593,6 @@ pub fn run_service() -> i32 {
                 empty
             };
             if !empty {
-                idle_since = None;
                 continue;
             }
             backend.network.mark_live_tasks_offline();
@@ -409,7 +629,7 @@ fn init_service_log() {
     }
 }
 
-pub fn init_gui_log() {
+fn init_process_log(file_name: &str) {
     let Some(data) = dirs::data_dir() else {
         return;
     };
@@ -420,7 +640,7 @@ pub fn init_gui_log() {
     if let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(logs.join("gui.log"))
+        .open(logs.join(file_name))
     {
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -430,6 +650,14 @@ pub fn init_gui_log() {
             .with_writer(Mutex::new(file))
             .try_init();
     }
+}
+
+pub fn init_gui_log() {
+    init_process_log("gui.log");
+}
+
+fn init_web_download_log() {
+    init_process_log("web-download.log");
 }
 
 #[cfg(test)]
@@ -448,14 +676,14 @@ mod tests {
         assert!(entries.attach("session", pid).is_err());
         assert!(entries.attach("cli", pid + 1).is_err());
     }
+
     #[test]
-    fn expired_entries_are_reaped_and_final_shutdown_rejects_registration() {
+    fn live_entries_remain_registered_and_shutdown_rejects_registration() {
         let mut entries = Entries::default();
         let pid = std::process::id();
         entries.attach("cli", pid).unwrap();
-        entries.entries.get_mut("cli").unwrap().seen = Instant::now() - Duration::from_secs(11);
         entries.reap();
-        assert!(entries.entries.is_empty());
+        assert!(entries.entries.contains_key("cli"));
         entries.closing = true;
         assert!(entries.attach("gui", pid).is_err());
     }

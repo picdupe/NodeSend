@@ -458,11 +458,21 @@ impl TransferService {
         let chunk = self
             .chunk_at(id, index)?
             .ok_or_else(|| AppError::BadRequest("Chunk index is out of range".into()))?;
-        if self.admit_cached_file(id, chunk.file).await?
+        let repair_required = self.admit_cached_file(id, chunk.file).await?
             || self.runtime_if_exists(id).is_some_and(|runtime| {
                 crate::locks::lock(&runtime.cache_fallback_pending).contains(&chunk.file)
-            })
-        {
+            });
+        if repair_required {
+            // A repair response must not race the final publication and arrive
+            // after the task has already committed and cleaned its cache files.
+            let _writer = self.destination_writer.lock().await;
+            let status = self.status_of(id)?;
+            if status == "completed" {
+                return Ok(Response::Ack);
+            }
+            if !super::recovery::processing(&status) || status == "finishing" {
+                return self.remote_state(id);
+            }
             return Ok(Response::Repair {
                 files: vec![chunk.file],
             });
@@ -470,6 +480,9 @@ impl TransferService {
         let gate = self.gate(id);
         let lock = gate.lock().await;
         let status = self.status_of(id)?;
+        if status == "completed" {
+            return Ok(Response::Ack);
+        }
         if !["accepted", "transferring"].contains(&status.as_str()) {
             return self.remote_state(id);
         }
@@ -737,6 +750,24 @@ impl TransferService {
                 self.invalidate_file(id, *file)?;
             }
             return Ok(Response::Repair { files: broken });
+        }
+        let _writer = self.destination_writer.lock().await;
+        let current = self.record(id)?;
+        if current.completed_count < current.chunk_count {
+            let files = current
+                .manifest
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(file, entry)| {
+                    let base = current.manifest.file_base(file);
+                    let count = entry.size.div_ceil(current.chunk_size) as usize;
+                    (!entry.directory
+                        && !(base..base + count).all(|index| current.completed.contains(&index)))
+                    .then_some(file)
+                })
+                .collect();
+            return Ok(Response::Repair { files });
         }
         let missing = self.missing_published_files(id).await?;
         if !missing.is_empty() {

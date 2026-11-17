@@ -95,12 +95,21 @@ pub async fn handle(
                     ic::encode_fs_volume_information(creation_time, 0xCAFE_BABE, "smb-server")
                 }
                 ic::FS_SIZE_INFORMATION => {
-                    // 1 PiB free pseudo-volume, 4 KiB cluster.
+                    let Some((total_bytes, free_bytes)) = tree_arc
+                        .read()
+                        .await
+                        .share
+                        .backend
+                        .volume_space()
+                    else {
+                        return HandlerResponse::err(ntstatus::STATUS_UNEXPECTED_IO_ERROR);
+                    };
+                    // Report the actual share volume in 4 KiB allocation units.
                     ic::encode_fs_size_information(
-                        1u64 << 40, // total
-                        1u64 << 39, // free
-                        1,          // sectors per cluster
-                        4096,       // bytes per sector
+                        total_bytes / 4096,
+                        free_bytes / 4096,
+                        1,
+                        4096,
                     )
                 }
                 ic::FS_DEVICE_INFORMATION => {
@@ -118,7 +127,22 @@ pub async fn handle(
                     "NTFS",
                 ),
                 ic::FS_FULL_SIZE_INFORMATION => {
-                    ic::encode_fs_full_size_information(1u64 << 40, 1u64 << 39, 1u64 << 39, 1, 4096)
+                    let Some((total_bytes, free_bytes)) = tree_arc
+                        .read()
+                        .await
+                        .share
+                        .backend
+                        .volume_space()
+                    else {
+                        return HandlerResponse::err(ntstatus::STATUS_UNEXPECTED_IO_ERROR);
+                    };
+                    ic::encode_fs_full_size_information(
+                        total_bytes / 4096,
+                        free_bytes / 4096,
+                        free_bytes / 4096,
+                        1,
+                        4096,
+                    )
                 }
                 _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
             }

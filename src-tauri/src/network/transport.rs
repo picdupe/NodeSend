@@ -93,6 +93,9 @@ impl Channel {
             _ => protocol::IO_TIMEOUT,
         };
         match protocol::read_frame_with_timeout(&mut *self.reader, timeout).await? {
+            Response::Error { message } if matches!(r, Request::Hello { .. }) => {
+                Ok(Response::Error { message })
+            }
             Response::Error { message } => Err(AppError::Other(message)),
             response => Ok(response),
         }
@@ -247,7 +250,9 @@ pub async fn connect(
         }
         Err(_) => {
             tracing::warn!(%address, "TCP connection timed out (peer is online but the port is not responding)");
-            return Err(other("Connection timed out; check whether the peer is online and reachable"));
+            return Err(other(
+                "Connection timed out; check whether the peer is online and reachable",
+            ));
         }
     };
     stream.set_nodelay(true)?;
@@ -336,15 +341,34 @@ pub async fn hello(
     channel: &mut Channel,
     app: &AppService,
 ) -> AppResult<(String, String, u16, u16)> {
-    match channel
+    tracing::info!(
+        transport = channel.kind,
+        sent_protocol_version = protocol::VERSION,
+        peer_id = %channel.peer_id,
+        "Sending NodeSend HELLO"
+    );
+    let response = match channel
         .request(&Request::Hello {
             version: protocol::VERSION,
             node_id: app.identity.node_id.clone(),
             display_name: display_name(app),
             device_type: local_device_type().into(),
         })
-        .await?
+        .await
     {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                transport = channel.kind,
+                local_protocol_version = protocol::VERSION,
+                peer_id = %channel.peer_id,
+                error = %error,
+                "NodeSend HELLO failed before a response was received; peer protocol version is unknown"
+            );
+            return Err(error);
+        }
+    };
+    match response {
         Response::Hello {
             version,
             node_id,
@@ -352,10 +376,54 @@ pub async fn hello(
             device_type,
             tcp_port,
             quic_port,
-        } if version == protocol::VERSION && node_id == channel.peer_id => {
+        } => {
+            tracing::info!(
+                transport = channel.kind,
+                local_protocol_version = protocol::VERSION,
+                peer_protocol_version = version,
+                peer_id = %node_id,
+                "Received NodeSend HELLO response"
+            );
+            if version != protocol::VERSION {
+                tracing::warn!(
+                    transport = channel.kind,
+                    local_protocol_version = protocol::VERSION,
+                    peer_protocol_version = version,
+                    peer_id = %node_id,
+                    "NodeSend protocol version mismatch"
+                );
+                return Err(AppError::Forbidden(format!(
+                    "Protocol version mismatch: local {}, peer {}",
+                    protocol::VERSION,
+                    version
+                )));
+            }
+            if node_id != channel.peer_id {
+                tracing::warn!(
+                    transport = channel.kind,
+                    expected_peer_id = %channel.peer_id,
+                    received_peer_id = %node_id,
+                    "NodeSend HELLO identity mismatch"
+                );
+                return Err(AppError::Forbidden(
+                    "Node identity does not match the TLS peer".into(),
+                ));
+            }
             Ok((display_name, device_type, tcp_port, quic_port))
         }
-        _ => Err(AppError::Forbidden("Node identity or protocol version does not match".into())),
+        Response::Error { message } => {
+            tracing::warn!(
+                transport = channel.kind,
+                local_protocol_version = protocol::VERSION,
+                peer_id = %channel.peer_id,
+                peer_error = %message,
+                "Received NodeSend HELLO error response; peer protocol version is unavailable"
+            );
+            Err(AppError::Other(message))
+        }
+        _ => Err(AppError::Forbidden(
+            "Unexpected response to NodeSend HELLO".into(),
+        )),
     }
 }
 
@@ -833,6 +901,7 @@ async fn session(
                 share_id,
                 path,
                 token,
+                offset,
             } => {
                 match browser::fetch(
                     &transfers.app,
@@ -840,6 +909,7 @@ async fn session(
                     share_id,
                     path,
                     token.clone(),
+                    *offset,
                 )
                 .await
                 {
@@ -848,7 +918,9 @@ async fn session(
                             .await?;
                         let copied = tokio::io::copy(&mut file, &mut *channel.writer).await?;
                         if copied != length {
-                            return Err(AppError::Other("Source file changed while being read".into()));
+                            return Err(AppError::Other(
+                                "Source file changed while being read".into(),
+                            ));
                         }
                         channel.writer.flush().await?;
                     }
@@ -892,7 +964,9 @@ async fn session(
                             _ => {
                                 drop(file);
                                 let _ = tokio::fs::remove_file(target).await;
-                                return Err(AppError::Other("NodeSend upload was interrupted".into()));
+                                return Err(AppError::Other(
+                                    "NodeSend upload was interrupted".into(),
+                                ));
                             }
                         }
                     }
@@ -974,7 +1048,9 @@ async fn session(
                     ));
                 }
                 if revision < task.remote_state_revision {
-                    return Err(AppError::Conflict("Received a stale task state revision".into()));
+                    return Err(AppError::Conflict(
+                        "Received a stale task state revision".into(),
+                    ));
                 }
                 transfers.action(&task_id, "resume").await?;
                 Ok(Response::Ack)

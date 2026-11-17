@@ -1,24 +1,24 @@
 {
-  "version": "0.1.7-build.135",
-  "protocol_version": 8,
-  "notes": "Refine window controls and page header masks",
+  "version": "0.1.8-build.136",
+  "protocol_version": 9,
+  "notes": "Expanded the HTTP share browser with login, file search, upload, download, and WebDAV support.\r\nAdded NodeSend download tasks initiated from the browser, with cache handling.\r\nImproved HTTP, FTP, and SMB share configuration, including share names, listen IPs, ports, and credential management.\r\nUpdated transfer recovery, connection status, and related UI messages.",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0JKOUE0Mi95OC9NRDV4cUZTTlliSW02eVhURVRLK2NVRnZTcjJsZ085Z2k1aHVWSTB4TUl1TzdLUmY4aWhOUlFaN3I0eHM4TkJxK3JBN2FnS1ZaSFFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0MjM5NDAzCWZpbGU6Tm9kZVNlbmRfMC4xLjctYnVpbGQuMTM1X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNy1idWlsZC4xMzUKWGJaUkd0aXNQUEwxQXEwL29WZHNNUFAwMWs2YVVSdThrOHJOMzhjaGVwblZNT3A2N01IbzBhTW1Wa1o5YWREYTNMcWc0TmYvem9hZ01oL0wzS3VqQVE9PQo=",
-      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_0.1.7.135_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTQ0lzY3BXbTBMR0hzYU4yMk5TUDhvMFVRZ2FUL3dYVVpsLzM5NG1mNGRNY1QzSEJHUnVGekwwbzh2UC9qeEZTTkJTVzRwaU81SFY3bU1lVWppSTFSdmpEeVhQZldLdGdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTE2NjUyCWZpbGU6Tm9kZVNlbmRfMC4xLjgtYnVpbGQuMTM2X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuOC1idWlsZC4xMzYKa3VPVHhJQWhKVEhxTkIxanpCdFhWOGl6alpHU1pYRXJzZ0c5aXAzajgrbm9hK0l0TjFYaUdDZm9aYTJnRGVIa293RWlsWVBiOTRSWEFXYnVIRnZKQWc9PQo=",
+      "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.8/NodeSend_0.1.8.136_x64-setup.exe",
       "fallback_urls": [
-        "https://github.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_0.1.7.135_x64-setup.exe"
+        "https://github.com/picdupe/NodeSend/releases/download/v0.1.8/NodeSend_0.1.8.136_x64-setup.exe"
       ]
     }
   },
   "release_page_url": "https://gitcode.com/picdupe/NodeSend/releases",
   "android": {
-    "version": "0.1.7.135",
-    "versionCode": 1070135,
-    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_v0.1.7.135-arm64-v8a-release.apk",
+    "version": "0.1.8.136",
+    "versionCode": 1080136,
+    "url": "https://gitcode.com/picdupe/NodeSend/releases/download/v0.1.8/NodeSend_v0.1.8.136-arm64-v8a-release.apk",
     "fallbackUrls": [
-      "https://github.com/picdupe/NodeSend/releases/download/v0.1.7/NodeSend_v0.1.7.135-arm64-v8a-release.apk"
+      "https://github.com/picdupe/NodeSend/releases/download/v0.1.8/NodeSend_v0.1.8.136-arm64-v8a-release.apk"
     ],
-    "sha256": "df5079ae4f04accf22050bbf93a64fb6dd7a438f45a3a7f2eb5d505aa5cb6e9a"
+    "sha256": "22c435b2553b649e0edfb6e1b6b41a65fd167d5b366dbbc9d004320b2d3543ec"
   }
 }

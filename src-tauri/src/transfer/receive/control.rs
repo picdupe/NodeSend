@@ -16,16 +16,25 @@ impl TransferService {
         match request {
             Request::PrepareFile { id, file } => {
                 let id = incoming_id(peer, &id);
-                if self.admit_cached_file(&id, file).await? {
-                    return Ok(Response::Repair { files: vec![file] });
-                }
-                if self
-                    .runtime_if_exists(&id)
-                    .is_some_and(|runtime| crate::locks::lock(&runtime.cache_fallback_pending).contains(&file))
-                {
+                let repair_required = self.admit_cached_file(&id, file).await?
+                    || self.runtime_if_exists(&id).is_some_and(|runtime| {
+                        crate::locks::lock(&runtime.cache_fallback_pending).contains(&file)
+                    });
+                if repair_required {
+                    let _writer = self.destination_writer.lock().await;
+                    let status = self.status_of(&id)?;
+                    if status == "completed" {
+                        return Ok(Response::Ack);
+                    }
+                    if !super::super::recovery::processing(&status) || status == "finishing" {
+                        return self.remote_state(&id);
+                    }
                     return Ok(Response::Repair { files: vec![file] });
                 }
                 let status = self.status_of(&id)?;
+                if status == "completed" {
+                    return Ok(Response::Ack);
+                }
                 if !["accepted", "transferring"].contains(&status.as_str()) {
                     return self.remote_state(&id);
                 }
@@ -43,12 +52,24 @@ impl TransferService {
             }
             Request::RecoveryAck { id, epoch, repair } => {
                 let id = incoming_id(peer, &id);
+                let _writer = self.destination_writer.lock().await;
                 let gate = self.gate(&id);
                 let _guard = gate.lock().await;
-                if self.record(&id)?.recovery_epoch != epoch {
+                let task = self.record(&id)?;
+                if task.recovery_epoch != epoch {
                     return Err(AppError::Conflict(
                         "Recovery acknowledgement uses a stale epoch".into(),
                     ));
+                }
+                if !super::super::recovery::processing(&task.status) || task.status == "finishing" {
+                    tracing::debug!(
+                        task = %id,
+                        status = %task.status,
+                        repair_files = repair.len(),
+                        "Ignored a late recovery repair for a task that is no longer repairable"
+                    );
+                    self.edit(&id, |current| current.checked_epoch = epoch)?;
+                    return Ok(Response::Ack);
                 }
                 for file in repair {
                     self.invalidate_file(&id, file)?;

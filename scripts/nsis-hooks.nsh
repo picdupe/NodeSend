@@ -1,5 +1,5 @@
 ﻿; Accept only a registered directory containing the installed application.
-!define NODESEND_PUBLIC_VERSION "0.1.7.135"
+!define NODESEND_PUBLIC_VERSION "0.1.8.136"
 !macro NodeSendReadLocation ROOT
   ReadRegStr $5 ${ROOT} "Software\Microsoft\Windows\CurrentVersion\Uninstall\NodeSend" "InstallLocation"
   StrCpy $6 $5 1

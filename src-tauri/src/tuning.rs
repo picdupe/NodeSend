@@ -41,7 +41,7 @@ pub(crate) const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 协议版本：帧格式变更必须同步提升，两端不一致时 HELLO 会直接拒绝。
 /// v8：文件级缓存准入、修复请求、源版本替换及中断恢复校验。
-pub(crate) const PROTOCOL_VERSION: u16 = 8;
+pub(crate) const PROTOCOL_VERSION: u16 = 9;
 /// 单帧清单条数（**发送起点**）。小批量先行：选完目录立刻就能发第一批，
 /// 不必等扫满整批落库批次（[`MANIFEST_PAGE`]）才开始发送。
 pub(crate) const MANIFEST_BATCH: usize = 256;

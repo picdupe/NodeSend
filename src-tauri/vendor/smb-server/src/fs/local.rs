@@ -46,6 +46,7 @@ use crate::path::SmbPath;
 /// Cheap to clone: internally an `Arc<cap_std::fs::Dir>` plus a flag.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
+    root_path: PathBuf,
     read_only: bool,
 }
 
@@ -53,9 +54,11 @@ impl LocalFsBackend {
     /// Open `path` as the share root. Errors if the path does not exist or is
     /// not a directory.
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
-        let dir = Dir::open_ambient_dir(path, ambient_authority())?;
+        let root_path = path.as_ref().to_path_buf();
+        let dir = Dir::open_ambient_dir(&root_path, ambient_authority())?;
         Ok(Self {
             root: Arc::new(dir),
+            root_path,
             read_only: false,
         })
     }
@@ -227,6 +230,13 @@ fn ascii_eq_ci(a: char, b: char) -> bool {
 
 #[async_trait]
 impl ShareBackend for LocalFsBackend {
+    fn volume_space(&self) -> Option<(u64, u64)> {
+        Some((
+            fs2::total_space(&self.root_path).ok()?,
+            fs2::available_space(&self.root_path).ok()?,
+        ))
+    }
+
     async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
         // 1. Read-only check: any open that requests creation, write access,
         //    truncation, or overwrite is rejected up front. Pure read opens

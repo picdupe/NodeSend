@@ -166,6 +166,17 @@ pub async fn service_invoke(
     .await?;
     Ok(json!({"handled":true,"value":value}))
 }
+
+pub async fn invoke_service(command: &str, args: Value) -> Result<Value, String> {
+    if !crate::service_rpc::is_service_command(command) {
+        return Err(format!("Unknown service command: {command}"));
+    }
+    remote(Request {
+        command: "invoke".into(),
+        args: vec![command.to_string(), args.to_string()],
+    })
+    .await
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Request {
     command: String,

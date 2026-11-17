@@ -279,6 +279,12 @@ impl TransferService {
     ) -> AppResult<crate::network::protocol::Response> {
         let _writer = self.destination_writer.lock().await;
         let task = self.record(id)?;
+        if !processing(&task.status) || task.status == "finishing" {
+            return Ok(crate::network::protocol::Response::RecoveryFiles {
+                epoch: task.recovery_epoch,
+                files: vec![],
+            });
+        }
         if task.recovery_epoch <= task.checked_epoch {
             return Ok(crate::network::protocol::Response::RecoveryFiles {
                 epoch: task.recovery_epoch,
@@ -641,7 +647,7 @@ impl TransferService {
         Ok(())
     }
     pub(crate) fn invalidate_file(&self, id: &str, file: usize) -> AppResult<()> {
-        self.reset_file_for_retry(id, file, true)
+        self.reset_file_for_retry(id, file, true).map(|_| ())
     }
 
     pub(crate) async fn fallback_cached_file_to_direct(
@@ -650,7 +656,19 @@ impl TransferService {
         file: usize,
     ) -> AppResult<bool> {
         let _admission = self.cache_admission.lock().await;
+        // Serialize cache fallback with final publication. Once commit marks a task
+        // completed, its cache and staging files may already have been removed.
+        let _writer = self.destination_writer.lock().await;
         let task = self.record(id)?;
+        if !processing(&task.status) || task.status == "finishing" {
+            tracing::debug!(
+                task = %id,
+                file,
+                status = %task.status,
+                "Ignored a cache fallback after the task stopped accepting repairs"
+            );
+            return Ok(false);
+        }
         if !task.cache_files.contains(&file) {
             return Ok(false);
         }
@@ -663,7 +681,9 @@ impl TransferService {
             .get(file)
             .ok_or_else(|| AppError::BadRequest("Invalid file index".into()))?;
         let size = entry.size;
-        self.reset_file_for_retry(id, file, false)?;
+        if !self.reset_file_for_retry(id, file, false)? {
+            return Ok(false);
+        }
         self.edit(id, |current| {
             if current.cache_files.remove(&file) {
                 current.use_cache = !current.cache_files.is_empty();
@@ -689,14 +709,24 @@ impl TransferService {
             crate::locks::lock(&runtime.cache_fallback_pending).insert(file);
             let base = task.manifest.file_base(file);
             let end = base.saturating_add(size.div_ceil(task.chunk_size) as usize);
-            crate::locks::lock(&runtime.write_pending).retain(|index| *index < base || *index >= end);
+            crate::locks::lock(&runtime.write_pending)
+                .retain(|index| *index < base || *index >= end);
         }
         tracing::warn!(task = %id, file, size_bytes = size, "Cache space is insufficient; cached data was discarded and the complete file will be retransmitted directly");
         Ok(true)
     }
 
-    fn reset_file_for_retry(&self, id: &str, file: usize, count_repair: bool) -> AppResult<()> {
+    fn reset_file_for_retry(&self, id: &str, file: usize, count_repair: bool) -> AppResult<bool> {
         let task = self.record(id)?;
+        if !processing(&task.status) || task.status == "finishing" {
+            tracing::debug!(
+                task = %id,
+                file,
+                status = %task.status,
+                "Ignored a file retry request for a task that is no longer repairable"
+            );
+            return Ok(false);
+        }
         let entry = task
             .manifest
             .entries
@@ -710,7 +740,8 @@ impl TransferService {
             if attempts > 3 {
                 self.edit(id, |t| {
                     t.status = "failed".into();
-                    t.error = Some("The received file could not be restored after three attempts".into());
+                    t.error =
+                        Some("The received file could not be restored after three attempts".into());
                 })?;
                 return Err(AppError::Conflict(
                     "The received file could not be restored after three attempts".into(),
@@ -719,7 +750,12 @@ impl TransferService {
         }
         let base = task.manifest.file_base(file);
         let end = base + entry.size.div_ceil(task.chunk_size) as usize;
+        let mut reset = false;
         self.edit(id, |t| {
+            if !processing(&t.status) || t.status == "finishing" {
+                return;
+            }
+            reset = true;
             t.repair_files.insert(file);
             t.completed.retain(|index| *index < base || *index >= end);
             t.completed_count = t.completed.len();
@@ -737,9 +773,15 @@ impl TransferService {
             t.event(if count_repair {
                 format!("File needs to be retransferred: {}", entry.path)
             } else {
-                format!("Cache space is insufficient; the file will be retransmitted directly: {}", entry.path)
+                format!(
+                    "Cache space is insufficient; the file will be retransmitted directly: {}",
+                    entry.path
+                )
             });
         })?;
+        if !reset {
+            return Ok(false);
+        }
         self.save_decision(id)?;
         if let Some(cache) = self.cache_root_for_task(id) {
             let assembled = super::paths::cache_file(&cache, &task, file);
@@ -772,7 +814,7 @@ impl TransferService {
                 std::fs::remove_file(marker)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) async fn missing_published_files(&self, id: &str) -> AppResult<Vec<usize>> {
@@ -867,14 +909,18 @@ impl TransferService {
         let Some(cache_root) = self.cache_root_for_task(id) else {
             return self.fallback_cached_file_to_direct(id, file).await;
         };
-        if !processing(&self.status_of(id)?) {
-            return Err(AppError::Conflict("Task is no longer active".into()));
+        let status = self.status_of(id)?;
+        if !processing(&status) || status == "finishing" {
+            return Ok(false);
         }
         let mut retry_direct = false;
         let mut switched_without_data = false;
         {
             let _lock = self.cache_admission.lock().await;
             let current = self.record(id)?;
+            if !processing(&current.status) || current.status == "finishing" {
+                return Ok(false);
+            }
             if !current.cache_files.contains(&file) {
                 return Ok(false);
             }
@@ -890,10 +936,15 @@ impl TransferService {
             match self.cache_budget(&cache_root).await {
                 Ok(budget) => {
                     let capacity = budget.receive.min(budget.assemble);
-                    let fits = super::cache_candidate_fits(size, 0, budget.max_file_size(), capacity);
-                    if !fits
-                        || !self.cached_file_reserved(id, file, size)?
-                            && !self.reserve_cached_file(id, file, size, capacity)?
+                    // Existing reservations already account for this file's full
+                    // receive and assembly footprint. Rechecking the whole-file
+                    // limit against free space reduced by this file's own incoming
+                    // chunks would incorrectly force a retransmission mid-transfer.
+                    let reserved = self.cached_file_reserved(id, file, size)?;
+                    let fits =
+                        super::cache_candidate_fits(size, 0, budget.max_file_size(), capacity);
+                    if !reserved
+                        && (!fits || !self.reserve_cached_file(id, file, size, capacity)?)
                     {
                         if has_received_chunks || has_cache_state || has_cached_data {
                             retry_direct = true;
